@@ -375,7 +375,7 @@ def cmd_init(args):
                            "cases": {}})
     (d / LOG).touch()
     gi = d / ".gitignore"
-    gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\n")
+    gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\n")
     print(f"initialized casefile in {d}")
 
 
@@ -1367,16 +1367,25 @@ if __name__ == "__main__":
 '''
 
 HOOK_SWEEP_PY = r'''#!/usr/bin/env python3
-"""Stop hook: secretary sweep (SPEC §13).
+"""Stop hook: secretary sweep + liveness pulse (SPEC §13; decision 52694aa9).
 
-Blocks the first stop of a session so the model diffs its conversation
-against the casefile log and files the gaps — the decision made
-conversationally in window 4 that nobody wrote down. `stop_hook_active`
-guards against blocking forever; no active case means nothing to sweep.
+First stop of a session blocks so the model diffs its conversation against
+the casefile log and files the gaps. The re-fire (`stop_hook_active`) is the
+final pass: every write of the turn — model-filed and sweep-filed — is
+already in the log, so it emits at most ONE honest liveness pulse
+(synthesis H7): 'casefile +3 since last look (2 hypothesis, 1 observation)
+— 74 total'. The diff is 'since this session last looked' via a
+session-keyed atomic cursor — no per-session write provenance is claimed.
+Suppressed while the tmux UI holds a fresh heartbeat lease (it is the
+liveness surface then); the cursor still advances. Silent when idle.
 """
 import json
+import os
 import sys
+import time
 from pathlib import Path
+
+LEASE_FRESH_S = 10
 
 REASON = (
     "Secretary sweep (casefile): before ending, diff this conversation against "
@@ -1389,11 +1398,57 @@ REASON = (
 )
 
 
+def log_lines(root: Path) -> list[dict]:
+    p = root / ".casefile" / "log.jsonl"
+    if not p.exists():
+        return []
+    out = []
+    for line in p.read_text().splitlines():
+        try:
+            out.append(json.loads(line))
+        except Exception:
+            pass
+    return out
+
+
+def pulse(root: Path, session_id: str):
+    entries = log_lines(root)
+    total = len(entries)
+    cur_dir = root / ".casefile" / "state"
+    cur_dir.mkdir(parents=True, exist_ok=True)
+    cursor = cur_dir / f"pulse-{session_id or 'default'}"
+    try:
+        seen = int(cursor.read_text())
+    except Exception:
+        seen = total  # first look: establish the baseline, report nothing
+    delta = entries[seen:total] if 0 <= seen <= total else entries
+    # advance the cursor first (atomic) — suppressed pulses still count as seen
+    tmp = cursor.with_suffix(".tmp")
+    tmp.write_text(str(total))
+    os.replace(tmp, cursor)
+    if not delta:
+        return
+    hb = root / ".casefile" / "ui" / "heartbeat"
+    try:
+        if time.time() - hb.stat().st_mtime < LEASE_FRESH_S:
+            return  # tmux UI lease fresh: it is the liveness surface (H6)
+    except FileNotFoundError:
+        pass
+    by_type = {}
+    for e in delta:
+        by_type[e.get("type", "?")] = by_type.get(e.get("type", "?"), 0) + 1
+    kinds = ", ".join(f"{n} {t}" for t, n in sorted(by_type.items()))
+    print(json.dumps({"systemMessage":
+                      f"casefile +{len(delta)} since last look ({kinds}) "
+                      f"— {total} total"}))
+
+
 def main():
     hook = json.load(sys.stdin)
-    if hook.get("stop_hook_active"):
-        return  # this stop already swept; let the session end
     root = Path(__file__).resolve().parents[2]
+    if hook.get("stop_hook_active"):
+        pulse(root, str(hook.get("session_id", "")))  # final pass: pulse (H7)
+        return
     if not _active_case(root):
         return  # no active case means nothing to sweep
     print(json.dumps({"decision": "block", "reason": REASON}))
@@ -1409,6 +1464,67 @@ def _active_case(root: Path) -> str | None:
         return json.loads((root / ".casefile" / "meta.json").read_text()).get("active_case")
     except Exception:
         return None
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+'''
+
+HOOK_SESSION_START_PY = r'''#!/usr/bin/env python3
+"""SessionStart hook: one-line casefile liveness summary (decision 52694aa9).
+
+Absolute totals only — a fresh session has no cursor, so no delta is
+claimed. Also seeds this session's pulse cursor so the first Stop-pass
+pulse diffs from session start, not from zero.
+"""
+import json
+import os
+import sys
+from pathlib import Path
+
+
+def main():
+    hook = json.load(sys.stdin)
+    root = Path(__file__).resolve().parents[2]
+    cf = root / ".casefile"
+    entries = [l for l in (cf / "log.jsonl").read_text().splitlines() if l.strip()] \
+        if (cf / "log.jsonl").exists() else []
+    active = None
+    if (cf / "active").exists():
+        active = (cf / "active").read_text().strip() or None
+    if not active:
+        try:
+            active = json.loads((cf / "meta.json").read_text()).get("active_case")
+        except Exception:
+            return
+    if not active:
+        return
+    open_q = 0
+    resolved = set()
+    parsed = []
+    for line in entries:
+        try:
+            parsed.append(json.loads(line))
+        except Exception:
+            pass
+    for e in parsed:
+        if e.get("type") == "resolution":
+            resolved.update(e.get("refs", []))
+    open_q = sum(1 for e in parsed if e.get("type") == "question"
+                 and e["id"] not in resolved)
+    sid = str(hook.get("session_id", "")) or "default"
+    state = cf / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    tmp = state / f"pulse-{sid}.tmp"
+    tmp.write_text(str(len(parsed)))
+    os.replace(tmp, state / f"pulse-{sid}")
+    print(json.dumps({"systemMessage":
+                      f"casefile: {active} — {len(parsed)} entries, "
+                      f"{open_q} open questions"}))
 
 
 if __name__ == "__main__":
@@ -1510,6 +1626,8 @@ CLAUDE_HOOKS = [  # event, matcher, command, timeout
      'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/observe.py"', 15),
     ("Stop", None,
      'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/sweep.py"', 10),
+    ("SessionStart", None,
+     'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/session_start.py"', 10),
 ]
 
 
@@ -1542,6 +1660,7 @@ def cmd_hooks(args):
     root, entries, meta = require_root()
     for rel, content in [(".casefile/hooks/observe.py", HOOK_OBSERVE_PY),
                          (".casefile/hooks/sweep.py", HOOK_SWEEP_PY),
+                         (".casefile/hooks/session_start.py", HOOK_SESSION_START_PY),
                          (".claude/skills/casefile/SKILL.md", SKILL_MD)]:
         print(f"{_write_if_changed(root / rel, content)}: {rel}")
     sp = root / ".claude" / "settings.json"
@@ -1617,7 +1736,10 @@ def _ui_state_loop(root: Path, interval: float = 1.0):
 
 
 def _ui_status_loop(root: Path, interval: float = 2.0):
+    hb = ui_paths(root)["dir"] / "heartbeat"
     while True:
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.touch()  # lease (H6/f1e747e3): hook pulses defer while this is fresh
         entries = read_entries(root)
         meta = load_meta(root)
         line = status_line(root, entries, meta)

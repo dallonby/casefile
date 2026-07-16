@@ -687,6 +687,89 @@ class CliTalkTests(CliBase):
         self.assertIn("recorded: constraint", p.stdout)  # echo-back convention
 
 
+class LivenessPulseTests(CliBase):
+    """Acceptance matrix from the spitball deliberation (decision 52694aa9,
+    synthesis H7): honest since-last-look pulses, session-keyed cursors,
+    lease suppression, kill-safe rollup."""
+
+    def setUp(self):
+        super().setUp()
+        self.cli("hooks", "install", "claude-code", expect=0)
+
+    def hook(self, name, payload):
+        p = subprocess.run(
+            [sys.executable, str(self.dir / ".casefile" / "hooks" / name)],
+            cwd=self.dir, capture_output=True, text=True, input=json.dumps(payload))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout.strip()
+
+    def stop(self, sid, active=True):
+        return self.hook("sweep.py", {"stop_hook_active": active,
+                                      "session_id": sid})
+
+    def test_session_start_seeds_cursor_and_announces(self):
+        out = self.hook("session_start.py", {"session_id": "s1"})
+        d = json.loads(out)
+        self.assertIn("casefile: test-case", d["systemMessage"])
+        self.assertIn("entries", d["systemMessage"])
+        self.assertTrue((self.dir / ".casefile" / "state" / "pulse-s1").exists())
+
+    def test_pulse_reports_since_last_look_then_goes_silent(self):
+        self.hook("session_start.py", {"session_id": "s1"})
+        self.add("-t", "hypothesis", "-a", "claude", "new theory")
+        self.add("-t", "observation", "-a", "system", "world data")
+        out = self.stop("s1")
+        d = json.loads(out)
+        self.assertIn("+2 since last look", d["systemMessage"])
+        self.assertIn("1 hypothesis", d["systemMessage"])
+        self.assertIn("1 observation", d["systemMessage"])
+        self.assertEqual(self.stop("s1"), "")  # nothing new: silent
+
+    def test_concurrent_sessions_have_independent_cursors(self):
+        self.hook("session_start.py", {"session_id": "s1"})
+        self.hook("session_start.py", {"session_id": "s2"})
+        self.add("-t", "note", "-a", "claude", "seen by both")
+        self.assertIn("+1", json.loads(self.stop("s1"))["systemMessage"])
+        self.assertIn("+1", json.loads(self.stop("s2"))["systemMessage"])  # s2 unaffected by s1's look
+
+    def test_kill_safe_rollup(self):
+        # a turn with no final pass (kill -9) rolls its writes into the next
+        # pulse — the cursor only advances when a pulse pass actually runs.
+        self.hook("session_start.py", {"session_id": "s1"})
+        self.add("-t", "note", "-a", "claude", "written then killed")
+        # (no stop pass here — simulated kill)
+        self.add("-t", "note", "-a", "claude", "next turn write")
+        d = json.loads(self.stop("s1"))
+        self.assertIn("+2 since last look", d["systemMessage"])
+
+    def test_fresh_lease_suppresses_but_cursor_advances(self):
+        self.hook("session_start.py", {"session_id": "s1"})
+        self.add("-t", "note", "-a", "claude", "ui is watching")
+        hb = self.dir / ".casefile" / "ui" / "heartbeat"
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.touch()  # fresh lease: tmux UI owns liveness
+        self.assertEqual(self.stop("s1"), "")
+        import os as _os, time as _time
+        _os.utime(hb, (_time.time() - 60, _time.time() - 60))  # lease expires
+        self.assertEqual(self.stop("s1"), "")  # suppressed writes stay seen
+
+    def test_stale_lease_falls_back_to_pulse(self):
+        self.hook("session_start.py", {"session_id": "s1"})
+        hb = self.dir / ".casefile" / "ui" / "heartbeat"
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.touch()
+        import os as _os, time as _time
+        _os.utime(hb, (_time.time() - 60, _time.time() - 60))  # stale from the start
+        self.add("-t", "note", "-a", "claude", "ui died; hook must speak")
+        self.assertIn("+1", json.loads(self.stop("s1"))["systemMessage"])
+
+    def test_first_pass_still_blocks_for_sweep(self):
+        out = self.stop("s1", active=False)
+        d = json.loads(out)
+        self.assertEqual(d["decision"], "block")
+        self.assertIn("Secretary sweep", d["reason"])
+
+
 class CliLintTests(CliBase):
     def test_clean_log_lints_clean(self):
         self.add("-t", "observation", "-a", "system", "ok")
