@@ -10,6 +10,8 @@ import argparse
 import hashlib
 import json
 import os
+import re
+import subprocess
 import sys
 import time
 from datetime import datetime, timezone
@@ -18,6 +20,7 @@ from pathlib import Path
 DIR = ".casefile"
 LOG = "log.jsonl"
 META = "meta.json"
+ACTIVE = "active"  # untracked: the active-case pointer is per-clone local state
 LOCK = "log.lock"
 STALE_LOCK_S = 60
 
@@ -49,6 +52,22 @@ def load_meta(root: Path) -> dict:
 
 def save_meta(root: Path, meta: dict):
     (root / DIR / META).write_text(json.dumps(meta, indent=2) + "\n")
+
+
+def load_active(root: Path, meta: dict | None = None) -> str | None:
+    """The active-case pointer lives in the untracked `.casefile/active` file so
+    it never shows up in git diffs (SPEC §5.1: 'last touched, per config').
+    Falls back to a legacy `active_case` key in meta.json for repos created
+    before this split."""
+    p = root / DIR / ACTIVE
+    if p.exists():
+        return p.read_text().strip() or None
+    m = meta if meta is not None else load_meta(root)
+    return m.get("active_case")
+
+
+def save_active(root: Path, cid: str | None):
+    (root / DIR / ACTIVE).write_text((cid or "") + "\n")
 
 
 def read_entries(root: Path) -> list[dict]:
@@ -180,26 +199,38 @@ def dispute_state(entries: list[dict]):
     return state
 
 
+def verified_hypotheses(entries: list[dict]) -> set[str]:
+    """Hypotheses linked to ground truth by a verification (refs ≥1 observation
+    + ≥1 hypothesis). This is the underlying epistemic fact, independent of the
+    computed grade — an open dispute suppresses the *grade* to `disputed`
+    (SPEC §5.4) but does not erase that the claim was verified (used by the
+    CONTRADICTION lint, SPEC §7)."""
+    by_id = {e["id"]: e for e in entries}
+    verified: set[str] = set()
+    for e in entries:
+        if e["type"] == "verification":
+            obs = [r for r in e["refs"] if by_id.get(r, {}).get("type") == "observation"]
+            if obs:
+                verified.update(r for r in e["refs"]
+                                if by_id.get(r, {}).get("type") == "hypothesis")
+    return verified
+
+
 def compute_grades(entries: list[dict]) -> dict[str, str]:
     """SPEC §5.4. refuted (dispute upheld) removes a hypothesis from the live
     differential and feeds the ruled-out list."""
     by_id = {e["id"]: e for e in entries}
     disputes = dispute_state(entries)
     revoked = revoked_ids(entries)
+    verified = verified_hypotheses(entries)
 
     endorsements: dict[str, set[str]] = {}
-    verified: set[str] = set()
     for e in entries:
         if e["type"] == "endorsement":
             for r in e.get("refs", []):
                 t = by_id.get(r)
                 if t and e["author"] != t["author"]:
                     endorsements.setdefault(r, set()).add(e["author"])
-        elif e["type"] == "verification":
-            obs = [r for r in e["refs"] if by_id.get(r, {}).get("type") == "observation"]
-            if obs:
-                verified.update(r for r in e["refs"]
-                                if by_id.get(r, {}).get("type") == "hypothesis")
 
     grades: dict[str, str] = {}
     for e in entries:
@@ -271,16 +302,12 @@ def require_root():
     return root, read_entries(root), load_meta(root)
 
 
-def active_case(meta: dict) -> str | None:
-    return meta.get("active_case")
-
-
-def resolve_case(meta: dict, explicit: str | None) -> str:
+def resolve_case(root: Path, meta: dict, explicit: str | None) -> str:
     if explicit:
         if explicit not in meta.get("cases", {}):
             die(f"unknown case '{explicit}' (see `casefile status`)")
         return explicit
-    ac = active_case(meta)
+    ac = load_active(root, meta)
     if not ac:
         die("no active case (run `casefile open \"<title>\"`)")
     return ac
@@ -323,10 +350,10 @@ def cmd_init(args):
     d.mkdir()
     save_meta(Path.cwd(), {"schema": "1.0",
                            "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                           "cases": {}, "active_case": None})
+                           "cases": {}})
     (d / LOG).touch()
     gi = d / ".gitignore"
-    gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\n")
+    gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\n")
     print(f"initialized casefile in {d}")
 
 
@@ -335,21 +362,30 @@ def cmd_open(args):
     # switch if a case with this title (or slug) exists
     for cid, c in meta["cases"].items():
         if cid == args.title or c["title"].lower() == args.title.lower():
-            meta["active_case"] = cid
-            save_meta(root, meta)
+            _migrate_legacy_active(root, meta)
+            save_active(root, cid)
             print(cid)
             return
     cid = case_slug(args.title, set(meta["cases"]))
     meta["cases"][cid] = {"title": args.title, "goal": args.goal or "",
                           "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-    meta["active_case"] = cid
+    _migrate_legacy_active(root, meta)  # drop stale key before rewriting meta
     save_meta(root, meta)
+    save_active(root, cid)
     print(cid)
+
+
+def _migrate_legacy_active(root: Path, meta: dict):
+    """One-time cleanup: drop the git-tracked active_case pointer from meta.json
+    now that it lives in the untracked `.casefile/active` file."""
+    if "active_case" in meta:
+        del meta["active_case"]
+        save_meta(root, meta)
 
 
 def cmd_add(args):
     root, entries, meta = require_root()
-    case = resolve_case(meta, args.case)
+    case = resolve_case(root, meta, args.case)
     extra = {}
     if args.type == "decision":
         extra["rationale"] = args.rationale
@@ -368,6 +404,7 @@ def cmd_add(args):
     e = make_entry(entries, case, args.type, args.author, args.body,
                    refs=args.refs, **extra)
     append_entry(root, e)
+    save_active(root, case)  # SPEC §5.1: active case follows "last touched"
     print(e["id"])
 
 
@@ -437,18 +474,313 @@ def cmd_revoke(args):
     print(e["id"])
 
 
+def latest_abstract_id(entries: list[dict], case: str) -> str | None:
+    live = None
+    for e in entries:
+        if e["type"] == "digest" and e.get("kind") == "abstract" and e["case"] == case:
+            live = e["id"]
+    return live
+
+
 def cmd_digest(args):
     root, entries, meta = require_root()
-    case = resolve_case(meta, args.case)
+    case = resolve_case(root, meta, args.case)
     if args.kind not in DIGEST_KINDS:
         die(f"kind must be one of {sorted(DIGEST_KINDS)}")
-    viol = digest_invariant_violations(entries, args.supersedes)
+    supersedes = list(args.supersedes or [])
+    if args.kind == "abstract" and not supersedes:
+        # the rolling abstract (§6.3) supersedes the prior abstract; the first
+        # one supersedes nothing. Auto-fill so callers needn't track it.
+        prev = latest_abstract_id(entries, case)
+        supersedes = [prev] if prev else []
+    elif not supersedes:
+        die("--supersedes is required for mechanical/judgment digests")
+    viol = digest_invariant_violations(entries, supersedes)
     if viol:
         die("digest violates the evidence-chain invariant:\n  " + "\n  ".join(viol))
     e = make_entry(entries, case, "digest", args.author, args.body,
-                   supersedes=args.supersedes, kind=args.kind)
+                   supersedes=supersedes, kind=args.kind)
     append_entry(root, e)
+    save_active(root, case)  # SPEC §5.1: active case follows "last touched"
     print(e["id"])
+
+
+# -------- recheck (SPEC §8)
+
+def live_checks(entries: list[dict]) -> list[dict]:
+    """Hypotheses/constraints that carry a `check` recipe and are still live —
+    not superseded by a digest, not revoked (constraints), not refuted
+    (hypotheses). These are the claims recheck can re-test against the world."""
+    hidden = superseded_ids(entries)
+    revoked = revoked_ids(entries)
+    grades = compute_grades(entries)
+    out = []
+    for e in entries:
+        if not e.get("check") or e["id"] in hidden:
+            continue
+        if e["type"] == "constraint" and e["id"] not in revoked:
+            out.append(e)
+        elif e["type"] == "hypothesis" and grades.get(e["id"]) != "refuted":
+            out.append(e)
+    return out
+
+
+def prior_recheck_pass(entries: list[dict], target_id: str) -> bool | None:
+    """Whether the most recent recheck observation for target_id passed.
+    None if this claim has never been rechecked (no drift baseline yet)."""
+    last = None
+    for e in entries:
+        if e["type"] == "observation" and e.get("source") == f"recheck:{target_id}":
+            last = e
+    if last is None:
+        return None
+    return last["body"].startswith("[PASS]")
+
+
+def cmd_recheck(args):
+    root, entries, meta = require_root()
+    targets = live_checks(entries)
+    if args.case:
+        if args.case not in meta.get("cases", {}):
+            die(f"unknown case '{args.case}' (see `casefile status`)")
+        targets = [e for e in targets if e["case"] == args.case]
+    if not targets:
+        print("no live checks to run")
+        return
+
+    report = []
+    for e in targets:
+        prior = prior_recheck_pass(entries, e["id"])
+        try:
+            p = subprocess.run(e["check"], shell=True, cwd=root, text=True,
+                               capture_output=True, timeout=args.timeout)
+            passed = p.returncode == 0
+            tail = (p.stdout + p.stderr).strip()
+        except subprocess.TimeoutExpired:
+            passed, tail = False, f"(timed out after {args.timeout}s)"
+        except Exception as ex:  # a broken recipe is an observation, never a crash (§8)
+            passed, tail = False, f"(recheck error: {ex})"
+        marker = "[PASS]" if passed else "[FAIL]"
+        body = f"{marker} {e['type']} {e['id']}: {e['check']}"
+        if not passed and tail:
+            body += "\n" + tail[-400:]
+        obs = make_entry(entries, e["case"], "observation", "system", body,
+                         source=f"recheck:{e['id']}")
+        append_entry(root, obs)
+        entries.append(obs)  # keep ids unique + advance the drift baseline
+        report.append((e, passed, prior))
+
+    drifted = 0
+    for e, passed, prior in report:
+        drift = prior is not None and prior != passed
+        drifted += drift
+        mark = "ok  " if passed else "FAIL"
+        note = ""
+        if drift:
+            note = f"  <- DRIFT (was {'holds' if prior else 'failing'})"
+        elif prior is None:
+            note = "  (first recheck)"
+        print(f"{mark} `{e['id']}` [{e['type']}] {e['body'][:52]}{note}")
+    held = sum(1 for _, p, _ in report if p)
+    print(f"\n{held}/{len(report)} hold" +
+          (f"; {drifted} drifted since last recheck" if drifted else ""))
+
+
+# -------- mechanical compaction (SPEC §6.1)
+
+_FAIL_MARKERS = ("[fail]", "traceback", "error:", "failed", "fatal", "exception")
+
+
+def obs_signature(body: str) -> str:
+    """Normalized first line of an observation body (SPEC §6.1) — digits masked
+    so run counts and timings don't defeat grouping ('Ran 42 tests in 8.9s'
+    and 'Ran 35 tests in 5.8s' share a signature)."""
+    first = (body.strip().splitlines() or [""])[0]
+    return " ".join(re.sub(r"\d+", "#", first).lower().split())
+
+
+def obs_outcome(body: str) -> str:
+    b = body.lower()
+    return "fail" if any(m in b for m in _FAIL_MARKERS) else "pass"
+
+
+def _runs(seq, key):
+    """Yield maximal runs of consecutive items sharing key(item)."""
+    run, k = [], object()
+    for item in seq:
+        ik = key(item)
+        if ik != k and run:
+            yield run
+            run = []
+        run.append(item)
+        k = ik
+    if run:
+        yield run
+
+
+def compaction_plan(entries: list[dict]) -> list[tuple[str, list[str], str]]:
+    """Per case, collapse steady-state runs of hook-sourced observations.
+    Keep the first of each run (transition into the state) and the last
+    (latest-per-source, SPEC §6.1); supersede the redundant middle with one
+    mechanical digest. Invariant-protected observations (referenced by a
+    verification, §5.3) are never collapsed. Returns (case, [ids], summary)."""
+    hidden = superseded_ids(entries)
+    protected = verification_protected_obs(entries)
+    plan = []
+    by_case: dict[str, list[dict]] = {}
+    for e in entries:
+        if (e["type"] == "observation" and e["id"] not in hidden
+                and str(e.get("source", "")).startswith("hook:")):
+            by_case.setdefault(e["case"], []).append(e)
+    for case, obs in by_case.items():
+        for run in _runs(obs, lambda e: (e["source"], obs_signature(e["body"]),
+                                         obs_outcome(e["body"]))):
+            if len(run) < 3:
+                continue  # first+last already retained; nothing steady to drop
+            middle = [e for e in run[1:-1] if e["id"] not in protected]
+            if not middle:
+                continue
+            sig = obs_signature(run[0]["body"])
+            summary = (f"{len(middle)} steady-state {obs_outcome(run[0]['body'])} "
+                       f"observations collapsed ({run[0]['source']}: {sig})")
+            plan.append((case, [e["id"] for e in middle], summary))
+    return plan
+
+
+def cmd_compact(args):
+    root, entries, meta = require_root()
+    plan = compaction_plan(entries)
+    if args.case:
+        plan = [p for p in plan if p[0] == args.case]
+    if not plan:
+        print("nothing to compact")
+        return
+    total = 0
+    for case, ids, summary in plan:
+        viol = digest_invariant_violations(entries, ids)
+        if viol:  # belt-and-braces; the plan already excludes protected obs
+            continue
+        e = make_entry(entries, case, "digest", "system", summary,
+                       supersedes=ids, kind="mechanical")
+        append_entry(root, e)
+        entries.append(e)
+        total += len(ids)
+        print(f"`{e['id']}` [{case}] {summary}")
+    print(f"\ncompacted {total} observation(s) into {len(plan)} mechanical digest(s)")
+
+
+# -------- recall & dig (SPEC §10)
+
+def compost_entries(entries: list[dict]) -> list[dict]:
+    """The searchable memory (SPEC §10): abstracts + judgment digests. These are
+    the dense, model-written summaries the recall index consumes."""
+    return [e for e in entries if e["type"] == "digest"
+            and e.get("kind") in ("abstract", "judgment")]
+
+
+def index_path(root: Path) -> Path:
+    return root / DIR / "index.db"
+
+
+def build_index(root: Path, entries: list[dict], meta: dict) -> int | None:
+    """Rebuild the FTS5 recall cache from scratch (SPEC §10: the index is a
+    cache; the log is the truth). Returns row count, or None if FTS5 is
+    unavailable in this SQLite build (recall then falls back to a log scan)."""
+    import sqlite3
+    p = index_path(root)
+    p.unlink(missing_ok=True)
+    db = sqlite3.connect(p)
+    try:
+        db.execute("CREATE VIRTUAL TABLE compost USING fts5(id, case_id, title, ts, body)")
+    except sqlite3.OperationalError:
+        db.close()
+        p.unlink(missing_ok=True)
+        return None
+    rows = [(e["id"], e["case"],
+             meta.get("cases", {}).get(e["case"], {}).get("title", e["case"]),
+             e.get("ts", ""), e["body"])
+            for e in compost_entries(entries)]
+    db.executemany("INSERT INTO compost VALUES (?,?,?,?,?)", rows)
+    db.commit()
+    db.close()
+    return len(rows)
+
+
+def cmd_reindex(args):
+    root, entries, meta = require_root()
+    n = build_index(root, entries, meta)
+    if n is None:
+        die("SQLite FTS5 unavailable in this build; `recall` still works via log scan")
+    print(f"indexed {n} compost entr{'y' if n == 1 else 'ies'}")
+
+
+def _scan_recall(entries, meta, query, limit):
+    q = query.lower()
+    out = []
+    for e in compost_entries(entries):
+        if q in e["body"].lower():
+            title = meta.get("cases", {}).get(e["case"], {}).get("title", e["case"])
+            out.append((e["case"], title, e["body"]))
+    return out[:limit]
+
+
+def cmd_recall(args):
+    root, entries, meta = require_root()
+    import sqlite3
+    hits = None
+    p = index_path(root)
+    if p.exists():
+        db = sqlite3.connect(p)
+        try:
+            hits = db.execute(
+                "SELECT case_id, title, body FROM compost WHERE compost MATCH ? "
+                "ORDER BY bm25(compost) LIMIT ?", (args.query, args.limit)).fetchall()
+        except sqlite3.OperationalError:
+            hits = None  # bad FTS query or no FTS5 — fall back
+        db.close()
+    if hits is None:
+        hits = _scan_recall(entries, meta, args.query, args.limit)
+    if not hits:
+        print("no matches in the compost "
+              "(run `casefile reindex` if you have abstracts/judgment digests)")
+        return
+    for case, title, body in hits:
+        first = body.strip().splitlines()[0] if body.strip() else ""
+        print(f"`{case}` {title}\n    {first[:100]}")
+
+
+def cmd_dig(args):
+    root, entries, meta = require_root()
+    hidden = superseded_ids(entries)
+    by_id = {e["id"]: e for e in entries}
+
+    # exact-id lookup: expand one entry and its digest relationships
+    if args.query in by_id:
+        e = by_id[args.query]
+        tag = " [superseded]" if e["id"] in hidden else ""
+        print(f"{e['id']}  {e['type']}{tag}: {e['body']}")
+        for sid in e.get("supersedes", []):
+            s = by_id.get(sid)
+            if s:
+                print(f"    ↳ superseded {sid} ({s['type']}): {s['body'][:70]}")
+        for d in entries:  # who hid this entry?
+            if d["type"] == "digest" and e["id"] in d.get("supersedes", []):
+                print(f"    ⤷ hidden by digest {d['id']} [{d.get('kind')}]: {d['body'][:60]}")
+        return
+
+    q = args.query.lower()
+    matches = [e for e in entries if q in e["body"].lower()]
+    if not matches:
+        print("no matches in raw history")
+        return
+    for e in matches[-args.limit:]:
+        tag = "[superseded] " if e["id"] in hidden else ""
+        print(f"{e['id']}  {e['type']:<11} {tag}{e['body'].splitlines()[0][:78]}")
+        if e["type"] == "digest":
+            for sid in e.get("supersedes", []):
+                s = by_id.get(sid)
+                if s:
+                    print(f"    ↳ {sid} ({s['type']}): {s['body'].splitlines()[0][:66]}")
 
 
 # -------- views
@@ -475,7 +807,7 @@ def case_view(entries, meta, case):
 
 def cmd_show(args):
     root, entries, meta = require_root()
-    case = resolve_case(meta, args.case)
+    case = resolve_case(root, meta, args.case)
     ce, grades = case_view(entries, meta, case)
     info = meta["cases"][case]
     by_type: dict[str, list] = {}
@@ -546,7 +878,7 @@ def fence(body: str) -> str:
 
 def cmd_resume_context(args):
     root, entries, meta = require_root()
-    case = resolve_case(meta, args.case)
+    case = resolve_case(root, meta, args.case)
     ce, grades = case_view(entries, meta, case)
     info = meta["cases"][case]
     by_type: dict[str, list] = {}
@@ -672,11 +1004,23 @@ def cmd_lint(args):
             problems.append(f"ORPHAN           decision `{e['id']}` has no refs and "
                             f"no rationale: {e['body'][:60]}")
 
-    # CONTRADICTION: verified hypothesis referenced by any dispute (open or not)
+    # CONTRADICTION (SPEC §7): a hypothesis verified against ground truth and
+    # *later* disputed. Scan chronologically, growing the verified set as
+    # verifications appear, so a dispute only trips it if the verification came
+    # first — a dispute that precedes verification is the ordinary
+    # disputed->verified flow, not a contradiction. Keyed on the verified fact,
+    # not the grade: an open dispute suppresses the grade to `disputed`, so
+    # grade-keying would silence the very case §7 wants.
+    verified_so_far: set[str] = set()
     for e in entries:
-        if e["type"] == "dispute":
+        if e["type"] == "verification":
+            obs = [r for r in e["refs"] if by_id.get(r, {}).get("type") == "observation"]
+            if obs:
+                verified_so_far.update(r for r in e["refs"]
+                                       if by_id.get(r, {}).get("type") == "hypothesis")
+        elif e["type"] == "dispute":
             for r in e.get("refs", []):
-                if grades.get(r) == "verified":
+                if r in verified_so_far:
                     problems.append(f"CONTRADICTION    verified `{r}` is disputed by "
                                     f"`{e['id']}` — human review needed")
 
@@ -706,7 +1050,7 @@ def compute_status(root, entries, meta) -> dict:
                       "last_entry": ce[-1]["ts"] if ce else None,
                       "open_disputes": sum(1 for d in ds if d["case"] == cid),
                       "open_questions": sum(1 for q in qs if q["case"] == cid)}
-    return {"active_case": meta.get("active_case"),
+    return {"active_case": load_active(root, meta),
             "cases": cases,
             "mailbox": [{"id": q["id"], "case": q["case"], "body": q["body"]}
                         for q in mailbox]}
@@ -802,7 +1146,9 @@ def main():
     s.add_argument("body")
     s.add_argument("-a", "--author", required=True)
     s.add_argument("--kind", required=True, choices=sorted(DIGEST_KINDS))
-    s.add_argument("--supersedes", nargs="+", required=True)
+    s.add_argument("--supersedes", nargs="+",
+                   help="ids to hide; optional for --kind abstract (auto-supersedes "
+                        "the prior abstract)")
     s.add_argument("--case")
     s.set_defaults(fn=cmd_digest)
 
@@ -818,6 +1164,28 @@ def main():
     s.add_argument("--observations", type=int, default=8)
     s.add_argument("--budget", type=int, default=2000, help="approx token budget")
     s.set_defaults(fn=cmd_resume_context)
+
+    s = sub.add_parser("recheck", help="run check recipes; append observations; report drift")
+    s.add_argument("--case")
+    s.add_argument("--timeout", type=int, default=60, help="per-recipe timeout (s)")
+    s.set_defaults(fn=cmd_recheck)
+
+    s = sub.add_parser("compact", help="collapse steady-state hook observations (SPEC §6.1)")
+    s.add_argument("--case")
+    s.set_defaults(fn=cmd_compact)
+
+    s = sub.add_parser("reindex", help="rebuild the FTS recall index from the log")
+    s.set_defaults(fn=cmd_reindex)
+
+    s = sub.add_parser("recall", help="search the compost (abstracts + judgment digests)")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=5)
+    s.set_defaults(fn=cmd_recall)
+
+    s = sub.add_parser("dig", help="search raw/superseded history; expand digests")
+    s.add_argument("query")
+    s.add_argument("--limit", type=int, default=20)
+    s.set_defaults(fn=cmd_dig)
 
     s = sub.add_parser("lint", help="drift detection; exit 1 on findings")
     s.add_argument("--launder-threshold", type=int, default=3)
