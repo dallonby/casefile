@@ -974,6 +974,13 @@ def cmd_resume_context(args):
     # build sections in SPEC §11.1 priority order; evict from the bottom
     sections: list[tuple[str, list[str]]] = []
 
+    # the rolling abstract (§6.3) is the purpose-built resumption artifact —
+    # it leads. case_view already hides all but the live abstract.
+    abstracts = [e for e in by_type.get("digest", []) if e.get("kind") == "abstract"]
+    if abstracts:
+        sections.append(("STATUS (rolling abstract — the case in one paragraph):",
+                         [abstracts[-1]["body"]]))
+
     live = lambda es: [e for e in es if grades.get(e["id"]) != "revoked"]
     cons = live(by_type.get("constraint", []))
     if cons:
@@ -1541,6 +1548,16 @@ def cmd_hooks(args):
           "session for new hooks to take effect")
 
 
+def cmd_spitball(args):
+    import spitball
+    models = tuple(m.strip() for m in args.models.split(",") if m.strip())
+    if len(models) != 2:
+        die("spitball needs exactly two models (--models a,b)")
+    spitball.run(topic=args.topic, models=models, turns=args.turns,
+                 budget_usd=args.budget_usd, blind=args.blind,
+                 fake_script=args.fake_script)
+
+
 # --------------------------------------------------------------------- main
 
 def main():
@@ -1652,6 +1669,16 @@ def main():
     s.add_argument("action", choices=["install"])
     s.add_argument("vendor")
     s.set_defaults(fn=cmd_hooks)
+
+    s = sub.add_parser("spitball", help="two-model deliberation on the active case (§12)")
+    s.add_argument("--topic", required=True)
+    s.add_argument("--models", default="claude,codex",
+                   help="comma-separated adapter names, proposer first")
+    s.add_argument("--turns", type=int, default=6)
+    s.add_argument("--budget-usd", type=float)
+    s.add_argument("--blind", help="model name to seed with resume-context --blind")
+    s.add_argument("--fake-script", help=argparse.SUPPRESS)  # tests/CI (§18)
+    s.set_defaults(fn=cmd_spitball)
 
     s = sub.add_parser("lint", help="drift detection; exit 1 on findings")
     s.add_argument("--launder-threshold", type=int, default=3)

@@ -310,6 +310,17 @@ class CliViewTests(CliBase):
         r = self.cli("resume-context", "--budget", "120", expect=0)
         self.assertIn("evicted", r.out)
 
+    def test_resume_context_leads_with_abstract(self):
+        # §6.3: the rolling abstract is the resumption artifact; it must render
+        # in resume-context (found by a reset-readiness test, 2026-07-17).
+        self.cli("digest", "Problem: X. Status: verified. Next: ship Y.",
+                 "-a", "claude", "--kind", "abstract", expect=0)
+        r = self.cli("resume-context", expect=0)
+        self.assertIn("STATUS", r.out)
+        self.assertIn("Next: ship Y.", r.out)
+        # and it outranks constraints (leads the sections)
+        self.assertLess(r.out.index("STATUS"), r.out.index("TASK") + 200)
+
     def test_ruled_out_shown(self):
         h = self.add("-t", "hypothesis", "-a", "claude", "gas theory")
         d = self.add("-t", "observation", "-a", "system", "seed")  # noqa
