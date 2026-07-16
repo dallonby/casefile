@@ -511,6 +511,81 @@ class CliMemoryTests(CliBase):
         self.assertIn("superseded", r.out)
 
 
+class CliImportTests(CliBase):
+    def draft(self, lines):
+        p = self.dir / "draft.jsonl"
+        p.write_text("\n".join(json.dumps(d) for d in lines) + "\n")
+        return str(p)
+
+    def test_bulk_import_appends_and_echoes(self):
+        p = self.draft([
+            {"type": "constraint", "author": "user", "body": "no new deps"},
+            {"type": "hypothesis", "author": "claude", "body": "race in importer"},
+            {"type": "observation", "author": "system", "body": "test log tail"},
+        ])
+        r = self.cli("import", p, expect=0)
+        self.assertEqual(r.out.count("imported:"), 3)
+        self.assertIn("3 entries -> case test-case", r.out)
+        types = [e["type"] for e in self.log_entries()]
+        self.assertEqual(types[-3:], ["constraint", "hypothesis", "observation"])
+        obs = self.log_entries()[-1]
+        self.assertEqual(obs["source"], "import")
+
+    def test_invalid_line_rejects_whole_batch(self):
+        before = len(self.log_entries())
+        p = self.draft([
+            {"type": "constraint", "author": "user", "body": "fine"},
+            {"type": "endorsement", "author": "claude", "body": "not importable"},
+        ])
+        r = self.cli("import", p)
+        self.assertNotEqual(r.rc, 0)
+        self.assertEqual(len(self.log_entries()), before)  # all-or-nothing
+
+    def test_unknown_field_rejected(self):
+        p = self.draft([{"type": "note", "author": "claude", "body": "x",
+                         "grade": "verified"}])  # grades are computed, never stored
+        r = self.cli("import", p)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("unknown field", r.err)
+
+
+class CliHooksInstallTests(CliBase):
+    def test_install_writes_artifacts(self):
+        r = self.cli("hooks", "install", "claude-code", expect=0)
+        for rel in (".casefile/hooks/observe.py", ".casefile/hooks/sweep.py",
+                    ".claude/skills/casefile/SKILL.md", ".claude/settings.json"):
+            self.assertTrue((self.dir / rel).exists(), rel)
+        settings = json.loads((self.dir / ".claude" / "settings.json").read_text())
+        cmds = [h["command"] for groups in settings["hooks"].values()
+                for g in groups for h in g["hooks"]]
+        self.assertTrue(any("observe.py" in c for c in cmds))
+        self.assertTrue(any("sweep.py" in c for c in cmds))
+
+    def test_install_is_idempotent_and_merge_preserves(self):
+        sp = self.dir / ".claude" / "settings.json"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(json.dumps({"model": "opus", "hooks": {"PreToolUse": []}}))
+        self.cli("hooks", "install", "claude-code", expect=0)
+        r = self.cli("hooks", "install", "claude-code", expect=0)
+        self.assertIn("already wired", r.out)
+        settings = json.loads(sp.read_text())
+        self.assertEqual(settings["model"], "opus")  # merge, not overwrite
+        self.assertIn("PreToolUse", settings["hooks"])
+        self.assertEqual(len(settings["hooks"]["PostToolUse"]), 1)
+
+    def test_installed_hooks_are_valid_python(self):
+        self.cli("hooks", "install", "claude-code", expect=0)
+        for name in ("observe.py", "sweep.py"):
+            p = subprocess.run([sys.executable, "-m", "py_compile",
+                                str(self.dir / ".casefile" / "hooks" / name)],
+                               capture_output=True)
+            self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_unknown_vendor_rejected(self):
+        r = self.cli("hooks", "install", "cursor")
+        self.assertNotEqual(r.rc, 0)
+
+
 class CliLintTests(CliBase):
     def test_clean_log_lints_clean(self):
         self.add("-t", "observation", "-a", "system", "ok")

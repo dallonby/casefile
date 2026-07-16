@@ -118,9 +118,15 @@ class LogLock:
 
 
 def append_entry(root: Path, entry: dict):
+    append_entries(root, [entry])
+
+
+def append_entries(root: Path, batch: list[dict]):
+    """Append a validated batch under one lock — import is all-or-nothing."""
     with LogLock(root):
         with (root / DIR / LOG).open("a") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            for entry in batch:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
 
@@ -783,6 +789,59 @@ def cmd_dig(args):
                     print(f"    ↳ {sid} ({s['type']}): {s['body'].splitlines()[0][:66]}")
 
 
+# -------- import (SPEC §11.3 / M3)
+
+IMPORT_TYPES = {"hypothesis", "decision", "observation", "constraint",
+                "question", "note"}
+_IMPORT_EXTRAS = {"decision": {"rationale", "rejected"},
+                  "observation": {"source"},
+                  "hypothesis": {"check"},
+                  "constraint": {"check"},
+                  "question": {"to"}}
+
+
+def cmd_import(args):
+    """Bulk-append typed entries from a JSONL draft file. The model-assisted
+    extraction (conversation/CLAUDE.md/scrollback -> typed drafts) is porcelain
+    (SKILL.md); this validates the whole batch and appends all-or-nothing."""
+    root, entries, meta = require_root()
+    case = resolve_case(root, meta, args.case)
+    src = Path(args.file)
+    if not src.exists():
+        die(f"no such file: {src}")
+    staged: list[dict] = []
+    for n, line in enumerate(src.read_text().splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError as ex:
+            die(f"{src}:{n}: not valid JSON ({ex})")
+        t, author, body = d.get("type"), d.get("author"), d.get("body")
+        if t not in IMPORT_TYPES:
+            die(f"{src}:{n}: type must be one of {sorted(IMPORT_TYPES)} (got {t!r})")
+        if not author or not body:
+            die(f"{src}:{n}: 'author' and 'body' are required")
+        allowed = _IMPORT_EXTRAS.get(t, set())
+        unknown = set(d) - {"type", "author", "body", "refs"} - allowed
+        if unknown:
+            die(f"{src}:{n}: unknown field(s) for {t}: {', '.join(sorted(unknown))}")
+        extra = {k: d[k] for k in allowed if k in d}
+        if t == "observation":
+            extra.setdefault("source", "import")
+        # entries+staged: refs may point at earlier lines of the same import
+        e = make_entry(entries + staged, case, t, author, body,
+                       refs=d.get("refs"), **extra)
+        staged.append(e)
+    if not staged:
+        die(f"{src}: no entries to import")
+    append_entries(root, staged)
+    save_active(root, case)
+    for e in staged:
+        print(f"imported: {e['id']} {e['type']} \"{e['body'][:60]}\" ({e['author']})")
+    print(f"\n{len(staged)} entr{'y' if len(staged) == 1 else 'ies'} -> case {case}")
+
+
 # -------- views
 
 GRADE_ORDER = ["verified", "consensus", "disputed", "hypothesis"]
@@ -1185,6 +1244,278 @@ def cmd_log(args):
               f"{e['author']:<8} {marks}{refs}  {e['body']}")
 
 
+# ------------------------------------------- vendor integration (SPEC §13/M3)
+# The templates below are the hand-rolled hooks this repo dogfooded, promoted
+# to installables once proven. `hooks install claude-code` must regenerate
+# byte-identical copies of what we run ourselves.
+
+HOOK_OBSERVE_PY = r'''#!/usr/bin/env python3
+"""PostToolUse hook: file interesting Bash results as casefile observations.
+
+SPEC §13 hook adapter. Best-effort by design (P9): any failure exits 0
+silently — the hook must never block the session. Volume control: only test
+runs, commits, and failing commands are recorded, and casefile's own
+invocations are skipped. Obvious token/key patterns are redacted before
+append (SPEC §15 — the log rides in git). After appending, mechanical
+compaction (§6.1) runs opportunistically to keep steady-state noise down.
+"""
+import json
+import re
+import subprocess
+import sys
+from pathlib import Path
+
+MAX_BODY = 500
+
+INTERESTING = re.compile(
+    r"\b(pytest|unittest|npm test|yarn test|pnpm test|cargo test|go test"
+    r"|make (test|check)|tox|git commit)\b")
+FAILURE = re.compile(r"(?i)\b(traceback|error:|failed|fatal|exception)\b")
+
+KV_SECRET = re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd)(\s*[=:]\s*)\S+")
+SECRET_PATTERNS = [
+    re.compile(r"\b(sk|pk)-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]{16,}"),
+]
+
+
+def redact(s: str) -> str:
+    s = KV_SECRET.sub(r"\1\2[REDACTED]", s)
+    for rx in SECRET_PATTERNS:
+        s = rx.sub("[REDACTED]", s)
+    return s
+
+
+def main():
+    hook = json.loads(sys.stdin.read())
+    if hook.get("tool_name") != "Bash":
+        return
+    cmd = (hook.get("tool_input") or {}).get("command", "")
+    if not cmd or "casefile" in cmd:
+        return  # never observe the tool observing itself
+    resp = hook.get("tool_response") or {}
+    if not isinstance(resp, dict):
+        resp = {"stdout": str(resp)}
+    stdout = str(resp.get("stdout", ""))
+    stderr = str(resp.get("stderr", ""))
+    failed = bool(FAILURE.search(stderr) or FAILURE.search(stdout[-2000:]))
+    if not (INTERESTING.search(cmd) or failed):
+        return
+    out = (stdout + "\n" + stderr).strip()
+    body = redact(f"$ {cmd.splitlines()[0][:120]}\n{out[-MAX_BODY:] if out else '(no output)'}")
+    root = Path(__file__).resolve().parents[2]  # <repo>/.casefile/hooks/observe.py
+    cli = ([sys.executable, str(root / "casefile.py")]
+           if (root / "casefile.py").exists() else ["casefile"])
+    subprocess.run(cli + ["add", "-t", "observation", "-a", "system",
+                          "--source", "hook:post-bash", body],
+                   cwd=root, capture_output=True, timeout=10)
+    subprocess.run(cli + ["compact"],  # §6.1: compaction rides hook batches
+                   cwd=root, capture_output=True, timeout=10)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+'''
+
+HOOK_SWEEP_PY = r'''#!/usr/bin/env python3
+"""Stop hook: secretary sweep (SPEC §13).
+
+Blocks the first stop of a session so the model diffs its conversation
+against the casefile log and files the gaps — the decision made
+conversationally in window 4 that nobody wrote down. `stop_hook_active`
+guards against blocking forever; no active case means nothing to sweep.
+"""
+import json
+import sys
+from pathlib import Path
+
+REASON = (
+    "Secretary sweep (casefile): before ending, diff this conversation against "
+    "the casefile log. Anything decided, constrained, observed, or ruled out "
+    "here that isn't recorded? File it with `python3 casefile.py add ...` using "
+    "the correct type and author (user for the user's words, claude for your "
+    "own). Then file the sweep marker — "
+    "`python3 casefile.py add -t note -a claude \"secretary sweep: <gaps filed, "
+    "or 'nothing unrecorded'>\"` — and finish."
+)
+
+
+def main():
+    hook = json.load(sys.stdin)
+    if hook.get("stop_hook_active"):
+        return  # this stop already swept; let the session end
+    root = Path(__file__).resolve().parents[2]
+    if not _active_case(root):
+        return  # no active case means nothing to sweep
+    print(json.dumps({"decision": "block", "reason": REASON}))
+
+
+def _active_case(root: Path) -> str | None:
+    """Mirror casefile.load_active: the pointer lives in the untracked
+    .casefile/active file, with a legacy fallback to meta.json."""
+    ap = root / ".casefile" / "active"
+    if ap.exists():
+        return ap.read_text().strip() or None
+    try:
+        return json.loads((root / ".casefile" / "meta.json").read_text()).get("active_case")
+    except Exception:
+        return None
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception:
+        pass
+    sys.exit(0)
+'''
+
+SKILL_MD = '''---
+name: casefile
+description: Operate the casefile investigation log in this repo — resume context at session start, file hypotheses/decisions/observations with correct types and authors as you work, and translate the user's conversational directions ("where are we", "rule that out", "don't touch X", "have we seen this before") into casefile CLI calls.
+---
+
+# casefile — porcelain behavior (SPEC §11.2, §13)
+
+The CLI is `python3 casefile.py <cmd>` from the repo root (or `casefile` if
+installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
+**never edit it by hand**; corrections are new entries.
+
+## Session start
+
+1. Run `python3 casefile.py resume-context` and read it. Ground truth beats
+   the notes: where the log and the world conflict, the world wins — record
+   the discrepancy as a new observation.
+2. Run `python3 casefile.py recheck` — it re-runs every recorded check
+   recipe and tells you which claims still hold versus held-three-days-ago.
+   Drift is your first lead.
+3. Run `python3 casefile.py status`. Address open questions before
+   proceeding; questions marked `→ user` are waiting on the user — surface
+   them once, don't block on them. Act on any dormancy nudge or lint count
+   conversationally (never dump raw lint output at the user).
+
+## Filing conventions (types and authors matter — grades are computed from them)
+
+- **hypothesis** — falsifiable claim, author is whoever proposed it. Add
+  `--check '<shell>'` when a one-liner can test it (exit 0 = still holds).
+- **decision** — author `user` ONLY for choices the user actually made;
+  your own proposals are author `claude` (they render as "asserted, not
+  user-confirmed"). Always give `--rationale`; record losing alternatives
+  with `--rejected "option:reason"` so they aren't re-proposed.
+- **observation** — ground truth only: test output, command results, log
+  lines, with `--source`. Never file your own inference as an observation.
+- **verify** — links a hypothesis to a real observation. Model agreement is
+  never verification; endorse instead (`consensus` is explicitly weaker).
+- **dispute** when you disagree with a recorded claim; `resolve` with
+  `--outcome upheld|withdrawn|answered` when settled.
+- **question --to user** for things only the user can answer (the mailbox).
+- **digest** at checkpoints (`--kind judgment`), and keep the rolling
+  abstract current (`--kind abstract`; `--supersedes` is automatic for
+  abstracts): problem, status with grade in words, leading theory,
+  ruled-out list, key decisions, open items. Run `reindex` after.
+
+## Recognizing casefile-directed speech
+
+| user says | you do |
+|---|---|
+| "where are we on X?" | `resume-context` → prose summary sized to the question |
+| "don't touch X" | `add -t constraint -a user` |
+| "I'm not convinced by X" | `dispute -a user` |
+| "why did we rule out X?" | `dig "<query>"` (searches superseded history; expands digests) |
+| "have we seen this before?" | `recall "<query>"` (searches past-case abstracts) |
+| "rule that out" / "let's go with X" | `resolve` / `add -t decision -a user` — **confirm first** |
+
+## Trust conventions
+
+- **Echo-back**: every mutation of the *user's* words echoes in one line:
+  `recorded: constraint "don't touch the sniffer" (user)`. This is how
+  mistranscription gets caught.
+- **Confirm** destructive-ish acts (resolve, digest, revoke) with one word
+  before running them. Reads never confirm.
+- Your own routine filing is silent by default; show it on request.
+
+## Importing existing notes (§11.3)
+
+To bootstrap a case from a CLAUDE.md, notes file, or pasted scrollback:
+extract typed entries into a JSONL draft — one
+`{"type": …, "author": …, "body": …}` per line (decisions may carry
+`rationale`/`rejected`; observations `source`; hypotheses/constraints
+`check`; questions `to`) — show the user the draft for bulk confirmation,
+then run `python3 casefile.py import <draft.jsonl>`. Validation is
+all-or-nothing; each imported entry echoes.
+
+## Proposing
+
+- When a debugging/diagnosis conversation shows multi-window shape
+  (reproduction attempts, competing theories, >1 hour of context) and no
+  case is open, **propose** opening one; on "yes", open it and backfill via
+  `import`. Before the first hypothesis, `recall` the problem statement —
+  surface strong compost hits ("this resembles the March importer case…").
+- When the differential stalls (two theories, no discriminating evidence,
+  ~3 windows without progress), propose escalating to a spitball (once the
+  driver exists — M4).
+'''
+
+CLAUDE_HOOKS = [  # event, matcher, command, timeout
+    ("PostToolUse", "Bash",
+     'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/observe.py"', 15),
+    ("Stop", None,
+     'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/sweep.py"', 10),
+]
+
+
+def _write_if_changed(path: Path, content: str) -> str:
+    if path.exists() and path.read_text() == content:
+        return "unchanged"
+    verb = "updated" if path.exists() else "wrote"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content)
+    return verb
+
+
+def _ensure_hook(settings: dict, event: str, matcher: str | None,
+                 command: str, timeout: int) -> bool:
+    groups = settings.setdefault("hooks", {}).setdefault(event, [])
+    for g in groups:
+        if any(h.get("command") == command for h in g.get("hooks", [])):
+            return False  # already installed
+    g = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
+    if matcher:
+        g = {"matcher": matcher, **g}
+    groups.append(g)
+    return True
+
+
+def cmd_hooks(args):
+    if args.vendor != "claude-code":
+        die("only 'claude-code' is supported for now (codex-side: SPEC §13, "
+            "verify against that CLI when building it)")
+    root, entries, meta = require_root()
+    for rel, content in [(".casefile/hooks/observe.py", HOOK_OBSERVE_PY),
+                         (".casefile/hooks/sweep.py", HOOK_SWEEP_PY),
+                         (".claude/skills/casefile/SKILL.md", SKILL_MD)]:
+        print(f"{_write_if_changed(root / rel, content)}: {rel}")
+    sp = root / ".claude" / "settings.json"
+    settings = json.loads(sp.read_text()) if sp.exists() else {}
+    changed = [ _ensure_hook(settings, ev, m, cmd, t)
+                for ev, m, cmd, t in CLAUDE_HOOKS ]
+    if any(changed):
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        sp.write_text(json.dumps(settings, indent=2) + "\n")
+        print(f"updated: .claude/settings.json ({sum(changed)} hook(s) added)")
+    else:
+        print("unchanged: .claude/settings.json (hooks already wired)")
+    print("\nnote: Claude Code loads settings at session start — restart the "
+          "session for new hooks to take effect")
+
+
 # --------------------------------------------------------------------- main
 
 def main():
@@ -1285,6 +1616,16 @@ def main():
     s.add_argument("query")
     s.add_argument("--limit", type=int, default=20)
     s.set_defaults(fn=cmd_dig)
+
+    s = sub.add_parser("import", help="bulk-append typed entries from a JSONL draft")
+    s.add_argument("file")
+    s.add_argument("--case")
+    s.set_defaults(fn=cmd_import)
+
+    s = sub.add_parser("hooks", help="install vendor integration (hooks + skill)")
+    s.add_argument("action", choices=["install"])
+    s.add_argument("vendor")
+    s.set_defaults(fn=cmd_hooks)
 
     s = sub.add_parser("lint", help="drift detection; exit 1 on findings")
     s.add_argument("--launder-threshold", type=int, default=3)
