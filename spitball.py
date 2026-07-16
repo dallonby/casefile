@@ -156,14 +156,17 @@ class CodexAdapter:
     def __init__(self, root: Path):
         self.root = root
         self.opts = ["--json", "--sandbox", "workspace-write"]
+        # `exec resume` rejects --sandbox (live-run failure 2026-07-17);
+        # the config-override spelling is accepted by both subcommands
+        self.resume_opts = ["--json", "-c", 'sandbox_mode="workspace-write"']
 
     def start(self, context: str) -> dict:
         return self._call(["codex", "exec", *self.opts, context],
                           {"tid": None, "usd": None, "tokens": 0})
 
     def send(self, handle: dict, msg: str) -> str:
-        h = self._call(["codex", "exec", "resume", handle["tid"], *self.opts, msg],
-                       handle)
+        h = self._call(["codex", "exec", "resume", handle["tid"],
+                        *self.resume_opts, msg], handle)
         return h["reply"]
 
     def _call(self, cmd, handle):

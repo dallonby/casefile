@@ -1236,7 +1236,17 @@ def compute_status(root, entries, meta) -> dict:
                         for q in mailbox],
             "lint": len(lint_problems(entries)),
             "dormancy_candidates": dormancy_candidates(lifecycle),
-            "spend": None}  # tracked from M4 (spitball driver) onward
+            "spend": _last_spitball_spend(root)}
+
+
+def _last_spitball_spend(root: Path):
+    """Latest spitball session's spend, from the driver's drop-file (§11.4)."""
+    try:
+        d = json.loads((root / DIR / UI_DIR / "spitball.json").read_text())
+        return {"usd": d.get("spend_usd"), "tokens": d.get("tokens"),
+                "models": d.get("models"), "turn": d.get("turn")}
+    except Exception:
+        return None
 
 
 def cmd_status(args):
