@@ -91,6 +91,36 @@ class DriverTests(SpitballBase):
             "concluded nothing whatsoever relevant today"))
 
 
+class StreamAdapterTests(unittest.TestCase):
+    """Protocol-folding logic only — no live process (probed live 2026-07-17)."""
+
+    def test_apply_event_folds_init_and_result(self):
+        h = {"sid": None, "usd": 0.0, "tokens": 0, "reply": ""}
+        A = spitball.StreamClaudeAdapter._apply_event
+        self.assertFalse(A(h, {"type": "system", "subtype": "init",
+                               "session_id": "s-1"}))
+        self.assertFalse(A(h, {"type": "assistant", "message": {}}))
+        self.assertTrue(A(h, {"type": "result", "result": "pong",
+                              "session_id": "s-1", "total_cost_usd": 0.01}))
+        self.assertEqual(h["reply"], "pong")
+        self.assertEqual(h["sid"], "s-1")
+        self.assertAlmostEqual(h["usd"], 0.01)
+
+    def test_umsg_shape(self):
+        m = json.loads(spitball.StreamClaudeAdapter._umsg("hi"))
+        self.assertEqual(m["type"], "user")
+        self.assertEqual(m["message"]["content"][0]["text"], "hi")
+
+    def test_adapter_registry(self):
+        root = Path(".")
+        self.assertIsInstance(spitball.make_adapter("claude", root),
+                              spitball.StreamClaudeAdapter)
+        self.assertIsInstance(spitball.make_adapter("claude-resume", root),
+                              spitball.ClaudeAdapter)
+        self.assertIsInstance(spitball.make_adapter("codex", root),
+                              spitball.CodexAdapter)
+
+
 class KillTest(SpitballBase):
     """SPEC §18: kill -9 the driver mid-session; restart; no consequential
     loss. Everything of consequence is already in the log (P1)."""

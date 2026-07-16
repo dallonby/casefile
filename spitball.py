@@ -70,6 +70,84 @@ class ClaudeAdapter:
         pass  # -p sessions end per call; nothing to tear down
 
 
+class StreamClaudeAdapter:
+    """M6: one long-lived `claude -p --input/output-format stream-json`
+    process per session. Measured 2026-07-17 (see log): second turns ~3x
+    faster than resume-mode (no session reload), and only this transport can
+    interject mid-turn (§12.3 hot path). Protocol verified by probe: user
+    messages as JSONL in; system/assistant/result events out; `--verbose`
+    required for stream output with -p."""
+    name = "claude"
+
+    def __init__(self, root: Path):
+        self.root = root
+        self.cmd = ["claude", "-p", "--input-format", "stream-json",
+                    "--output-format", "stream-json", "--verbose",
+                    "--setting-sources", "user",
+                    "--allowedTools",
+                    f"Bash({CLI_STR}:*),Bash(python3 casefile.py:*)"]
+
+    @staticmethod
+    def _umsg(text: str) -> str:
+        return json.dumps({"type": "user", "message": {
+            "role": "user", "content": [{"type": "text", "text": text}]}}) + "\n"
+
+    @staticmethod
+    def _apply_event(handle: dict, ev: dict) -> bool:
+        """Fold one stream event into the handle; True when the turn is done."""
+        if ev.get("type") == "system" and ev.get("subtype") == "init":
+            handle["sid"] = ev.get("session_id", handle.get("sid"))
+        elif ev.get("type") == "result":
+            handle["reply"] = ev.get("result", "")
+            handle["usd"] += ev.get("total_cost_usd") or 0.0
+            handle["sid"] = ev.get("session_id", handle.get("sid"))
+            return True
+        return False
+
+    def start(self, context: str) -> dict:
+        proc = subprocess.Popen(self.cmd, cwd=self.root, text=True, bufsize=1,
+                                stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                stderr=subprocess.DEVNULL)
+        h = {"proc": proc, "sid": None, "usd": 0.0, "tokens": 0, "reply": ""}
+        h["reply"] = self.send(h, context)
+        return h
+
+    def send(self, handle: dict, msg: str) -> str:
+        p = handle["proc"]
+        if p.poll() is not None:
+            raise RuntimeError(f"stream claude died (rc={p.returncode})")
+        p.stdin.write(self._umsg(msg))
+        p.stdin.flush()
+        deadline = time.time() + TURN_TIMEOUT_S
+        for line in p.stdout:
+            if time.time() > deadline:
+                raise RuntimeError("stream claude: turn timeout")
+            try:
+                ev = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if self._apply_event(handle, ev):
+                return handle["reply"]
+        raise RuntimeError("stream claude: stdout closed before result")
+
+    def interject(self, handle: dict, msg: str):
+        """§12.3 hot path: inject without waiting for the turn to finish."""
+        handle["proc"].stdin.write(self._umsg(msg))
+        handle["proc"].stdin.flush()
+
+    def cost(self, handle):
+        return {"usd": handle["usd"], "tokens": handle["tokens"]}
+
+    def stop(self, handle):
+        p = handle.get("proc")
+        if p and p.poll() is None:
+            try:
+                p.stdin.close()
+                p.wait(timeout=10)
+            except Exception:
+                p.kill()
+
+
 class CodexAdapter:
     """codex exec with session resume (§12.2). thread_id from the
     thread.started event; reply is the last agent_message item."""
@@ -151,11 +229,14 @@ class FakeAdapter:
 def make_adapter(name: str, root: Path, fake_script: Path | None = None):
     if fake_script:
         return FakeAdapter(root, name, fake_script)
-    if name == "claude":
+    if name == "claude":  # stream promoted to default per the M6 measurement
+        return StreamClaudeAdapter(root)
+    if name == "claude-resume":  # fallback transport (M4 v1)
         return ClaudeAdapter(root)
     if name == "codex":
         return CodexAdapter(root)
-    raise SystemExit(f"unknown model '{name}' (adapters: claude, codex)")
+    raise SystemExit(f"unknown model '{name}' "
+                     "(adapters: claude, claude-resume, codex)")
 
 
 # ------------------------------------------------------------------- briefs
