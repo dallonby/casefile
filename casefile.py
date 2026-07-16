@@ -175,6 +175,17 @@ def revoked_ids(entries: list[dict]) -> set[str]:
     return out
 
 
+def fulfilled_ids(entries: list[dict]) -> set[str]:
+    """Decisions closed by a resolution with outcome `fulfilled` (§5.3): the
+    mandated work shipped. Dismissed for the evidence-chain invariant, but
+    semantically distinct from revocation — completed, not retracted."""
+    out = set()
+    for e in entries:
+        if e["type"] == "resolution" and e.get("outcome") == "fulfilled":
+            out.update(e.get("refs", []))
+    return out
+
+
 def verification_protected_obs(entries: list[dict]) -> set[str]:
     by_id = {e["id"]: e for e in entries}
     out = set()
@@ -228,6 +239,7 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
     by_id = {e["id"]: e for e in entries}
     disputes = dispute_state(entries)
     revoked = revoked_ids(entries)
+    fulfilled = fulfilled_ids(entries)
     verified = verified_hypotheses(entries)
 
     endorsements: dict[str, set[str]] = {}
@@ -258,6 +270,8 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
         elif t in ("decision", "constraint"):
             if eid in revoked:
                 grades[eid] = "revoked"
+            elif eid in fulfilled:
+                grades[eid] = "fulfilled"
             elif e["author"] == "user":
                 grades[eid] = "stated"
             else:
@@ -279,6 +293,7 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
     view = entries if as_of is None else entries[:as_of]
     by_id = {e["id"]: e for e in view}
     revoked = revoked_ids(view)
+    fulfilled = fulfilled_ids(view)
     resolved = resolved_ref_ids(view)
     protected_obs = verification_protected_obs(view)
     out = []
@@ -290,8 +305,9 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
         t = e["type"]
         if t == "constraint" and sid not in revoked:
             out.append(f"{sid}: unrevoked constraint")
-        elif t == "decision" and sid not in revoked:
-            out.append(f"{sid}: unrevoked decision")
+        elif t == "decision" and sid not in revoked and sid not in fulfilled:
+            out.append(f"{sid}: undismissed decision (revoke or resolve "
+                       f"--outcome fulfilled first)")
         elif t in ("dispute", "question") and sid not in resolved:
             out.append(f"{sid}: open {t}")
         elif t == "observation" and sid in protected_obs:
@@ -445,8 +461,16 @@ def cmd_dispute(args):
 def cmd_resolve(args):
     root, entries, meta = require_root()
     t = _target(entries, args.entry)
-    if t["type"] not in ("dispute", "question"):
-        die(f"{args.entry} is a {t['type']}, not a dispute or question")
+    if t["type"] == "decision":
+        if args.outcome != "fulfilled":
+            die("decisions only resolve with --outcome fulfilled "
+                "(to retract one, use `revoke`)")
+    elif t["type"] in ("dispute", "question"):
+        if args.outcome == "fulfilled":
+            die("'fulfilled' is for decisions; disputes/questions take "
+                "upheld/withdrawn/answered")
+    else:
+        die(f"{args.entry} is a {t['type']}, not a dispute, question, or decision")
     e = make_entry(entries, t["case"], "resolution", args.author, args.reason,
                    refs=[args.entry], outcome=args.outcome)
     append_entry(root, e)
@@ -854,6 +878,7 @@ PHRASE = {
     "hypothesis": "an unverified hypothesis",
     "asserted": "asserted, not user-confirmed",
     "refuted": "refuted",
+    "fulfilled": "fulfilled — shipped and observed; digestible",
 }
 
 
@@ -1561,7 +1586,8 @@ def main():
     s = sub.add_parser("resolve", help="close a dispute or question")
     s.add_argument("entry")
     s.add_argument("-a", "--author", required=True)
-    s.add_argument("--outcome", required=True, choices=["upheld", "withdrawn", "answered"])
+    s.add_argument("--outcome", required=True,
+                   choices=["upheld", "withdrawn", "answered", "fulfilled"])
     s.add_argument("--reason", required=True)
     s.set_defaults(fn=cmd_resolve)
 

@@ -172,7 +172,7 @@ git (provide a starter `.gitignore`).
 | `question` | open unknown; user-authored questions form the **mailbox** | `to` (optional: `user`, `any`) |
 | `endorsement` | author X supports another author's entry | `comment` |
 | `dispute` | author X challenges entry; **blocks promotion** while open | `reason` in body |
-| `resolution` | closes a dispute or question | `outcome`: `upheld`/`withdrawn`/`answered` |
+| `resolution` | closes a dispute or question; marks a decision fulfilled | `outcome`: `upheld`/`withdrawn`/`answered`; `fulfilled` (decisions only) |
 | `verification` | links hypothesis → observation(s) | refs must include ≥1 observation |
 | `digest` | summarizes and hides a span | `supersedes` (list of ids), `kind`: `mechanical`/`judgment`/`abstract` |
 | `revocation` | explicitly retires a constraint or decision | refs the retired entry |
@@ -183,7 +183,12 @@ Rules enforced at append time:
 - `verification` requires ≥1 `observation` ref and ≥1 `hypothesis` ref;
 - `digest.supersedes` may NOT include: unrevoked constraints, undismissed
   decisions, open disputes/questions, or observations referenced by any
-  verification (**the evidence-chain invariant** — see also lint §7);
+  verification (**the evidence-chain invariant** — see also lint §7).
+  A decision is *dismissed* by revocation (retracted) **or** by a
+  `resolution` with `outcome: fulfilled` (the work it mandated shipped and
+  was observed — distinct from retraction; the digest that supersedes it
+  must carry the residue). Revoke ≠ fulfil: the record must not read a
+  completed plan as a reversed one;
 - refs must exist and belong to the same case (digests exempted for
   cross-case abstracts only).
 

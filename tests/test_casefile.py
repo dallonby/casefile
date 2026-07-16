@@ -511,6 +511,45 @@ class CliMemoryTests(CliBase):
         self.assertIn("superseded", r.out)
 
 
+class CliFulfilledTests(CliBase):
+    """§5.3: fulfilled dismisses a decision for the invariant without reading
+    as a retraction; the digest carries the residue."""
+
+    def test_fulfilled_decision_becomes_digestible(self):
+        d = self.add("-t", "decision", "-a", "claude", "build the thing",
+                     "--rationale", "because")
+        r = self.cli("digest", "phase done", "-a", "claude",
+                     "--kind", "judgment", "--supersedes", d)
+        self.assertNotEqual(r.rc, 0)  # undismissed: blocked
+        self.assertIn("undismissed decision", r.err)
+        self.cli("resolve", d, "-a", "claude", "--outcome", "fulfilled",
+                 "--reason", "shipped in commit abc", expect=0)
+        r = self.cli("digest", "phase done: thing built (see abc)", "-a", "claude",
+                     "--kind", "judgment", "--supersedes", d, expect=0)
+        self.assertIn(d, cf.superseded_ids(self.log_entries()))
+
+    def test_fulfilled_grade_and_lint_clean(self):
+        d = self.add("-t", "decision", "-a", "claude", "do X", "--rationale", "y")
+        self.cli("resolve", d, "-a", "claude", "--outcome", "fulfilled",
+                 "--reason", "done", expect=0)
+        grades = cf.compute_grades(self.log_entries())
+        self.assertEqual(grades[d], "fulfilled")
+        self.assertEqual(self.cli("lint").rc, 0)
+
+    def test_fulfilled_rejected_for_questions(self):
+        q = self.add("-t", "question", "-a", "user", "which db?")
+        r = self.cli("resolve", q, "-a", "claude", "--outcome", "fulfilled",
+                     "--reason", "n/a")
+        self.assertNotEqual(r.rc, 0)
+
+    def test_other_outcomes_rejected_for_decisions(self):
+        d = self.add("-t", "decision", "-a", "claude", "do X", "--rationale", "y")
+        r = self.cli("resolve", d, "-a", "claude", "--outcome", "answered",
+                     "--reason", "n/a")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("fulfilled", r.err)
+
+
 class CliImportTests(CliBase):
     def draft(self, lines):
         p = self.dir / "draft.jsonl"
