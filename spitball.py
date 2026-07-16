@@ -35,10 +35,12 @@ class ClaudeAdapter:
 
     def __init__(self, root: Path):
         self.root = root
+        # one comma-joined value: --allowedTools is variadic and would
+        # otherwise swallow any later positional (live-run failure, 2026-07-17)
         self.base = ["claude", "-p", "--output-format", "json",
                      "--setting-sources", "user",
                      "--allowedTools",
-                     f"Bash({CLI_STR}:*)", "Bash(python3 casefile.py:*)"]
+                     f"Bash({CLI_STR}:*),Bash(python3 casefile.py:*)"]
 
     def start(self, context: str) -> dict:
         return self._call(None, context)
@@ -48,8 +50,9 @@ class ClaudeAdapter:
         return h["reply"]
 
     def _call(self, sid, prompt, handle=None):
-        cmd = list(self.base) + (["-r", sid] if sid else []) + [prompt]
+        cmd = list(self.base) + (["-r", sid] if sid else [])
         p = subprocess.run(cmd, cwd=self.root, capture_output=True, text=True,
+                           input=prompt,  # stdin: immune to variadic-flag capture
                            timeout=TURN_TIMEOUT_S)
         if p.returncode != 0:
             raise RuntimeError(f"claude adapter: rc={p.returncode}: {p.stderr[:300]}")
@@ -267,10 +270,22 @@ def run(topic: str, models=("claude", "codex"), turns: int = 6,
     log_t(b_name, "seed-reply", hb.get("reply", ""))
 
     # 2. ferry turns
+    def drop_status(turn):
+        try:  # best-effort: feeds the §14 status bar; never blocks the drive
+            usd, tokens = spend()
+            ui = root / ".casefile" / "ui"
+            ui.mkdir(parents=True, exist_ok=True)
+            (ui / "spitball.json").write_text(json.dumps(
+                {"models": "+".join(models), "turn": turn,
+                 "spend_usd": round(usd, 4), "tokens": tokens}))
+        except Exception:
+            pass
+
     msg_to_a = hb.get("reply", "")
     outcome, idle_rounds = "turn-budget", 0
     entries_before = len(cf.read_entries(root))
     for turn in range(turns):
+        drop_status(turn)
         if converged(root, case):
             outcome = "converged"
             break

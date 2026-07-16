@@ -636,6 +636,57 @@ class CliHooksInstallTests(CliBase):
         self.assertNotEqual(r.rc, 0)
 
 
+class CliUiTests(CliBase):
+    def test_dry_run_plan_is_window_not_session(self):
+        r = self.cli("ui", "--dry-run", expect=0)
+        self.assertIn("new-window", r.out)          # §14: never a nested session
+        self.assertNotIn("new-session", r.out)
+        self.assertIn("tail -F", r.out)
+        self.assertIn("--render-status", r.out)
+
+    def test_ui_outside_tmux_dies(self):
+        env = {k: v for k, v in __import__("os").environ.items() if k != "TMUX"}
+        p = subprocess.run([sys.executable, str(CASEFILE), "ui"],
+                           cwd=self.dir, capture_output=True, text=True, env=env)
+        self.assertNotEqual(p.returncode, 0)
+        self.assertIn("tmux", p.stderr)
+
+    def test_ui_prepare_default_channel_is_state_view(self):
+        p = cf.ui_prepare(self.dir)
+        self.assertTrue(p["active"].is_symlink())
+        self.assertEqual(p["active"].resolve(), p["state"].resolve())
+        cf.ui_prepare(self.dir)  # idempotent (ln -sfn semantics)
+
+    def test_status_line_fields(self):
+        self.add("-t", "question", "-a", "user", "pending?", "--to", "user")
+        p = cf.ui_paths(self.dir)
+        p["dir"].mkdir(parents=True, exist_ok=True)
+        p["spitball"].write_text(json.dumps(
+            {"models": "claude+codex", "turn": 3, "spend_usd": 1.25}))
+        entries = self.log_entries()
+        meta = json.loads((self.dir / ".casefile" / "meta.json").read_text())
+        line = cf.status_line(self.dir, entries, meta)
+        self.assertIn("test-case", line)
+        self.assertIn("claude+codex", line)
+        self.assertIn("turn 3", line)
+        self.assertIn("$1.25", line)
+        self.assertIn("mail 1", line)
+        self.assertIn("lint", line)
+
+
+class CliTalkTests(CliBase):
+    def test_repl_round_trip_with_fake_concierge(self):
+        script = self.dir / "fake.json"
+        script.write_text(json.dumps(
+            {"claude": ["recorded: constraint \"no deps\" (user)"]}))
+        p = subprocess.run(
+            [sys.executable, str(CASEFILE), "talk", "--fake-script", str(script)],
+            cwd=self.dir, capture_output=True, text=True,
+            input="don't add any dependencies\nexit\n")
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("recorded: constraint", p.stdout)  # echo-back convention
+
+
 class CliLintTests(CliBase):
     def test_clean_log_lints_clean(self):
         self.add("-t", "observation", "-a", "system", "ok")

@@ -1548,6 +1548,125 @@ def cmd_hooks(args):
           "session for new hooks to take effect")
 
 
+# ------------------------------------------------------------ tmux UI (§14)
+
+UI_DIR = "ui"
+
+
+def ui_paths(root: Path) -> dict:
+    d = root / DIR / UI_DIR
+    return {"dir": d, "state": d / "state.log", "active": d / "active.log",
+            "spitball": d / "spitball.json"}
+
+
+def ui_prepare(root: Path):
+    """Create the viewport files; default channel = state view (§14)."""
+    p = ui_paths(root)
+    p["dir"].mkdir(parents=True, exist_ok=True)
+    p["state"].touch()
+    tmp = p["dir"] / ".active.tmp"
+    tmp.symlink_to(p["state"].name)
+    tmp.replace(p["active"])  # atomic ln -sfn
+    return p
+
+
+def status_line(root: Path, entries, meta) -> str:
+    """One-line status bar: case · models running · turns · spend · mailbox ·
+    lint (§14). Spitball fields come from the driver's best-effort drop file."""
+    st = compute_status(root, entries, meta)
+    parts = [st["active_case"] or "(no case)"]
+    sp = ui_paths(root)["spitball"]
+    try:
+        d = json.loads(sp.read_text())
+        parts.append(f"spitball {d.get('models')} turn {d.get('turn')} "
+                     f"${d.get('spend_usd', 0):.2f}")
+    except Exception:
+        pass
+    parts.append(f"mail {len(st['mailbox'])}")
+    parts.append(f"lint {st['lint']}")
+    return " · ".join(parts)
+
+
+def _ui_state_loop(root: Path, interval: float = 1.0):
+    """Re-render `show` into state.log whenever the log changes. Truncate +
+    rewrite: tail -F reseeks on shrink, so the viewport refreshes whole."""
+    p = ui_paths(root)
+    log = root / DIR / LOG
+    last = None
+    while True:
+        try:
+            mtime = log.stat().st_mtime
+        except FileNotFoundError:
+            mtime = None
+        if mtime != last:
+            last = mtime
+            r = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                                "show"], cwd=root, capture_output=True, text=True)
+            p["state"].write_text("\x1b[2J\x1b[H" + r.stdout)
+        time.sleep(interval)
+
+
+def _ui_status_loop(root: Path, interval: float = 2.0):
+    while True:
+        entries = read_entries(root)
+        meta = load_meta(root)
+        line = status_line(root, entries, meta)
+        sys.stdout.write("\r\x1b[2K" + line[:200])
+        sys.stdout.flush()
+        time.sleep(interval)
+
+
+def ui_layout_cmds(root: Path) -> list[list[str]]:
+    """The tmux command plan (§14): new WINDOW in the user's existing session
+    — never a nested session (iTerm2 -CC must survive). Left: conversation
+    (claude, or a shell). Right: viewport tailing the active.log symlink.
+    Bottom (2 rows, full width): status bar loop."""
+    me = str(Path(__file__).resolve())
+    left = "claude" if _which("claude") else os.environ.get("SHELL", "sh")
+    return [
+        ["tmux", "new-window", "-c", str(root), "-n", "casefile", left],
+        ["tmux", "split-window", "-h", "-c", str(root),
+         f"tail -F {root / DIR / UI_DIR / 'active.log'}"],
+        ["tmux", "split-window", "-v", "-f", "-l", "2", "-c", str(root),
+         f"python3 {me} ui --render-status"],
+        ["tmux", "select-pane", "-t", "{left}"],
+    ]
+
+
+def _which(name: str) -> str | None:
+    import shutil
+    return shutil.which(name)
+
+
+def cmd_ui(args):
+    root, entries, meta = require_root()
+    if args.render_state:
+        _ui_state_loop(root)
+        return
+    if args.render_status:
+        _ui_status_loop(root)
+        return
+    ui_prepare(root)
+    cmds = ui_layout_cmds(root)
+    # the state renderer rides along as a detached best-effort process
+    render = [sys.executable, str(Path(__file__).resolve()), "ui", "--render-state"]
+    if args.dry_run:
+        for c in cmds:
+            print(" ".join(c))
+        print("(+ background: " + " ".join(render) + ")")
+        return
+    if not os.environ.get("TMUX"):
+        die("not inside tmux — `casefile ui` adds a window to your existing "
+            "session (SPEC §14: never a nested session)")
+    subprocess.Popen(render, cwd=root, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.DEVNULL, start_new_session=True)
+    for c in cmds:
+        p = subprocess.run(c, capture_output=True, text=True)
+        if p.returncode != 0:
+            die(f"tmux failed: {' '.join(c)}: {p.stderr.strip()}")
+    print("casefile ui window created")
+
+
 def cmd_spitball(args):
     import spitball
     models = tuple(m.strip() for m in args.models.split(",") if m.strip())
@@ -1556,6 +1675,37 @@ def cmd_spitball(args):
     spitball.run(topic=args.topic, models=models, turns=args.turns,
                  budget_usd=args.budget_usd, blind=args.blind,
                  fake_script=args.fake_script)
+
+
+def cmd_talk(args):
+    """§11.2: humans direct casefile by talking. A REPL over one continuous
+    headless concierge session, seeded with the skill + resume-context."""
+    import spitball
+    root, entries, meta = require_root()
+    adapter = spitball.make_adapter("claude", root,
+                                    Path(args.fake_script) if args.fake_script else None)
+    skill_p = root / ".claude" / "skills" / "casefile" / "SKILL.md"
+    skill = skill_p.read_text() if skill_p.exists() else ""
+    ctx = subprocess.run([sys.executable, str(Path(__file__).resolve()),
+                          "resume-context"], cwd=root,
+                         capture_output=True, text=True).stdout
+    h = adapter.start(
+        "You are the casefile concierge for this repo. Follow this skill:\n"
+        f"{skill}\n\nCurrent state:\n{ctx}\n"
+        "The user will now talk to you. Translate casefile-directed speech "
+        "into CLI calls per the skill (echo-back user mutations; confirm "
+        "destructive acts; reads never confirm). Reply READY.")
+    print(h.get("reply", "").strip() or "(concierge ready)")
+    while True:
+        try:
+            line = input("casefile> ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            break
+        if not line or line in ("exit", "quit"):
+            break
+        print(adapter.send(h, line).strip())
+    adapter.stop(h)
 
 
 # --------------------------------------------------------------------- main
@@ -1669,6 +1819,16 @@ def main():
     s.add_argument("action", choices=["install"])
     s.add_argument("vendor")
     s.set_defaults(fn=cmd_hooks)
+
+    s = sub.add_parser("ui", help="tmux window: conversation | viewport / status bar (§14)")
+    s.add_argument("--dry-run", action="store_true", help="print the tmux plan")
+    s.add_argument("--render-state", action="store_true", help=argparse.SUPPRESS)
+    s.add_argument("--render-status", action="store_true", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_ui)
+
+    s = sub.add_parser("talk", help="conversational REPL over a concierge session (§11.2)")
+    s.add_argument("--fake-script", help=argparse.SUPPRESS)  # tests
+    s.set_defaults(fn=cmd_talk)
 
     s = sub.add_parser("spitball", help="two-model deliberation on the active case (§12)")
     s.add_argument("--topic", required=True)
