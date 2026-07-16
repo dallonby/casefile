@@ -963,8 +963,84 @@ def cmd_resume_context(args):
     print("\n".join(out))
 
 
-def cmd_lint(args):
-    root, entries, meta = require_root()
+# -------- lifecycle (SPEC §9: states are computed, never stored)
+
+ACTIVITY_WINDOW_H = 48   # §19.3: defaults are guesses; tune with real use
+DORMANCY_GRACE_D = 7
+SESSION_GAP_MIN = 30
+
+
+def parse_ts(s: str) -> datetime:
+    return datetime.fromisoformat(s)
+
+
+def case_lifecycle(entries: list[dict], meta: dict, now: datetime | None = None) -> dict:
+    """Per case: state (active/quiet/dormant) + resolution-signal cluster.
+    quiet past the grace period auto-files to dormant (§9: silence files it);
+    any new entry reactivates silently because state derives from the log."""
+    now = now or datetime.now(timezone.utc)
+    hidden = superseded_ids(entries)
+    qs, ds = open_items([e for e in entries if e["id"] not in hidden])
+    grades = compute_grades(entries)
+    out = {}
+    for cid in meta.get("cases", {}):
+        ce = [e for e in entries if e["case"] == cid]
+        if not ce:
+            out[cid] = {"state": "active", "signals": [], "age_h": 0.0}
+            continue
+        age_h = (now - parse_ts(ce[-1]["ts"])).total_seconds() / 3600
+        if age_h < ACTIVITY_WINDOW_H:
+            state = "active"
+        elif age_h < ACTIVITY_WINDOW_H + DORMANCY_GRACE_D * 24:
+            state = "quiet"
+        else:
+            state = "dormant"
+        signals = []  # a cluster, not a proof (§9)
+        if not any(d["case"] == cid for d in ds) and not any(q["case"] == cid for q in qs):
+            signals.append("no open disputes/questions")
+        hyps = [e for e in ce if e["type"] == "hypothesis"]
+        if any(grades[h["id"]] == "verified" for h in hyps):
+            signals.append("leading hypothesis verified")
+        world = [e for e in ce if e["type"] == "observation"
+                 and str(e.get("source", "")).startswith(("hook:", "recheck:"))]
+        if world and obs_outcome(world[-1]["body"]) == "pass":
+            signals.append("latest world observation green")
+        out[cid] = {"state": state, "signals": signals, "age_h": round(age_h, 1)}
+    return out
+
+
+def dormancy_candidates(lifecycle: dict) -> list[str]:
+    """Quiet cases with green signal clusters — the nudge targets (§9)."""
+    return [cid for cid, st in lifecycle.items()
+            if st["state"] == "quiet" and len(st["signals"]) >= 2]
+
+
+def unswept_blocks(entries: list[dict], now: datetime | None = None):
+    """SPEC §7 UNSWEPT: entries were filed after the last secretary-sweep note
+    and the log has since gone cold (>30min) — the most recent session ended
+    unswept. A sweep marker covers everything before it (the sweep diffs the
+    whole conversation, so idle gaps inside a swept span don't alarm), the
+    next sweep clears the finding, and history predating the first sweep
+    marker isn't judged by a convention it predates. A smoke alarm, not a
+    report (§7)."""
+    now = now or datetime.now(timezone.utc)
+    is_sweep = lambda e: (e["type"] == "note"
+                          and e["body"].lower().startswith("secretary sweep"))
+    if not any(is_sweep(e) for e in entries):
+        return []
+    tail: list[dict] = []
+    for e in entries:
+        tail = [] if is_sweep(e) else tail + [e]
+    if not tail:
+        return []
+    if (now - parse_ts(tail[-1]["ts"])).total_seconds() <= SESSION_GAP_MIN * 60:
+        return []  # still warm: the session may simply not have ended yet
+    return [(tail[0]["ts"], tail[-1]["ts"], len(tail))]
+
+
+def lint_problems(entries: list[dict], launder_threshold: int = 3,
+                  stale_threshold: int = 10,
+                  now: datetime | None = None) -> list[str]:
     grades = compute_grades(entries)
     by_id = {e["id"]: e for e in entries}
     problems = []
@@ -980,7 +1056,7 @@ def cmd_lint(args):
     for eid, n in ref_counts.items():
         e = by_id.get(eid)
         if e and e["type"] == "hypothesis" and grades[eid] in ("hypothesis", "consensus") \
-                and n >= args.launder_threshold:
+                and n >= launder_threshold:
             problems.append(f"LAUNDERING       `{eid}` referenced {n}x but still "
                             f"[{grades[eid]}]: {e['body'][:60]}")
 
@@ -995,7 +1071,7 @@ def cmd_lint(args):
     index = {e["id"]: i for i, e in enumerate(entries)}
     for d in ds:
         age = len(entries) - index[d["id"]]
-        if age >= args.stale_threshold:
+        if age >= stale_threshold:
             problems.append(f"STALE            dispute `{d['id']}` open for {age} "
                             f"entries: {d['body'][:60]}")
 
@@ -1031,6 +1107,16 @@ def cmd_lint(args):
             for v in viol:
                 problems.append(f"DIGEST-VIOLATION `{e['id']}` supersedes {v}")
 
+    for start, end, n in unswept_blocks(entries, now=now):
+        problems.append(f"UNSWEPT          session {start}..{end} ({n} entries) "
+                        f"ended without a secretary sweep")
+
+    return problems
+
+
+def cmd_lint(args):
+    root, entries, meta = require_root()
+    problems = lint_problems(entries, args.launder_threshold, args.stale_threshold)
     if problems:
         print("\n".join(problems))
         sys.exit(1)
@@ -1038,22 +1124,28 @@ def cmd_lint(args):
 
 
 def compute_status(root, entries, meta) -> dict:
-    grades = compute_grades(entries)
     hidden = superseded_ids(entries)
     qs, ds = open_items([e for e in entries if e["id"] not in hidden])
     mailbox = [q for q in qs if q.get("to") == "user"]
+    lifecycle = case_lifecycle(entries, meta)
     cases = {}
     for cid, info in meta["cases"].items():
         ce = [e for e in entries if e["case"] == cid]
+        st = lifecycle.get(cid, {})
         cases[cid] = {"title": info["title"],
                       "entries": len(ce),
                       "last_entry": ce[-1]["ts"] if ce else None,
+                      "state": st.get("state", "active"),
+                      "signals": st.get("signals", []),
                       "open_disputes": sum(1 for d in ds if d["case"] == cid),
                       "open_questions": sum(1 for q in qs if q["case"] == cid)}
     return {"active_case": load_active(root, meta),
             "cases": cases,
             "mailbox": [{"id": q["id"], "case": q["case"], "body": q["body"]}
-                        for q in mailbox]}
+                        for q in mailbox],
+            "lint": len(lint_problems(entries)),
+            "dormancy_candidates": dormancy_candidates(lifecycle),
+            "spend": None}  # tracked from M4 (spitball driver) onward
 
 
 def cmd_status(args):
@@ -1067,11 +1159,18 @@ def cmd_status(args):
     for cid, c in st["cases"].items():
         mark = "*" if cid == ac else " "
         print(f" {mark} {cid}: {c['title']} — {c['entries']} entries, "
-              f"{c['open_disputes']} open disputes, {c['open_questions']} open questions")
+              f"{c['open_disputes']} open disputes, {c['open_questions']} open questions"
+              f" [{c['state']}]")
     if st["mailbox"]:
         print(f"mailbox ({len(st['mailbox'])} waiting on you):")
         for q in st["mailbox"]:
             print(f"   `{q['id']}` [{q['case']}] {q['body']}")
+    for cid in st["dormancy_candidates"]:
+        c = st["cases"][cid]
+        print(f"nudge: '{c['title']}' has gone quiet with green signals "
+              f"({'; '.join(c['signals'])}) — anything left, or shall I file it?")
+    if st["lint"]:
+        print(f"lint: {st['lint']} finding(s) — run `casefile lint`")
 
 
 def cmd_log(args):

@@ -142,6 +142,87 @@ class InvariantTests(unittest.TestCase):
         self.assertTrue(self.viol([], ["nope"]))
 
 
+# --------------------------------------------------- unit: lifecycle (SPEC §9)
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+NOW = datetime(2026, 7, 17, 12, 0, tzinfo=timezone.utc)
+
+
+def ago(**kw):
+    return (NOW - timedelta(**kw)).isoformat(timespec="seconds")
+
+
+class LifecycleTests(unittest.TestCase):
+    META = {"cases": {"c": {"title": "c"}}}
+
+    def state(self, entries):
+        return cf.case_lifecycle(entries, self.META, now=NOW)["c"]
+
+    def test_recent_entry_is_active(self):
+        st = self.state([E("n1", "note", ts=ago(hours=1))])
+        self.assertEqual(st["state"], "active")
+
+    def test_beyond_window_is_quiet(self):
+        st = self.state([E("n1", "note", ts=ago(hours=72))])
+        self.assertEqual(st["state"], "quiet")
+
+    def test_past_grace_is_dormant(self):
+        st = self.state([E("n1", "note", ts=ago(days=10))])
+        self.assertEqual(st["state"], "dormant")
+
+    def test_green_signals_cluster(self):
+        es = [E("h1", "hypothesis", ts=ago(days=3)),
+              E("o1", "observation", ts=ago(days=3), source="recheck:h1",
+                body="[PASS] constraint h1: true"),
+              E("v1", "verification", author="user", refs=["h1", "o1"], ts=ago(days=3))]
+        st = self.state(es)
+        self.assertEqual(st["state"], "quiet")
+        self.assertIn("leading hypothesis verified", st["signals"])
+        self.assertIn("latest world observation green", st["signals"])
+        self.assertIn("c", cf.dormancy_candidates({"c": st}))
+
+    def test_open_question_blocks_candidacy(self):
+        es = [E("q1", "question", ts=ago(days=3), body="unsure?")]
+        st = self.state(es)
+        self.assertNotIn("no open disputes/questions", st["signals"])
+        self.assertNotIn("c", cf.dormancy_candidates({"c": st}))
+
+
+class UnsweptTests(unittest.TestCase):
+    def sweep(self, id, **kw):
+        return E(id, "note", body="secretary sweep: nothing unrecorded", ts=ago(**kw))
+
+    def test_no_sweep_convention_no_alarm(self):
+        es = [E("n1", "note", ts=ago(hours=5))]
+        self.assertEqual(cf.unswept_blocks(es, now=NOW), [])
+
+    def test_cold_tail_after_sweep_alarms(self):
+        es = [self.sweep("s1", hours=6),
+              E("n1", "note", ts=ago(hours=5)),
+              E("n2", "note", ts=ago(hours=4))]
+        blocks = cf.unswept_blocks(es, now=NOW)
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0][2], 2)
+
+    def test_warm_tail_is_not_judged(self):
+        es = [self.sweep("s1", hours=6),
+              E("n1", "note", ts=ago(minutes=10))]
+        self.assertEqual(cf.unswept_blocks(es, now=NOW), [])
+
+    def test_next_sweep_clears(self):
+        es = [self.sweep("s1", hours=6),
+              E("n1", "note", ts=ago(hours=5)),
+              self.sweep("s2", hours=4)]
+        self.assertEqual(cf.unswept_blocks(es, now=NOW), [])
+
+    def test_unswept_surfaces_in_lint(self):
+        es = [self.sweep("s1", hours=6),
+              E("n1", "note", ts=ago(hours=5))]
+        problems = cf.lint_problems(es, now=NOW)
+        self.assertTrue(any(p.startswith("UNSWEPT") for p in problems))
+
+
 # ------------------------------------------------------------------- cli harness
 
 class CliBase(unittest.TestCase):
