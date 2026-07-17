@@ -872,6 +872,18 @@ class CliInitTests(CliBase):
         self.assertEqual(cfg.count("[[hooks.Stop]]"), 1)
         agents = (self.dir / "AGENTS.md").read_text()
         self.assertEqual(agents.count("## casefile"), 1)
+        gi = (self.dir / ".gitignore").read_text()
+        self.assertEqual(gi.count(".casefile/"), 1)
+
+    def test_init_gitignores_the_log(self):
+        gi = self.dir / ".gitignore"
+        self.assertIn(".casefile/", gi.read_text().splitlines())
+        # preserves an existing .gitignore rather than replacing it
+        gi.write_text("node_modules/\n")
+        self.cli("init", expect=0)
+        lines = gi.read_text().splitlines()
+        self.assertIn("node_modules/", lines)
+        self.assertIn(".casefile/", lines)
 
     def test_codex_block_preserves_surrounding_config(self):
         cfg = self.dir / ".codex-home" / "config.toml"

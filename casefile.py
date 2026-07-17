@@ -382,6 +382,13 @@ def cmd_init(args):
         gi = d / ".gitignore"
         gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\n")
         print(f"initialized casefile in {d}")
+    # the log is local state, never repo content (constraint dfae9509):
+    # make the project's own .gitignore enforce that on fresh projects too
+    pgi = root / ".gitignore"
+    lines = pgi.read_text().splitlines() if pgi.exists() else []
+    if ".casefile/" not in lines:
+        pgi.write_text("\n".join(lines + [".casefile/"]) + "\n")
+        print("updated: .gitignore (+.casefile/)")
     meta = load_meta(root)
     if not meta.get("cases"):
         cid = open_case(root, meta, root.name or "case", None)

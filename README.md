@@ -83,6 +83,10 @@ authoritative design document.
 
 ## Status
 
-Working core (M1–M6): log + grades, resume-context, recheck, hooks,
-import, spitball driver, tmux viewport. Roadmap: config.toml, Codex-side
-hooks, mid-turn interjection routing. Expect sharp edges.
+Working core (M1–M6): log + grades, resume-context, recheck, hooks for
+Claude Code and Codex, import, spitball driver, tmux viewport. Roadmap:
+config.toml, mid-turn interjection routing. Expect sharp edges.
+
+## License
+
+[GPL-3.0](LICENSE).
