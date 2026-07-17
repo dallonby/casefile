@@ -51,6 +51,8 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 | "I'm not convinced by X" | `dispute -a user` |
 | "why did we rule out X?" | `dig "<query>"` (searches superseded history; expands digests) |
 | "have we seen this before?" | `recall "<query>"` (searches past-case abstracts) |
+| "what's codex saying?" / "show me the deliberation" | `channel <model>` (ui viewport → that model's live transcript) |
+| "show the case again" | `channel state` (ui viewport → live state view) |
 | "rule that out" / "let's go with X" | `resolve` / `add -t decision -a user` — **confirm first** |
 
 ## Trust conventions

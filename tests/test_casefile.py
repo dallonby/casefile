@@ -770,6 +770,41 @@ class LivenessPulseTests(CliBase):
         self.assertIn("Secretary sweep", d["reason"])
 
 
+class CliChannelTests(CliBase):
+    def _transcripts(self, session, models=("claude", "codex")):
+        d = self.dir / ".casefile" / "transcripts" / session
+        d.mkdir(parents=True)
+        for m in models:
+            (d / f"{m}.log").write_text(f"{m} transcript\n")
+
+    def test_list_shows_state_and_latest_session_models(self):
+        self._transcripts("20260101T000000Z")
+        self._transcripts("20260102T000000Z", models=("claude", "codex"))
+        r = self.cli("channel", "list", expect=0)
+        self.assertIn("state:", r.out)
+        self.assertIn("claude:", r.out)
+        self.assertIn("codex:", r.out)
+        self.assertIn("20260102T000000Z", r.out)   # latest session only
+        self.assertNotIn("20260101T000000Z", r.out)
+
+    def test_switch_to_model_and_back(self):
+        self._transcripts("20260101T000000Z")
+        self.cli("ui", "--dry-run", expect=0)  # ensures nothing needed beforehand
+        r = self.cli("channel", "codex", expect=0)
+        self.assertIn("viewport -> codex", r.out)
+        active = self.dir / ".casefile" / "ui" / "active.log"
+        self.assertTrue(active.is_symlink())
+        self.assertEqual(active.resolve().name, "codex.log")
+        self.assertEqual(active.read_text(), "codex transcript\n")
+        self.cli("channel", "state", expect=0)
+        self.assertEqual(active.resolve().name, "state.log")
+
+    def test_unknown_channel_rejected(self):
+        r = self.cli("channel", "gpt9")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("unknown channel", r.err)
+
+
 class CliLintTests(CliBase):
     def test_clean_log_lints_clean(self):
         self.add("-t", "observation", "-a", "system", "ok")

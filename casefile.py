@@ -1588,6 +1588,8 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 | "I'm not convinced by X" | `dispute -a user` |
 | "why did we rule out X?" | `dig "<query>"` (searches superseded history; expands digests) |
 | "have we seen this before?" | `recall "<query>"` (searches past-case abstracts) |
+| "what's codex saying?" / "show me the deliberation" | `channel <model>` (ui viewport → that model's live transcript) |
+| "show the case again" | `channel state` (ui viewport → live state view) |
 | "rule that out" / "let's go with X" | `resolve` / `add -t decision -a user` — **confirm first** |
 
 ## Trust conventions
@@ -1693,10 +1695,49 @@ def ui_prepare(root: Path):
     p = ui_paths(root)
     p["dir"].mkdir(parents=True, exist_ok=True)
     p["state"].touch()
-    tmp = p["dir"] / ".active.tmp"
-    tmp.symlink_to(p["state"].name)
-    tmp.replace(p["active"])  # atomic ln -sfn
+    _switch_channel(p, p["state"])
     return p
+
+
+def _switch_channel(p: dict, target: Path):
+    tmp = p["dir"] / ".active.tmp"
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(os.path.relpath(target, p["dir"]))
+    tmp.replace(p["active"])  # atomic ln -sfn; tail -F follows the name
+
+
+def ui_channels(root: Path) -> dict[str, Path]:
+    """Available viewport channels (§14): the state view plus one per model
+    transcript of the most recent spitball session."""
+    p = ui_paths(root)
+    out = {"state": p["state"]}
+    tdir = root / DIR / "transcripts"
+    if tdir.is_dir():
+        sessions = sorted((d for d in tdir.iterdir() if d.is_dir()),
+                          key=lambda d: d.name)
+        if sessions:
+            for log in sorted(sessions[-1].glob("*.log")):
+                out[log.stem] = log
+    return out
+
+
+def cmd_channel(args):
+    root, entries, meta = require_root()
+    channels = ui_channels(root)
+    if args.name in (None, "list"):
+        p = ui_paths(root)
+        current = None
+        if p["active"].is_symlink():
+            current = p["active"].resolve()
+        for name, target in channels.items():
+            mark = "*" if current and target.resolve() == current else " "
+            print(f" {mark} {name}: {target.relative_to(root)}")
+        return
+    if args.name not in channels:
+        die(f"unknown channel '{args.name}' (have: {', '.join(channels)})")
+    p = ui_prepare(root) if not ui_paths(root)["dir"].exists() else ui_paths(root)
+    _switch_channel(p, channels[args.name])
+    print(f"viewport -> {args.name}")
 
 
 def status_line(root: Path, entries, meta) -> str:
@@ -1951,6 +1992,10 @@ def main():
     s.add_argument("action", choices=["install"])
     s.add_argument("vendor")
     s.set_defaults(fn=cmd_hooks)
+
+    s = sub.add_parser("channel", help="switch the ui viewport (state | <model> | list)")
+    s.add_argument("name", nargs="?", default="list")
+    s.set_defaults(fn=cmd_channel)
 
     s = sub.add_parser("ui", help="tmux window: conversation | viewport / status bar (§14)")
     s.add_argument("--dry-run", action="store_true", help="print the tmux plan")

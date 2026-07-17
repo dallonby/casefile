@@ -326,6 +326,9 @@ def run(topic: str, models=("claude", "codex"), turns: int = 6,
     session = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     tdir = root / ".casefile" / "transcripts" / session
     tdir.mkdir(parents=True, exist_ok=True)
+    for m in models:  # channels exist from turn one (§14 viewport)
+        (tdir / f"{m}.log").touch()
+    print(f"viewport channels: casefile channel {' | '.join(models)} | state")
 
     fake = Path(fake_script) if fake_script else None
     a_name, b_name = models
