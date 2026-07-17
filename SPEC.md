@@ -291,7 +291,13 @@ drift. **A resuming instance's first act is one command that tells it which
 claims still hold versus held-three-days-ago** — this turns verification
 from a historical event into a reproducible property. Recipes run in the
 repo root with a timeout (config, default 60s); failures are observations,
-never crashes.
+never crashes. A timed-out or broken recipe records `[UNKNOWN]` — it does
+not falsify the claim, never counts as drift, and preserves the last
+conclusive result as the drift baseline. Because the first command of a
+resuming session must be cheap, `recheck --startup` skips recipes whose
+last recorded wall-time exceeded ~5s and reports their last conclusive
+result instead; the bare `recheck` remains the exhaustive pass. Per-recipe
+durations live in `.casefile/state/` (derived state, not ground truth).
 
 ## 9. Case lifecycle (no explicit ending — humans don't announce "solved")
 

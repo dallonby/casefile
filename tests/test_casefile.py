@@ -427,6 +427,26 @@ class CliRecheckTests(CliBase):
         self.assertIn("DRIFT", r3.out)     # drift vs the last KNOWN result
         self.assertIn("was holds", r3.out)
 
+    def test_startup_skips_known_slow_checks(self):
+        fast = self.add("-t", "constraint", "-a", "user", "fast claim",
+                        "--check", "true")
+        slow = self.add("-t", "constraint", "-a", "user", "slow claim",
+                        "--check", "true")
+        self.cli("recheck", expect=0)  # conclusive baseline + durations
+        state = self.dir / ".casefile" / "state" / "recheck-durations.json"
+        d = json.loads(state.read_text())
+        self.assertIn(fast, d)
+        d[slow] = 24.0  # pretend the slow recipe took 24s last time
+        state.write_text(json.dumps(d))
+        r = self.cli("recheck", "--startup", expect=0)
+        self.assertIn("skipped", r.out)
+        self.assertIn("last known holds", r.out)
+        self.assertIn("1/1 hold", r.out)
+        self.assertIn("1 slow skipped", r.out)
+        obs = [e for e in self.log_entries()
+               if e.get("source") == f"recheck:{slow}"]
+        self.assertEqual(len(obs), 1)  # skipping appends no observation
+
     def test_refuted_hypothesis_check_skipped(self):
         h = self.add("-t", "hypothesis", "-a", "claude", "was true", "--check", "true")
         d = self.cli("dispute", h, "-a", "codex", "--reason", "nope").out

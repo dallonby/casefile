@@ -570,6 +570,26 @@ def prior_recheck_pass(entries: list[dict], target_id: str) -> bool | None:
     return last["body"].startswith("[PASS]")
 
 
+SLOW_CHECK_S = 5  # --startup skips recipes whose last run exceeded this
+
+
+def load_check_durations(root: Path) -> dict:
+    """Last observed wall-time per recipe (derived state, not ground truth)."""
+    try:
+        return json.loads(
+            (root / ".casefile" / "state" / "recheck-durations.json").read_text())
+    except Exception:
+        return {}
+
+
+def save_check_durations(root: Path, durations: dict):
+    d = root / ".casefile" / "state"
+    d.mkdir(parents=True, exist_ok=True)
+    tmp = d / f".recheck-durations.{os.getpid()}.tmp"
+    tmp.write_text(json.dumps(durations))
+    os.replace(tmp, d / "recheck-durations.json")
+
+
 def cmd_recheck(args):
     root, entries, meta = require_root()
     targets = live_checks(entries)
@@ -581,9 +601,25 @@ def cmd_recheck(args):
         print("no live checks to run")
         return
 
+    durations = load_check_durations(root)
+    skipped = []
+    if args.startup:  # bounded session-start pass: known-slow recipes wait
+        slow = [e for e in targets
+                if durations.get(e["id"], 0) > SLOW_CHECK_S]
+        targets = [e for e in targets if e not in slow]
+        for e in slow:
+            prior = prior_recheck_pass(entries, e["id"])
+            known = ("holds" if prior else "failing") if prior is not None \
+                else "never conclusively checked"
+            print(f"slow `{e['id']}` [{e['type']}] {e['body'][:52]}"
+                  f"  (skipped: {durations[e['id']]:.0f}s last run — last known"
+                  f" {known}; run `casefile recheck` for the full pass)")
+            skipped.append(e)
+
     report = []
     for e in targets:
         prior = prior_recheck_pass(entries, e["id"])
+        t0 = time.monotonic()
         try:
             p = subprocess.run(e["check"], shell=True, cwd=root, text=True,
                                capture_output=True, timeout=args.timeout)
@@ -593,6 +629,7 @@ def cmd_recheck(args):
             status, tail = "UNKNOWN", f"(timed out after {args.timeout}s)"
         except Exception as ex:  # a broken recipe is an observation, never a crash (§8)
             status, tail = "UNKNOWN", f"(recheck error: {ex})"
+        durations[e["id"]] = round(time.monotonic() - t0, 3)
         body = f"[{status}] {e['type']} {e['id']}: {e['check']}"
         if status != "PASS" and tail:
             body += "\n" + tail[-400:]
@@ -601,6 +638,7 @@ def cmd_recheck(args):
         append_entry(root, obs)
         entries.append(obs)  # keep ids unique + advance the drift baseline
         report.append((e, status, prior))
+    save_check_durations(root, durations)
 
     drifted = 0
     for e, status, prior in report:
@@ -623,6 +661,7 @@ def cmd_recheck(args):
     unknown = sum(1 for _, s, _ in report if s == "UNKNOWN")
     print(f"\n{held}/{len(report)} hold" +
           (f"; {unknown} unknown" if unknown else "") +
+          (f"; {len(skipped)} slow skipped" if skipped else "") +
           (f"; {drifted} drifted since last recheck" if drifted else ""))
 
 
@@ -1976,6 +2015,10 @@ def main():
     s = sub.add_parser("recheck", help="run check recipes; append observations; report drift")
     s.add_argument("--case")
     s.add_argument("--timeout", type=int, default=60, help="per-recipe timeout (s)")
+    s.add_argument("--startup", action="store_true",
+                   help=f"bounded session-start pass: skip recipes slower "
+                        f"than {SLOW_CHECK_S}s last run, reporting their "
+                        f"last conclusive result instead")
     s.set_defaults(fn=cmd_recheck)
 
     s = sub.add_parser("compact", help="collapse steady-state hook observations (SPEC §6.1)")

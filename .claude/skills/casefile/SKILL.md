@@ -14,9 +14,11 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 1. Run `python3 casefile.py resume-context` and read it. Ground truth beats
    the notes: where the log and the world conflict, the world wins — record
    the discrepancy as a new observation.
-2. Run `python3 casefile.py recheck` — it re-runs every recorded check
-   recipe and tells you which claims still hold versus held-three-days-ago.
-   Drift is your first lead.
+2. Run `python3 casefile.py recheck --startup` — it re-runs the recorded
+   check recipes and tells you which claims still hold versus
+   held-three-days-ago. Drift is your first lead. `--startup` keeps this
+   fast by skipping known-slow recipes (their last conclusive result is
+   reported instead); run the bare `recheck` when a skipped claim matters.
 3. Run `python3 casefile.py status`. Address open questions before
    proceeding; questions marked `→ user` are waiting on the user — surface
    them once, don't block on them. Act on any dormancy nudge or lint count
