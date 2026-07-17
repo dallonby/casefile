@@ -232,8 +232,13 @@ Runs on hook batches or pre-commit. Targets hook-sourced observations only:
 - keep the latest observation per `source`;
 - keep every **transition** (pass→fail, fail→pass, new error signature —
   signature = normalized first line of the body);
-- digest steady-state runs into one line: `"tests green for 47 consecutive
-  runs over 6h (pytest)"` with `kind: mechanical`, `author: system`.
+- digest steady-state repeats into one line: `"tests green for 47 runs
+  over 6h (pytest)"` with `kind: mechanical`, `author: system`. Repeats
+  group by (source, signature, outcome) across the whole case, not by
+  adjacency — interactive sessions interleave commands, so the same check
+  rarely lands back-to-back. The first and latest of each group survive;
+  transitions survive because a changed outcome or signature is by
+  definition a different group.
 
 Never touches anything protected by the evidence-chain invariant (§5.3).
 

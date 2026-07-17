@@ -247,8 +247,9 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
         if e["type"] == "endorsement":
             for r in e.get("refs", []):
                 t = by_id.get(r)
-                if t and e["author"] != t["author"]:
-                    endorsements.setdefault(r, set()).add(e["author"])
+                # casefold: pre-normalization logs may hold 'Codex' and 'codex'
+                if t and e["author"].casefold() != t["author"].casefold():
+                    endorsements.setdefault(r, set()).add(e["author"].casefold())
 
     grades: dict[str, str] = {}
     for e in entries:
@@ -344,8 +345,19 @@ def case_slug(title: str, existing: set[str]) -> str:
     return slug
 
 
+def canonical_author(entries, author: str) -> str:
+    """Authors are identities: 'Codex' and 'codex' must not split attribution
+    (or let a model endorse its own claim into consensus via a case variant).
+    First-seen casing wins; unseen authors pass through untouched."""
+    seen: dict[str, str] = {}
+    for e in entries:
+        seen.setdefault(str(e["author"]).casefold(), e["author"])
+    return seen.get(str(author).casefold(), author)
+
+
 def make_entry(entries, case, type_, author, body, refs=None, **extra):
     ids = {e["id"] for e in entries}
+    author = canonical_author(entries, author)
     refs = refs or []
     by_id = {e["id"]: e for e in entries}
     missing = [r for r in refs if r not in ids]
@@ -448,6 +460,14 @@ def cmd_add(args):
     append_entry(root, e)
     save_active(root, case)  # SPEC §5.1: active case follows "last touched"
     print(e["id"])
+    # filing nudges: cheapest at write time, when the context to fix them is
+    # still in hand — lint catches the same gaps, but only after the fact
+    if args.type == "decision" and not args.rationale and not args.refs:
+        print("note: decision has no --rationale and no refs — it will "
+              "render as bare assertion (lint: ORPHAN)", file=sys.stderr)
+    if args.type == "hypothesis" and not args.check:
+        print("note: hypothesis has no --check recipe — recheck cannot "
+              "watch it for drift", file=sys.stderr)
 
 
 def _target(entries, eid):
@@ -703,46 +723,35 @@ def obs_outcome(body: str) -> str:
     return "fail" if any(m in b for m in _FAIL_MARKERS) else "pass"
 
 
-def _runs(seq, key):
-    """Yield maximal runs of consecutive items sharing key(item)."""
-    run, k = [], object()
-    for item in seq:
-        ik = key(item)
-        if ik != k and run:
-            yield run
-            run = []
-        run.append(item)
-        k = ik
-    if run:
-        yield run
-
-
 def compaction_plan(entries: list[dict]) -> list[tuple[str, list[str], str]]:
-    """Per case, collapse steady-state runs of hook-sourced observations.
-    Keep the first of each run (transition into the state) and the last
-    (latest-per-source, SPEC §6.1); supersede the redundant middle with one
-    mechanical digest. Invariant-protected observations (referenced by a
-    verification, §5.3) are never collapsed. Returns (case, [ids], summary)."""
+    """Per case, collapse steady-state hook-sourced observations. Repeats
+    group by (source, signature, outcome) across the whole case, not by
+    adjacency — interactive sessions interleave commands, so the same check
+    rarely lands back-to-back. Keep the first of each group (transition into
+    the state) and the last (latest-per-source, SPEC §6.1); supersede the
+    redundant middle with one mechanical digest. Transitions survive because
+    a changed outcome or signature is by definition a different group.
+    Invariant-protected observations (referenced by a verification, §5.3)
+    are never collapsed. Returns (case, [ids], summary)."""
     hidden = superseded_ids(entries)
     protected = verification_protected_obs(entries)
     plan = []
-    by_case: dict[str, list[dict]] = {}
+    groups: dict[tuple, list[dict]] = {}
     for e in entries:
         if (e["type"] == "observation" and e["id"] not in hidden
                 and str(e.get("source", "")).startswith("hook:")):
-            by_case.setdefault(e["case"], []).append(e)
-    for case, obs in by_case.items():
-        for run in _runs(obs, lambda e: (e["source"], obs_signature(e["body"]),
-                                         obs_outcome(e["body"]))):
-            if len(run) < 3:
-                continue  # first+last already retained; nothing steady to drop
-            middle = [e for e in run[1:-1] if e["id"] not in protected]
-            if not middle:
-                continue
-            sig = obs_signature(run[0]["body"])
-            summary = (f"{len(middle)} steady-state {obs_outcome(run[0]['body'])} "
-                       f"observations collapsed ({run[0]['source']}: {sig})")
-            plan.append((case, [e["id"] for e in middle], summary))
+            key = (e["case"], e["source"], obs_signature(e["body"]),
+                   obs_outcome(e["body"]))
+            groups.setdefault(key, []).append(e)
+    for (case, source, sig, outcome), group in groups.items():
+        if len(group) < 3:
+            continue  # first+last already retained; nothing steady to drop
+        middle = [e for e in group[1:-1] if e["id"] not in protected]
+        if not middle:
+            continue
+        summary = (f"{len(middle)} steady-state {outcome} "
+                   f"observations collapsed ({source}: {sig})")
+        plan.append((case, [e["id"] for e in middle], summary))
     return plan
 
 

@@ -58,6 +58,12 @@ class GradeTests(unittest.TestCase):
               E("e1", "endorsement", author="claude", refs=["h1"])]
         self.assertEqual(self.g(es)["h1"], "hypothesis")
 
+    def test_case_variant_self_endorsement_does_not_promote(self):
+        # pre-normalization logs may hold 'Codex' and 'codex' — same identity
+        es = [E("h1", "hypothesis", author="codex"),
+              E("e1", "endorsement", author="Codex", refs=["h1"])]
+        self.assertEqual(self.g(es)["h1"], "hypothesis")
+
     def test_verified_beats_consensus(self):
         es = [E("h1", "hypothesis", author="claude"),
               E("o1", "observation"),
@@ -477,6 +483,20 @@ class CliCompactTests(CliBase):
         self.assertEqual(len(digs), 1)
         self.assertEqual(set(digs[0]["supersedes"]), {ids[1], ids[2]})
 
+    def test_interleaved_duplicates_collapse(self):
+        # SPEC §6.1: repeats group by (source, signature, outcome) across the
+        # case, not adjacency — interactive sessions interleave commands.
+        ids = []
+        for i, filler in enumerate(("alpha ran", "beta built", "gamma synced")):
+            ids.append(self.add("-t", "observation", "-a", "system",
+                                "--source", "hook:t", f"check ok {i}"))
+            self.add("-t", "observation", "-a", "system",
+                     "--source", "hook:t", filler)
+        r = self.cli("compact", expect=0)
+        self.assertIn("compacted 1", r.out)
+        sup = cf.superseded_ids(self.log_entries())
+        self.assertEqual(sup, {ids[1]})  # first + last of the group survive
+
     def test_idempotent(self):
         self._hook_obs(4)
         self.cli("compact", expect=0)
@@ -505,6 +525,29 @@ class CliCompactTests(CliBase):
                  "check failed: error")
         r = self.cli("compact", expect=0)
         self.assertIn("nothing to compact", r.out)
+
+
+class CliAuthorAndNudgeTests(CliBase):
+    def test_author_casing_canonicalized_to_first_seen(self):
+        self.add("-t", "note", "-a", "codex", "first")
+        self.add("-t", "note", "-a", "Codex", "second")
+        authors = [e["author"] for e in self.log_entries() if e["type"] == "note"]
+        self.assertEqual(authors, ["codex", "codex"])
+
+    def test_orphan_decision_nudged_at_add_time(self):
+        r = self.cli("add", "-t", "decision", "-a", "claude", "just do X", expect=0)
+        self.assertIn("no --rationale", r.err)
+        r = self.cli("add", "-t", "decision", "-a", "claude", "do Y",
+                     "--rationale", "because", expect=0)
+        self.assertEqual(r.err, "")
+
+    def test_checkless_hypothesis_nudged_at_add_time(self):
+        r = self.cli("add", "-t", "hypothesis", "-a", "claude", "it is flaky",
+                     expect=0)
+        self.assertIn("--check", r.err)
+        r = self.cli("add", "-t", "hypothesis", "-a", "claude", "flaky again",
+                     "--check", "true", expect=0)
+        self.assertEqual(r.err, "")
 
 
 class CliAbstractTests(CliBase):
