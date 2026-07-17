@@ -1228,6 +1228,7 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
     # not the grade: an open dispute suppresses the grade to `disputed`, so
     # grade-keying would silence the very case §7 wants.
     verified_so_far: set[str] = set()
+    hidden = superseded_ids(entries)
     for e in entries:
         if e["type"] == "verification":
             obs = [r for r in e["refs"] if by_id.get(r, {}).get("type") == "observation"]
@@ -1236,7 +1237,10 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
                                        if by_id.get(r, {}).get("type") == "hypothesis")
         elif e["type"] == "dispute":
             for r in e.get("refs", []):
-                if r in verified_so_far:
+                # a digest superseding both sides IS the human review the
+                # lint asks for (world-changed sequences settle that way)
+                if r in verified_so_far \
+                        and not (r in hidden and e["id"] in hidden):
                     problems.append(f"CONTRADICTION    verified `{r}` is disputed by "
                                     f"`{e['id']}` — human review needed")
 

@@ -65,6 +65,12 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 - **Confirm** destructive-ish acts (resolve, digest, revoke) with one word
   before running them. Reads never confirm.
 - Your own routine filing is silent by default; show it on request.
+- **Reset-readiness drill** (user-adopted 2026-07-17): periodically — after
+  a digest, before ending a long session, or when the abstract feels stale —
+  simulate a context reset: read ONLY `resume-context` + `status` output and
+  ask what a fresh instance would be missing or misled by. Fix the surface
+  (abstract, mailbox, checks), not the instance. Note the drill result in
+  the sweep marker.
 
 ## Importing existing notes (§11.3)
 

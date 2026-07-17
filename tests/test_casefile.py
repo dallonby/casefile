@@ -882,6 +882,25 @@ class CliLintTests(CliBase):
         self.assertEqual(r.rc, 1)
         self.assertIn("CONTRADICTION", r.out)
 
+    def test_digested_contradiction_is_settled(self):
+        # a judgment digest superseding both the verified hypothesis and its
+        # dispute IS the human review — the lint must go quiet after it
+        h = self.add("-t", "hypothesis", "-a", "claude", "defect present")
+        o = self.add("-t", "observation", "-a", "system", "defect confirmed")
+        self.cli("verify", h, o, "-a", "claude", expect=0)
+        d = self.cli("dispute", h, "-a", "claude", "--reason", "fixed").out
+        self.cli("resolve", d, "-a", "claude", "--outcome", "upheld",
+                 "--reason", "fix verified", expect=0)
+        r1 = self.cli("lint")
+        self.assertIn("CONTRADICTION", r1.out)
+        v = [e["id"] for e in self.log_entries()
+             if e["type"] in ("verification", "resolution")]
+        self.cli("digest", "settled: defect found, fixed, closed", "-a",
+                 "claude", "--kind", "judgment", "--supersedes", h, d, *v,
+                 expect=0)
+        r2 = self.cli("lint")
+        self.assertNotIn("CONTRADICTION", r2.out)
+
     def test_dispute_before_verification_is_not_contradiction(self):
         # SPEC §7 says verified *then* disputed. A dispute that precedes the
         # verification is the ordinary disputed->verified flow, not a §7 case.
