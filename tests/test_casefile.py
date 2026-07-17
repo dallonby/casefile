@@ -673,6 +673,30 @@ class CliHooksInstallTests(CliBase):
         self.assertIn("PreToolUse", settings["hooks"])
         self.assertEqual(len(settings["hooks"]["PostToolUse"]), 1)
 
+    def test_install_records_cli_location(self):
+        # init already installs hooks; the pointer names the real CLI so
+        # hooks and skill text work when casefile.py is not at the repo root
+        ptr = self.dir / ".casefile" / "cli"
+        self.assertTrue(ptr.exists())
+        self.assertEqual(ptr.read_text().strip(), str(CASEFILE.resolve()))
+
+    def test_skill_and_agents_reference_cli_by_absolute_path(self):
+        self.cli("hooks", "install", "all", expect=0)
+        for rel in (Path(".claude/skills/casefile/SKILL.md"), Path("AGENTS.md")):
+            text = (self.dir / rel).read_text()
+            self.assertIn(f"python3 {CASEFILE.resolve()}", text, rel)
+            self.assertNotIn("python3 casefile.py", text, rel)
+
+    def test_sweep_reason_names_resolvable_cli(self):
+        self.cli("hooks", "install", "claude-code", expect=0)
+        p = subprocess.run(
+            [sys.executable, str(self.dir / ".casefile" / "hooks" / "sweep.py")],
+            cwd=self.dir, capture_output=True, text=True,
+            input=json.dumps({"session_id": "s1"}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        reason = json.loads(p.stdout)["reason"]
+        self.assertIn(f"python3 {CASEFILE.resolve()} add", reason)
+
     def test_installed_hooks_are_valid_python(self):
         self.cli("hooks", "install", "claude-code", expect=0)
         for name in ("observe.py", "sweep.py"):

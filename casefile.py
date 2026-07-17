@@ -380,7 +380,7 @@ def cmd_init(args):
                          "cases": {}})
         (d / LOG).touch()
         gi = d / ".gitignore"
-        gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\n")
+        gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\ncli\n")
         print(f"initialized casefile in {d}")
     # the log is local state, never repo content (constraint dfae9509):
     # make the project's own .gitignore enforce that on fresh projects too
@@ -1404,6 +1404,21 @@ def redact(s: str) -> str:
     return s
 
 
+def _cli(root):
+    """Resolve the CLI: repo-root copy, then the .casefile/cli pointer the
+    installer records, then a PATH-installed `casefile`."""
+    local = root / "casefile.py"
+    if local.exists():
+        return [sys.executable, str(local)]
+    try:
+        p = Path((root / ".casefile" / "cli").read_text().strip())
+        if p.is_file():
+            return [sys.executable, str(p)]
+    except OSError:
+        pass
+    return ["casefile"]
+
+
 def main():
     hook = json.loads(sys.stdin.read())
     if hook.get("tool_name") != "Bash":
@@ -1422,8 +1437,7 @@ def main():
     out = (stdout + "\n" + stderr).strip()
     body = redact(f"$ {cmd.splitlines()[0][:120]}\n{out[-MAX_BODY:] if out else '(no output)'}")
     root = Path(__file__).resolve().parents[2]  # <repo>/.casefile/hooks/observe.py
-    cli = ([sys.executable, str(root / "casefile.py")]
-           if (root / "casefile.py").exists() else ["casefile"])
+    cli = _cli(root)
     subprocess.run(cli + ["add", "-t", "observation", "-a", "system",
                           "--source", "hook:post-bash", body],
                    cwd=root, capture_output=True, timeout=10)
@@ -1460,17 +1474,36 @@ from pathlib import Path
 
 LEASE_FRESH_S = 10
 
+ROOT = Path(__file__).resolve().parents[2]  # <repo>/.casefile/hooks/sweep.py
+
 # the installing vendor passes the model author as argv[1] (codex sessions
 # must file as codex); default stays claude for the claude-code install
 AUTHOR = sys.argv[1] if len(sys.argv) > 1 else "claude"
 
+
+def _cli_display(root):
+    """The invocation to tell the model: repo-root copy, then the
+    .casefile/cli pointer the installer records, then PATH."""
+    if (root / "casefile.py").exists():
+        return "python3 casefile.py"
+    try:
+        p = Path((root / ".casefile" / "cli").read_text().strip())
+        if p.is_file():
+            return f"python3 {p}"
+    except OSError:
+        pass
+    return "casefile"
+
+
+CLI = _cli_display(ROOT)
+
 REASON = (
     "Secretary sweep (casefile): before ending, diff this conversation against "
     "the casefile log. Anything decided, constrained, observed, or ruled out "
-    "here that isn't recorded? File it with `python3 casefile.py add ...` using "
+    f"here that isn't recorded? File it with `{CLI} add ...` using "
     f"the correct type and author (user for the user's words, {AUTHOR} for your "
     "own). Then file the sweep marker — "
-    f"`python3 casefile.py add -t note -a {AUTHOR} \"secretary sweep: <gaps filed, "
+    f"`{CLI} add -t note -a {AUTHOR} \"secretary sweep: <gaps filed, "
     "or 'nothing unrecorded'>\"` — and finish."
 )
 
@@ -1522,11 +1555,10 @@ def pulse(root: Path, session_id: str):
 
 def main():
     hook = json.load(sys.stdin)
-    root = Path(__file__).resolve().parents[2]
     if hook.get("stop_hook_active"):
-        pulse(root, str(hook.get("session_id", "")))  # final pass: pulse (H7)
+        pulse(ROOT, str(hook.get("session_id", "")))  # final pass: pulse (H7)
         return
-    if not _active_case(root):
+    if not _active_case(ROOT):
         return  # no active case means nothing to sweep
     print(json.dumps({"decision": "block", "reason": REASON}))
 
@@ -1807,11 +1839,26 @@ def _managed_block(path: Path, begin: str, end: str, body: str) -> str:
     return verb
 
 
+def cli_invocation(root: Path) -> str:
+    """How agents in this repo invoke the CLI: the repo-root copy when one
+    exists, else the absolute path of this installed casefile.py (which the
+    installer also records in .casefile/cli for the hooks)."""
+    if (root / "casefile.py").exists():
+        return "python3 casefile.py"
+    return f"python3 {Path(__file__).resolve()}"
+
+
 def _install_hook_scripts(root: Path):
+    # record where the CLI lives so hooks and skill text keep working in
+    # repos that don't carry casefile.py at their root
+    ptr = str(Path(__file__).resolve()) + "\n"
+    print(f"{_write_if_changed(root / DIR / 'cli', ptr)}: .casefile/cli")
+    cli = cli_invocation(root)
     for rel, content in [(".casefile/hooks/observe.py", HOOK_OBSERVE_PY),
                          (".casefile/hooks/sweep.py", HOOK_SWEEP_PY),
                          (".casefile/hooks/session_start.py", HOOK_SESSION_START_PY),
-                         (".claude/skills/casefile/SKILL.md", SKILL_MD)]:
+                         (".claude/skills/casefile/SKILL.md",
+                          SKILL_MD.replace("python3 casefile.py", cli))]:
         print(f"{_write_if_changed(root / rel, content)}: {rel}")
 
 
@@ -1836,7 +1883,8 @@ def _install_codex(root: Path):
                           CODEX_HOOKS_TOML)
     print(f"{verb}: {cfg} (global block; dispatches per-project)")
     verb = _managed_block(root / "AGENTS.md", AGENTS_BEGIN, AGENTS_END,
-                          AGENTS_SNIPPET)
+                          AGENTS_SNIPPET.replace("python3 casefile.py",
+                                                 cli_invocation(root)))
     print(f"{verb}: AGENTS.md")
     print("note: codex hook trust is per-hook and one-time — run `codex`, "
           "open /hooks, and trust the casefile hooks (headless runs can pass "
