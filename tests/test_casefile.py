@@ -401,6 +401,32 @@ class CliRecheckTests(CliBase):
         self.assertIn("DRIFT", r2.out)
         self.assertIn("1 drifted", r2.out)
 
+    def test_timeout_is_unknown_not_fail(self):
+        # a timed-out recipe establishes unknown, not claim-false (133ab399)
+        self.add("-t", "constraint", "-a", "user", "slow claim",
+                 "--check", "sleep 5")
+        r = self.cli("recheck", "--timeout", "1", expect=0)
+        self.assertIn("???", r.out)
+        self.assertIn("1 unknown", r.out)
+        self.assertNotIn("DRIFT", r.out)
+        obs = [e for e in self.log_entries()
+               if str(e.get("source", "")).startswith("recheck:")]
+        self.assertTrue(obs[-1]["body"].startswith("[UNKNOWN]"))
+
+    def test_unknown_preserves_drift_baseline(self):
+        sh = self.dir / "check.sh"
+        sh.write_text("exit 0")
+        self.add("-t", "constraint", "-a", "user", "scripted claim",
+                 "--check", "sh check.sh")
+        self.cli("recheck", expect=0)      # conclusive baseline: holds
+        sh.write_text("sleep 5")
+        r2 = self.cli("recheck", "--timeout", "1", expect=0)
+        self.assertNotIn("DRIFT", r2.out)  # unknown is never drift
+        sh.write_text("exit 1")
+        r3 = self.cli("recheck", expect=0)
+        self.assertIn("DRIFT", r3.out)     # drift vs the last KNOWN result
+        self.assertIn("was holds", r3.out)
+
     def test_refuted_hypothesis_check_skipped(self):
         h = self.add("-t", "hypothesis", "-a", "claude", "was true", "--check", "true")
         d = self.cli("dispute", h, "-a", "codex", "--reason", "nope").out

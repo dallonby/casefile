@@ -57,13 +57,55 @@ class DriverTests(SpitballBase):
         r = self.run_driver(fake_script=s, turns=1)
         self.assertEqual(r["outcome"], "turn-budget")
 
-    def test_convergence_halts(self):
-        # converged state pre-exists: endorsed hypothesis, no open disputes.
+    def test_preexisting_consensus_does_not_converge(self):
+        # a claim settled BEFORE the run must not converge it (485f4fbc):
+        # nothing new gets filed here, so the run stalls out instead.
         h = self.cli("add", "-t", "hypothesis", "-a", "claude", "it is the cache")
         self.cli("endorse", h, "-a", "codex")
         s = self.script({"claude": ["x"] * 4, "codex": ["y"] * 4})
         r = self.run_driver(fake_script=s, turns=4)
-        self.assertEqual(r["outcome"], "converged")
+        self.assertEqual(r["outcome"], "stalemate")
+
+    def test_convergence_scoped_to_since_position(self):
+        case = cf.load_active(self.dir, cf.load_meta(self.dir))
+        h = self.cli("add", "-t", "hypothesis", "-a", "claude", "old claim")
+        self.cli("endorse", h, "-a", "codex")
+        n = len(cf.read_entries(self.dir))
+        # the settled claim converges from position 0, not from after it
+        self.assertTrue(spitball.converged(self.dir, case, 0))
+        self.assertFalse(spitball.converged(self.dir, case, n))
+        # a hypothesis endorsed after the position converges the scoped view
+        h2 = self.cli("add", "-t", "hypothesis", "-a", "claude", "fresh claim")
+        self.cli("endorse", h2, "-a", "codex")
+        self.assertTrue(spitball.converged(self.dir, case, n))
+
+    def test_adapters_stopped_when_second_start_fails(self):
+        stopped = []
+
+        class Good:
+            def start(self, ctx):
+                return {"reply": "ok"}
+
+            def send(self, h, m):
+                return "ok"
+
+            def cost(self, h):
+                return {"usd": 0.0, "tokens": 0}
+
+            def stop(self, h):
+                stopped.append("A")
+
+        class Bad(Good):
+            def start(self, ctx):
+                raise RuntimeError("boom")
+
+        orig = spitball.make_adapter
+        spitball.make_adapter = (
+            lambda name, root, fake=None: Good() if name == "claude" else Bad())
+        self.addCleanup(lambda: setattr(spitball, "make_adapter", orig))
+        with self.assertRaises(RuntimeError):
+            self.run_driver(turns=1)
+        self.assertEqual(stopped, ["A"])  # A was started, so A gets stopped
 
     def test_transcripts_written_per_model(self):
         s = self.script({"claude": ["A"], "codex": ["B"]})
@@ -119,6 +161,30 @@ class StreamAdapterTests(unittest.TestCase):
                               spitball.ClaudeAdapter)
         self.assertIsInstance(spitball.make_adapter("codex", root),
                               spitball.CodexAdapter)
+
+    def test_send_times_out_on_silent_child(self):
+        # a child that hangs without emitting a newline must still hit the
+        # turn deadline (78b17208) and be reclaimed
+        ad = spitball.StreamClaudeAdapter(Path("."))
+        proc = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, bufsize=1)
+        self.addCleanup(proc.kill)
+        h = ad._attach(proc)
+        orig = spitball.TURN_TIMEOUT_S
+        spitball.TURN_TIMEOUT_S = 1
+        self.addCleanup(lambda: setattr(spitball, "TURN_TIMEOUT_S", orig))
+        t0 = time.time()
+        with self.assertRaisesRegex(RuntimeError, "timeout"):
+            ad.send(h, "ping")
+        self.assertLess(time.time() - t0, 10)
+        proc.wait(timeout=5)  # send() killed the wedged child
+
+    def test_codex_adapter_carries_high_effort(self):
+        # recorded user constraint: codex always runs at high reasoning effort
+        ad = spitball.CodexAdapter(Path("."))
+        self.assertIn("model_reasoning_effort=high", ad.opts)
+        self.assertIn("model_reasoning_effort=high", ad.resume_opts)
 
 
 class KillTest(SpitballBase):

@@ -556,11 +556,14 @@ def live_checks(entries: list[dict]) -> list[dict]:
 
 
 def prior_recheck_pass(entries: list[dict], target_id: str) -> bool | None:
-    """Whether the most recent recheck observation for target_id passed.
-    None if this claim has never been rechecked (no drift baseline yet)."""
+    """Whether the most recent conclusive recheck observation for target_id
+    passed. UNKNOWN runs (timeout/infra error) are skipped — they don't
+    falsify the claim, so the last known PASS/FAIL stays the drift baseline.
+    None if this claim has never been conclusively rechecked."""
     last = None
     for e in entries:
-        if e["type"] == "observation" and e.get("source") == f"recheck:{target_id}":
+        if e["type"] == "observation" and e.get("source") == f"recheck:{target_id}" \
+                and not e["body"].startswith("[UNKNOWN]"):
             last = e
     if last is None:
         return None
@@ -584,35 +587,42 @@ def cmd_recheck(args):
         try:
             p = subprocess.run(e["check"], shell=True, cwd=root, text=True,
                                capture_output=True, timeout=args.timeout)
-            passed = p.returncode == 0
+            status = "PASS" if p.returncode == 0 else "FAIL"
             tail = (p.stdout + p.stderr).strip()
-        except subprocess.TimeoutExpired:
-            passed, tail = False, f"(timed out after {args.timeout}s)"
+        except subprocess.TimeoutExpired:  # timeout establishes unknown, not false
+            status, tail = "UNKNOWN", f"(timed out after {args.timeout}s)"
         except Exception as ex:  # a broken recipe is an observation, never a crash (§8)
-            passed, tail = False, f"(recheck error: {ex})"
-        marker = "[PASS]" if passed else "[FAIL]"
-        body = f"{marker} {e['type']} {e['id']}: {e['check']}"
-        if not passed and tail:
+            status, tail = "UNKNOWN", f"(recheck error: {ex})"
+        body = f"[{status}] {e['type']} {e['id']}: {e['check']}"
+        if status != "PASS" and tail:
             body += "\n" + tail[-400:]
         obs = make_entry(entries, e["case"], "observation", "system", body,
                          source=f"recheck:{e['id']}")
         append_entry(root, obs)
         entries.append(obs)  # keep ids unique + advance the drift baseline
-        report.append((e, passed, prior))
+        report.append((e, status, prior))
 
     drifted = 0
-    for e, passed, prior in report:
-        drift = prior is not None and prior != passed
+    for e, status, prior in report:
+        # only conclusive PASS<->FAIL transitions are epistemic drift
+        drift = status != "UNKNOWN" and prior is not None \
+            and prior != (status == "PASS")
         drifted += drift
-        mark = "ok  " if passed else "FAIL"
+        mark = {"PASS": "ok  ", "FAIL": "FAIL", "UNKNOWN": "??? "}[status]
         note = ""
         if drift:
             note = f"  <- DRIFT (was {'holds' if prior else 'failing'})"
+        elif status == "UNKNOWN":
+            note = ("  (unknown — last known "
+                    f"{'holds' if prior else 'failing'})" if prior is not None
+                    else "  (unknown — never conclusively checked)")
         elif prior is None:
             note = "  (first recheck)"
         print(f"{mark} `{e['id']}` [{e['type']}] {e['body'][:52]}{note}")
-    held = sum(1 for _, p, _ in report if p)
+    held = sum(1 for _, s, _ in report if s == "PASS")
+    unknown = sum(1 for _, s, _ in report if s == "UNKNOWN")
     print(f"\n{held}/{len(report)} hold" +
+          (f"; {unknown} unknown" if unknown else "") +
           (f"; {drifted} drifted since last recheck" if drifted else ""))
 
 
@@ -1869,16 +1879,18 @@ def cmd_talk(args):
         "into CLI calls per the skill (echo-back user mutations; confirm "
         "destructive acts; reads never confirm). Reply READY.")
     print(h.get("reply", "").strip() or "(concierge ready)")
-    while True:
-        try:
-            line = input("casefile> ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
-        if not line or line in ("exit", "quit"):
-            break
-        print(adapter.send(h, line).strip())
-    adapter.stop(h)
+    try:
+        while True:
+            try:
+                line = input("casefile> ").strip()
+            except (EOFError, KeyboardInterrupt):
+                print()
+                break
+            if not line or line in ("exit", "quit"):
+                break
+            print(adapter.send(h, line).strip())
+    finally:
+        adapter.stop(h)  # a raising send() must not leak the concierge
 
 
 # --------------------------------------------------------------------- main

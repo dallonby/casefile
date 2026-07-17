@@ -12,8 +12,10 @@ source: manual) — re-verify on CLI upgrades, never trust memory.
 """
 
 import json
+import queue
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -108,9 +110,24 @@ class StreamClaudeAdapter:
         proc = subprocess.Popen(self.cmd, cwd=self.root, text=True, bufsize=1,
                                 stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                 stderr=subprocess.DEVNULL)
-        h = {"proc": proc, "sid": None, "usd": 0.0, "tokens": 0, "reply": ""}
+        h = self._attach(proc)
         h["reply"] = self.send(h, context)
         return h
+
+    def _attach(self, proc) -> dict:
+        # stdout is drained by a thread so send() can enforce its deadline
+        # even when the child goes silent (a blocking readline never returns)
+        q = queue.Queue()
+        threading.Thread(target=self._pump, args=(proc.stdout, q),
+                         daemon=True).start()
+        return {"proc": proc, "q": q, "sid": None, "usd": 0.0, "tokens": 0,
+                "reply": ""}
+
+    @staticmethod
+    def _pump(stream, q):
+        for line in stream:
+            q.put(line)
+        q.put(None)  # EOF sentinel
 
     def send(self, handle: dict, msg: str) -> str:
         p = handle["proc"]
@@ -119,16 +136,20 @@ class StreamClaudeAdapter:
         p.stdin.write(self._umsg(msg))
         p.stdin.flush()
         deadline = time.time() + TURN_TIMEOUT_S
-        for line in p.stdout:
-            if time.time() > deadline:
+        while True:
+            try:
+                line = handle["q"].get(timeout=max(0.0, deadline - time.time()))
+            except queue.Empty:
+                p.kill()  # the turn is wedged; reclaim the child
                 raise RuntimeError("stream claude: turn timeout")
+            if line is None:
+                raise RuntimeError("stream claude: stdout closed before result")
             try:
                 ev = json.loads(line)
             except json.JSONDecodeError:
                 continue
             if self._apply_event(handle, ev):
                 return handle["reply"]
-        raise RuntimeError("stream claude: stdout closed before result")
 
     def interject(self, handle: dict, msg: str):
         """§12.3 hot path: inject without waiting for the turn to finish."""
@@ -155,10 +176,13 @@ class CodexAdapter:
 
     def __init__(self, root: Path):
         self.root = root
-        self.opts = ["--json", "--sandbox", "workspace-write"]
+        # high effort on every call: recorded user constraint (codex consults)
+        effort = ["-c", "model_reasoning_effort=high"]
+        self.opts = ["--json", "--sandbox", "workspace-write", *effort]
         # `exec resume` rejects --sandbox (live-run failure 2026-07-17);
         # the config-override spelling is accepted by both subcommands
-        self.resume_opts = ["--json", "-c", 'sandbox_mode="workspace-write"']
+        self.resume_opts = ["--json", "-c", 'sandbox_mode="workspace-write"',
+                            *effort]
 
     def start(self, context: str) -> dict:
         return self._call(["codex", "exec", *self.opts, context],
@@ -281,20 +305,19 @@ def role_brief(root: Path, role: str, model: str) -> str:
 
 # -------------------------------------------------------------------- driver
 
-def case_snapshot(root: Path, case: str):
+def converged(root: Path, case: str, since_n: int = 0) -> bool:
+    """§12.1: no open disputes; leading hypothesis endorsed or verified.
+    Only hypotheses filed at/after log position `since_n` count — a settled
+    claim from before this deliberation must not converge it (485f4fbc)."""
     entries = cf.read_entries(root)
+    new_ids = {e["id"] for e in entries[since_n:]}
     ce = [e for e in entries if e["case"] == case]
     grades = cf.compute_grades(entries)
-    qs, ds = cf.open_items(ce)
-    return ce, grades, ds
-
-
-def converged(root: Path, case: str) -> bool:
-    """§12.1: no open disputes; leading hypothesis endorsed or verified."""
-    ce, grades, ds = case_snapshot(root, case)
+    _, ds = cf.open_items(ce)
     if ds:
         return False
     hyps = [e for e in ce if e["type"] == "hypothesis"
+            and e["id"] in new_ids
             and grades[e["id"]] not in ("refuted",)]
     return any(grades[h["id"]] in ("verified", "consensus") for h in hyps)
 
@@ -345,79 +368,91 @@ def run(topic: str, models=("claude", "codex"), turns: int = 6,
         c = [A.cost(ha), B.cost(hb)]
         return sum(x["usd"] or 0.0 for x in c), sum(x["tokens"] for x in c)
 
-    # 1. seed each model: role brief + resume-context (+recall)
-    ha = A.start(role_brief(root, roles[a_name], a_name) + "\n"
-                 + seed_context(root, case, topic, blind == a_name)
-                 + "\nBegin: state your opening position.")
-    log_t(a_name, "seed-reply", ha.get("reply", ""))
-    hb = B.start(role_brief(root, roles[b_name], b_name) + "\n"
-                 + seed_context(root, case, topic, blind == b_name)
-                 + f"\nThe {a_name} (proposer) opened with:\n{ha.get('reply','')}\n"
-                 + "Respond: your opening critique.")
-    log_t(b_name, "seed-reply", hb.get("reply", ""))
+    # convergence is scoped to hypotheses filed from here on (485f4fbc);
+    # captured before seeding because models may file during seed turns
+    start_n = len(cf.read_entries(root))
 
-    # 2. ferry turns
-    def drop_status(turn):
-        try:  # best-effort: feeds the §14 status bar; never blocks the drive
-            usd, tokens = spend()
-            ui = root / ".casefile" / "ui"
-            ui.mkdir(parents=True, exist_ok=True)
-            (ui / "spitball.json").write_text(json.dumps(
-                {"models": "+".join(models), "turn": turn,
-                 "spend_usd": round(usd, 4), "tokens": tokens}))
-        except Exception:
-            pass
+    ha = hb = None
+    try:
+        # 1. seed each model: role brief + resume-context (+recall)
+        ha = A.start(role_brief(root, roles[a_name], a_name) + "\n"
+                     + seed_context(root, case, topic, blind == a_name)
+                     + "\nBegin: state your opening position.")
+        log_t(a_name, "seed-reply", ha.get("reply", ""))
+        hb = B.start(role_brief(root, roles[b_name], b_name) + "\n"
+                     + seed_context(root, case, topic, blind == b_name)
+                     + f"\nThe {a_name} (proposer) opened with:\n{ha.get('reply','')}\n"
+                     + "Respond: your opening critique.")
+        log_t(b_name, "seed-reply", hb.get("reply", ""))
 
-    msg_to_a = hb.get("reply", "")
-    outcome, idle_rounds = "turn-budget", 0
-    entries_before = len(cf.read_entries(root))
-    for turn in range(turns):
-        drop_status(turn)
-        if converged(root, case):
-            outcome = "converged"
-            break
-        usd, _ = spend()
-        if budget_usd is not None and usd >= budget_usd:
-            outcome = "spend-budget"
-            break
-        ra = A.send(ha, f"[{b_name} says]:\n{msg_to_a}")
-        log_t(a_name, f"turn-{turn}", ra)
-        rb = B.send(hb, f"[{a_name} says]:\n{ra}")
-        log_t(b_name, f"turn-{turn}", rb)
-        msg_to_a = rb
-        n = len(cf.read_entries(root))
-        idle_rounds = idle_rounds + 1 if n == entries_before else 0
-        entries_before = n
-        if idle_rounds >= 2:
-            outcome = "stalemate"  # two rounds with nothing filed (§12.1)
-            break
-    else:
-        if converged(root, case):
-            outcome = "converged"
+        # 2. ferry turns
+        def drop_status(turn):
+            try:  # best-effort: feeds the §14 status bar; never blocks the drive
+                usd, tokens = spend()
+                ui = root / ".casefile" / "ui"
+                ui.mkdir(parents=True, exist_ok=True)
+                (ui / "spitball.json").write_text(json.dumps(
+                    {"models": "+".join(models), "turn": turn,
+                     "spend_usd": round(usd, 4), "tokens": tokens}))
+            except Exception:
+                pass
 
-    # 3. independent summaries — each written without seeing the other's (§12.1)
-    sum_prompt = ("Deliberation over. WITHOUT consulting the other model's view, "
-                  "state in <=5 bullet points what you believe was decided, "
-                  "ruled out, and left open. Do not file anything for this.")
-    sa, sb = A.send(ha, sum_prompt), B.send(hb, sum_prompt)
-    log_t(a_name, "summary", sa)
-    log_t(b_name, "summary", sb)
+        msg_to_a = hb.get("reply", "")
+        outcome, idle_rounds = "turn-budget", 0
+        entries_before = len(cf.read_entries(root))
+        for turn in range(turns):
+            drop_status(turn)
+            if converged(root, case, start_n):
+                outcome = "converged"
+                break
+            usd, _ = spend()
+            if budget_usd is not None and usd >= budget_usd:
+                outcome = "spend-budget"
+                break
+            ra = A.send(ha, f"[{b_name} says]:\n{msg_to_a}")
+            log_t(a_name, f"turn-{turn}", ra)
+            rb = B.send(hb, f"[{a_name} says]:\n{ra}")
+            log_t(b_name, f"turn-{turn}", rb)
+            msg_to_a = rb
+            n = len(cf.read_entries(root))
+            idle_rounds = idle_rounds + 1 if n == entries_before else 0
+            entries_before = n
+            if idle_rounds >= 2:
+                outcome = "stalemate"  # two rounds with nothing filed (§12.1)
+                break
+        else:
+            if converged(root, case, start_n):
+                outcome = "converged"
 
-    # 4. sweep + digest-and-review happen via the models (driver prompts, models file)
-    if outcome in ("converged", "turn-budget", "spend-budget"):
-        da = A.send(ha, "Secretary sweep: file anything from this deliberation "
-                        "not yet in the log, then propose a judgment digest via "
-                        f"`{CLI_STR} digest \"…\" -a " + a_name +
-                        " --kind judgment --supersedes <ids…>` for the settled span. "
-                        "Reply with the digest id or NONE.")
-        log_t(a_name, "digest", da)
-        db = B.send(hb, "Adversarial review (§6.2): read the newest judgment digest "
-                        "against the raw span (`python3 casefile.py log -n 50`). "
-                        "Find anything dropped or upgraded; endorse or dispute it "
-                        "via the CLI. Reply with what you filed.")
-        log_t(b_name, "digest-review", db)
-    A.stop(ha)
-    B.stop(hb)
+        # 3. independent summaries — each written without seeing the other's (§12.1)
+        sum_prompt = ("Deliberation over. WITHOUT consulting the other model's view, "
+                      "state in <=5 bullet points what you believe was decided, "
+                      "ruled out, and left open. Do not file anything for this.")
+        sa, sb = A.send(ha, sum_prompt), B.send(hb, sum_prompt)
+        log_t(a_name, "summary", sa)
+        log_t(b_name, "summary", sb)
+
+        # 4. sweep + digest-and-review happen via the models (driver prompts, models file)
+        if outcome in ("converged", "turn-budget", "spend-budget"):
+            da = A.send(ha, "Secretary sweep: file anything from this deliberation "
+                            "not yet in the log, then propose a judgment digest via "
+                            f"`{CLI_STR} digest \"…\" -a " + a_name +
+                            " --kind judgment --supersedes <ids…>` for the settled span. "
+                            "Reply with the digest id or NONE.")
+            log_t(a_name, "digest", da)
+            db = B.send(hb, "Adversarial review (§6.2): read the newest judgment digest "
+                            "against the raw span (`python3 casefile.py log -n 50`). "
+                            "Find anything dropped or upgraded; endorse or dispute it "
+                            "via the CLI. Reply with what you filed.")
+            log_t(b_name, "digest-review", db)
+    finally:
+        # every started handle is stopped on every exit path (0c5f2db9)
+        for ad, h in ((A, ha), (B, hb)):
+            if h is not None:
+                try:
+                    ad.stop(h)
+                except Exception:
+                    pass
 
     usd, tokens = spend()
     result = {"outcome": outcome, "case": case, "session": session,
