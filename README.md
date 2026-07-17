@@ -74,10 +74,10 @@ into a Claude Code project.
 
 ## Dogfooded
 
-casefile is developed using casefile ([SPEC §17](SPEC.md)): its own
-`.casefile/log.jsonl` — every hypothesis, wrong turn, deliberation, and
-external code review that produced this codebase — ships in this repo as
-a live example. `SPEC.md` is the authoritative design document.
+casefile is developed using casefile ([SPEC §17](SPEC.md)): every
+hypothesis, wrong turn, two-model deliberation, and external code review
+that produced this codebase went through its own log. `SPEC.md` is the
+authoritative design document.
 
 ## Status
 
