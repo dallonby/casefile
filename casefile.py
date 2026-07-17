@@ -2138,9 +2138,11 @@ def main():
     s.add_argument("-a", "--author", required=True)
     s.add_argument("body")
     s.add_argument("--case")
-    s.add_argument("--refs", nargs="*", default=[])
+    # extend: a repeated flag accumulates instead of silently overwriting —
+    # `--refs a --refs b` and `--refs a b` both record both
+    s.add_argument("--refs", nargs="*", action="extend", default=[])
     s.add_argument("--rationale", help="decisions")
-    s.add_argument("--rejected", nargs="*", metavar="OPTION:REASON",
+    s.add_argument("--rejected", nargs="*", action="extend", metavar="OPTION:REASON",
                    help="decisions: losing alternatives, so they aren't re-proposed")
     s.add_argument("--source", help="observations")
     s.add_argument("--check", help="hypothesis/constraint: shell recipe, exit 0 = still holds")

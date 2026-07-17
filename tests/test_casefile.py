@@ -528,6 +528,14 @@ class CliCompactTests(CliBase):
 
 
 class CliAuthorAndNudgeTests(CliBase):
+    def test_repeated_refs_flags_accumulate(self):
+        a = self.add("-t", "note", "-a", "claude", "first")
+        b = self.add("-t", "note", "-a", "claude", "second")
+        c = self.add("-t", "note", "-a", "claude", "links",
+                     "--refs", a, "--refs", b)
+        e = next(x for x in self.log_entries() if x["id"] == c)
+        self.assertEqual(e["refs"], [a, b])
+
     def test_author_casing_canonicalized_to_first_seen(self):
         self.add("-t", "note", "-a", "codex", "first")
         self.add("-t", "note", "-a", "Codex", "second")
