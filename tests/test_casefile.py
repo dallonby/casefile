@@ -13,6 +13,7 @@ Stdlib only (SPEC §4): run with `python3 -m unittest discover tests`.
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -234,8 +235,11 @@ class CliBase(unittest.TestCase):
         self.assertEqual(self.cli("open", "Test case", "--goal", "g").rc, 0)
 
     def cli(self, *args, expect=None):
+        # CODEX_HOME sandboxed: init/hooks-install must never touch ~/.codex
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home")}
         p = subprocess.run([sys.executable, str(CASEFILE), *args],
-                           cwd=self.dir, capture_output=True, text=True)
+                           cwd=self.dir, capture_output=True, text=True,
+                           env=env)
         r = type("R", (), {"rc": p.returncode,
                            "out": p.stdout.strip(), "err": p.stderr.strip()})
         if expect is not None:
@@ -849,6 +853,52 @@ class CliChannelTests(CliBase):
         r = self.cli("channel", "gpt9")
         self.assertNotEqual(r.rc, 0)
         self.assertIn("unknown channel", r.err)
+
+
+class CliInitTests(CliBase):
+    def test_init_opens_default_case_and_wires_both_vendors(self):
+        meta = json.loads((self.dir / ".casefile" / "meta.json").read_text())
+        self.assertTrue(meta["cases"])  # a default case exists after init
+        self.assertTrue((self.dir / ".claude" / "settings.json").exists())
+        self.assertTrue((self.dir / ".casefile" / "hooks" / "sweep.py").exists())
+        cfg = self.dir / ".codex-home" / "config.toml"
+        self.assertIn("[[hooks.Stop]]", cfg.read_text())
+        self.assertIn("casefile", (self.dir / "AGENTS.md").read_text())
+
+    def test_init_is_idempotent(self):
+        r = self.cli("init", expect=0)
+        self.assertIn("already exists", r.out)
+        cfg = (self.dir / ".codex-home" / "config.toml").read_text()
+        self.assertEqual(cfg.count("[[hooks.Stop]]"), 1)
+        agents = (self.dir / "AGENTS.md").read_text()
+        self.assertEqual(agents.count("## casefile"), 1)
+
+    def test_codex_block_preserves_surrounding_config(self):
+        cfg = self.dir / ".codex-home" / "config.toml"
+        cfg.write_text('model = "gpt-5.6-sol"\n\n' + cfg.read_text()
+                       + '\n[projects."/x"]\ntrust_level = "trusted"\n')
+        self.cli("hooks", "install", "codex", expect=0)
+        text = cfg.read_text()
+        self.assertIn('model = "gpt-5.6-sol"', text)
+        self.assertIn('[projects."/x"]', text)
+        self.assertEqual(text.count("[[hooks.Stop]]"), 1)
+        try:  # parse-validate where the stdlib has TOML (3.11+)
+            import tomllib
+            data = tomllib.loads(text)
+            self.assertIn("SessionStart", data["hooks"])
+            self.assertIn("Stop", data["hooks"])
+        except ModuleNotFoundError:
+            pass
+
+    def test_codex_commands_are_project_dispatching(self):
+        # global hooks must no-op outside casefile projects: every command
+        # guards on the script's presence in the cwd
+        cmds = [l for l in cf.CODEX_HOOKS_TOML.splitlines()
+                if l.startswith("command")]
+        self.assertEqual(len(cmds), 3)
+        for c in cmds:
+            self.assertIn("test -f .casefile/hooks/", c)
+            self.assertIn("|| true", c)
 
 
 class CliLintTests(CliBase):

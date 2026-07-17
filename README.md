@@ -66,11 +66,13 @@ Python ≥ 3.10, zero dependencies.
 git clone https://github.com/dallonby/casefile
 cd your-project
 python3 /path/to/casefile/casefile.py init
-python3 casefile.py open "intermittent 502s" --goal "find the cause"
 ```
 
-`casefile hooks install claude-code` wires the sweep/observe/liveness hooks
-into a Claude Code project.
+`init` is the whole onboarding: it opens a default case named after your
+project and wires the sweep/observe/liveness hooks for **both Claude Code
+and Codex** (same hook scripts — codex-cli's hook wire is Claude-compatible,
+verified against 0.144.5). Open named cases later for distinct
+investigations: `casefile open "intermittent 502s" --goal "find the cause"`.
 
 ## Dogfooded
 

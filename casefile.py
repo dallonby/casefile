@@ -366,35 +366,48 @@ def make_entry(entries, case, type_, author, body, refs=None, **extra):
 # ----------------------------------------------------------------- commands
 
 def cmd_init(args):
-    d = Path.cwd() / DIR
+    """One command onboards a project (user decision f5cee4f6/e0dfa650):
+    create .casefile, open a default case named after the directory, and
+    wire hooks for every supported vendor. Idempotent — safe to re-run."""
+    root = Path.cwd()
+    d = root / DIR
     if d.exists():
-        die(f"{d} already exists")
-    d.mkdir()
-    save_meta(Path.cwd(), {"schema": "1.0",
-                           "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                           "cases": {}})
-    (d / LOG).touch()
-    gi = d / ".gitignore"
-    gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\n")
-    print(f"initialized casefile in {d}")
+        print(f"{d} already exists — ensuring case + hooks")
+    else:
+        d.mkdir()
+        save_meta(root, {"schema": "1.0",
+                         "created": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                         "cases": {}})
+        (d / LOG).touch()
+        gi = d / ".gitignore"
+        gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\n")
+        print(f"initialized casefile in {d}")
+    meta = load_meta(root)
+    if not meta.get("cases"):
+        cid = open_case(root, meta, root.name or "case", None)
+        print(f"opened default case: {cid}")
+    install_hooks(root, "all")
 
 
-def cmd_open(args):
-    root, entries, meta = require_root()
-    # switch if a case with this title (or slug) exists
+def open_case(root: Path, meta: dict, title: str, goal: str | None) -> str:
+    """Switch to a case with this title (or slug) if it exists, else create."""
     for cid, c in meta["cases"].items():
-        if cid == args.title or c["title"].lower() == args.title.lower():
+        if cid == title or c["title"].lower() == title.lower():
             _migrate_legacy_active(root, meta)
             save_active(root, cid)
-            print(cid)
-            return
-    cid = case_slug(args.title, set(meta["cases"]))
-    meta["cases"][cid] = {"title": args.title, "goal": args.goal or "",
+            return cid
+    cid = case_slug(title, set(meta["cases"]))
+    meta["cases"][cid] = {"title": title, "goal": goal or "",
                           "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     _migrate_legacy_active(root, meta)  # drop stale key before rewriting meta
     save_meta(root, meta)
     save_active(root, cid)
-    print(cid)
+    return cid
+
+
+def cmd_open(args):
+    root, entries, meta = require_root()
+    print(open_case(root, meta, args.title, args.goal))
 
 
 def _migrate_legacy_active(root: Path, meta: dict):
@@ -1440,13 +1453,17 @@ from pathlib import Path
 
 LEASE_FRESH_S = 10
 
+# the installing vendor passes the model author as argv[1] (codex sessions
+# must file as codex); default stays claude for the claude-code install
+AUTHOR = sys.argv[1] if len(sys.argv) > 1 else "claude"
+
 REASON = (
     "Secretary sweep (casefile): before ending, diff this conversation against "
     "the casefile log. Anything decided, constrained, observed, or ruled out "
     "here that isn't recorded? File it with `python3 casefile.py add ...` using "
-    "the correct type and author (user for the user's words, claude for your "
+    f"the correct type and author (user for the user's words, {AUTHOR} for your "
     "own). Then file the sweep marker — "
-    "`python3 casefile.py add -t note -a claude \"secretary sweep: <gaps filed, "
+    f"`python3 casefile.py add -t note -a {AUTHOR} \"secretary sweep: <gaps filed, "
     "or 'nothing unrecorded'>\"` — and finish."
 )
 
@@ -1604,9 +1621,11 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 1. Run `python3 casefile.py resume-context` and read it. Ground truth beats
    the notes: where the log and the world conflict, the world wins — record
    the discrepancy as a new observation.
-2. Run `python3 casefile.py recheck` — it re-runs every recorded check
-   recipe and tells you which claims still hold versus held-three-days-ago.
-   Drift is your first lead.
+2. Run `python3 casefile.py recheck --startup` — it re-runs the recorded
+   check recipes and tells you which claims still hold versus
+   held-three-days-ago. Drift is your first lead. `--startup` keeps this
+   fast by skipping known-slow recipes (their last conclusive result is
+   reported instead); run the bare `recheck` when a skipped claim matters.
 3. Run `python3 casefile.py status`. Address open questions before
    proceeding; questions marked `→ user` are waiting on the user — surface
    them once, don't block on them. Act on any dormancy nudge or lint count
@@ -1653,6 +1672,12 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 - **Confirm** destructive-ish acts (resolve, digest, revoke) with one word
   before running them. Reads never confirm.
 - Your own routine filing is silent by default; show it on request.
+- **Reset-readiness drill** (user-adopted 2026-07-17): periodically — after
+  a digest, before ending a long session, or when the abstract feels stale —
+  simulate a context reset: read ONLY `resume-context` + `status` output and
+  ask what a fresh instance would be missing or misled by. Fix the surface
+  (abstract, mailbox, checks), not the instance. Note the drill result in
+  the sweep marker.
 
 ## Importing existing notes (§11.3)
 
@@ -1708,28 +1733,120 @@ def _ensure_hook(settings: dict, event: str, matcher: str | None,
     return True
 
 
-def cmd_hooks(args):
-    if args.vendor != "claude-code":
-        die("only 'claude-code' is supported for now (codex-side: SPEC §13, "
-            "verify against that CLI when building it)")
-    root, entries, meta = require_root()
+# Codex hook mechanics verified live against codex-cli 0.144.5 (obs 8c7a9b86):
+# definitions live in $CODEX_HOME/config.toml [hooks] (PascalCase events,
+# Claude-style groups); hook commands run through a shell with cwd = the
+# project dir; the stdin payload is Claude Code-compatible (session_id,
+# hook_event_name, stop_hook_active, tool_name 'Bash', tool_input.command).
+# There is no project-level codex config, so the global block dispatches:
+# each command no-ops unless the cwd has the casefile hook script.
+CODEX_HOOKS_BEGIN = "# >>> casefile hooks (managed by `casefile hooks install codex`) >>>"
+CODEX_HOOKS_END = "# <<< casefile hooks <<<"
+CODEX_HOOKS_TOML = """\
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "test -f .casefile/hooks/session_start.py && exec python3 .casefile/hooks/session_start.py || true"
+timeout = 10
+
+[[hooks.PostToolUse]]
+matcher = "Bash"
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "test -f .casefile/hooks/observe.py && exec python3 .casefile/hooks/observe.py || true"
+timeout = 15
+
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "test -f .casefile/hooks/sweep.py && exec python3 .casefile/hooks/sweep.py codex || true"
+timeout = 10"""
+
+AGENTS_BEGIN = "<!-- >>> casefile (managed by `casefile hooks install codex`) >>> -->"
+AGENTS_END = "<!-- <<< casefile <<< -->"
+AGENTS_SNIPPET = """\
+## casefile
+
+This project keeps its investigation state in an append-only casefile log.
+
+- At session start run `python3 casefile.py resume-context`, then
+  `python3 casefile.py recheck --startup`, then `python3 casefile.py status`,
+  and act on what they say.
+- File hypotheses, decisions, observations, and questions as you work —
+  the conventions in `.claude/skills/casefile/SKILL.md` apply to any agent,
+  not just Claude. Never edit `.casefile/log.jsonl` by hand."""
+
+
+def codex_home() -> Path:
+    return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+
+
+def _managed_block(path: Path, begin: str, end: str, body: str) -> str:
+    """Idempotently install/refresh a marker-delimited block in a text file
+    we don't own. Everything outside the markers is preserved verbatim."""
+    text = path.read_text() if path.exists() else ""
+    block = f"{begin}\n{body}\n{end}\n"
+    if begin in text and end in text:
+        pre, rest = text.split(begin, 1)
+        post = rest.split(end, 1)[1]
+        new = pre + block + post.lstrip("\n")
+    else:
+        new = (text.rstrip("\n") + "\n\n" if text.strip() else "") + block
+    if new == text:
+        return "unchanged"
+    verb = "updated" if path.exists() else "wrote"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(new)
+    return verb
+
+
+def _install_hook_scripts(root: Path):
     for rel, content in [(".casefile/hooks/observe.py", HOOK_OBSERVE_PY),
                          (".casefile/hooks/sweep.py", HOOK_SWEEP_PY),
                          (".casefile/hooks/session_start.py", HOOK_SESSION_START_PY),
                          (".claude/skills/casefile/SKILL.md", SKILL_MD)]:
         print(f"{_write_if_changed(root / rel, content)}: {rel}")
+
+
+def _install_claude(root: Path):
     sp = root / ".claude" / "settings.json"
     settings = json.loads(sp.read_text()) if sp.exists() else {}
-    changed = [ _ensure_hook(settings, ev, m, cmd, t)
-                for ev, m, cmd, t in CLAUDE_HOOKS ]
+    changed = [_ensure_hook(settings, ev, m, cmd, t)
+               for ev, m, cmd, t in CLAUDE_HOOKS]
     if any(changed):
         sp.parent.mkdir(parents=True, exist_ok=True)
         sp.write_text(json.dumps(settings, indent=2) + "\n")
         print(f"updated: .claude/settings.json ({sum(changed)} hook(s) added)")
     else:
         print("unchanged: .claude/settings.json (hooks already wired)")
-    print("\nnote: Claude Code loads settings at session start — restart the "
+    print("note: Claude Code loads settings at session start — restart the "
           "session for new hooks to take effect")
+
+
+def _install_codex(root: Path):
+    cfg = codex_home() / "config.toml"
+    verb = _managed_block(cfg, CODEX_HOOKS_BEGIN, CODEX_HOOKS_END,
+                          CODEX_HOOKS_TOML)
+    print(f"{verb}: {cfg} (global block; dispatches per-project)")
+    verb = _managed_block(root / "AGENTS.md", AGENTS_BEGIN, AGENTS_END,
+                          AGENTS_SNIPPET)
+    print(f"{verb}: AGENTS.md")
+    print("note: codex hook trust is per-hook and one-time — run `codex`, "
+          "open /hooks, and trust the casefile hooks (headless runs can pass "
+          "--dangerously-bypass-hook-trust)")
+
+
+def install_hooks(root: Path, vendor: str):
+    _install_hook_scripts(root)
+    if vendor in ("claude-code", "all"):
+        _install_claude(root)
+    if vendor in ("codex", "all"):
+        _install_codex(root)
+
+
+def cmd_hooks(args):
+    root, entries, meta = require_root()
+    install_hooks(root, args.vendor)
 
 
 # ------------------------------------------------------------ tmux UI (§14)
@@ -2049,7 +2166,7 @@ def main():
 
     s = sub.add_parser("hooks", help="install vendor integration (hooks + skill)")
     s.add_argument("action", choices=["install"])
-    s.add_argument("vendor")
+    s.add_argument("vendor", choices=["claude-code", "codex", "all"])
     s.set_defaults(fn=cmd_hooks)
 
     s = sub.add_parser("channel", help="switch the ui viewport (state | <model> | list)")

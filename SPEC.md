@@ -504,8 +504,24 @@ reply`, `interject(handle, msg)` (mid-request if supported), `cost(handle)`,
   stalls (two theories, no discriminating evidence, ~3 windows without
   progress); never edit the log by hand.
 
-Codex-side integration mirrors this with whatever configuration/skill
-mechanism Codex exposes (verify at build time).
+**Codex-side integration** (verified live against codex-cli 0.144.5, obs
+8c7a9b86): `casefile hooks install codex` appends a marker-delimited
+`[hooks]` block to `$CODEX_HOME/config.toml` — Codex reads hook
+definitions only from the global config (PascalCase events, Claude-style
+groups; no project-level config exists), so each command is a dispatcher
+that no-ops unless the cwd contains `.casefile/hooks/<script>`. The stdin
+payload and output contract are Claude Code-compatible (`session_id`,
+`hook_event_name`, `stop_hook_active`, `tool_name` "Bash", `decision:
+block`, `systemMessage`), so the same three hook scripts serve both
+vendors; the sweep hook takes the filing author as `argv[1]` (`codex`).
+Conventions land in a managed `AGENTS.md` section (Codex's project
+instructions file), pointing at the shared skill. Hook trust is per-hook,
+hash-based, and granted once interactively via `/hooks`; headless runs use
+`--dangerously-bypass-hook-trust`.
+
+**`casefile init` is the single onboarding step**: it creates `.casefile`,
+opens a default case named after the project directory (no title/goal
+ceremony), and installs hooks for all supported vendors. Idempotent.
 
 ## 14. tmux UI
 

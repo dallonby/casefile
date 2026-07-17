@@ -29,8 +29,11 @@ class SpitballBase(unittest.TestCase):
         self.cli("open", "Deliberation case", "--goal", "settle it")
 
     def cli(self, *args):
+        # CODEX_HOME sandboxed: init/hooks-install must never touch ~/.codex
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home")}
         p = subprocess.run([sys.executable, str(CASEFILE), *args],
-                           cwd=self.dir, capture_output=True, text=True)
+                           cwd=self.dir, capture_output=True, text=True,
+                           env=env)
         self.assertEqual(p.returncode, 0, p.stderr)
         return p.stdout.strip()
 
