@@ -165,7 +165,7 @@ git (provide a starter `.gitignore`).
 
 | type | purpose | extra fields |
 |---|---|---|
-| `hypothesis` | falsifiable claim by a model | `check` (optional shell recipe, §8) |
+| `hypothesis` | falsifiable claim by a model | `check` (optional shell recipe, §8); `supersedes` (optional: prior hypothesis id(s) this re-file corrects — retires them and their checks; a verified target must be disputed instead) |
 | `decision` | a choice constraining future work | `rationale`, `rejected` (list of `{option, reason}` — the losing alternatives, so they aren't re-proposed) |
 | `observation` | ground truth from the world | `source` (`pytest`, `git`, `hook:*`, `manual`, …) |
 | `constraint` | invariant that must hold | `check` (optional) |
@@ -494,6 +494,14 @@ reply`, `interject(handle, msg)` (mid-request if supported), `cost(handle)`,
 - **Hook config** mapping Claude Code tool events → `casefile add -t
   observation --source hook:<event>` (test runs, failing commands, commits).
   Volume governed by config; mechanical compaction (§6.1) keeps noise down.
+- **External journal sync**: agents often keep their own structured logs
+  (operations journals, run diaries) and file to them more reliably than to
+  the case. `sync-journal` mechanically ingests new lines from journals
+  listed in `.casefile/journals` (local-only config, one absolute path per
+  line) as observations with `source: journal:<name>`, secret-redacted. A
+  journal seen for the first time registers at EOF — only lines written
+  after configuration sync, never a historical flood. Rides hook batches
+  like compaction.
 - **Stop hook → secretary sweep**: on session end, prompt the session to
   diff its conversation against the log — "anything decided, constrained,
   or ruled out here that isn't recorded?" — and file the gaps. Closes the

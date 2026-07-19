@@ -145,7 +145,9 @@ def new_id(existing: set[str], body: str) -> str:
 def superseded_ids(entries: list[dict]) -> set[str]:
     s: set[str] = set()
     for e in entries:
-        if e["type"] == "digest":
+        # digests supersede at checkpoints (§6); a corrected hypothesis
+        # supersedes the claim it re-files, retiring its stale check with it
+        if e["type"] in ("digest", "hypothesis"):
             s.update(e.get("supersedes", []))
             # a newer abstract supersedes older abstracts of the same case
     # abstracts: only the latest per case is live
@@ -392,7 +394,7 @@ def cmd_init(args):
                          "cases": {}})
         (d / LOG).touch()
         gi = d / ".gitignore"
-        gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\ncli\n")
+        gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\ncli\njournals\n")
         print(f"initialized casefile in {d}")
     # the log is local state, never repo content (constraint dfae9509):
     # make the project's own .gitignore enforce that on fresh projects too
@@ -453,6 +455,24 @@ def cmd_add(args):
         extra["source"] = args.source or "manual"
     if args.type in ("hypothesis", "constraint") and args.check:
         extra["check"] = args.check
+    if args.supersedes:
+        # like-for-like correction: a hypothesis re-filed with a fixed body
+        # or check retires its predecessor in one step (no digest ceremony)
+        if args.type != "hypothesis":
+            die("--supersedes on add is for hypotheses; decisions revoke, "
+                "digests supersede everything else")
+        by_id = {e["id"]: e for e in entries}
+        grades = compute_grades(entries)
+        for t in args.supersedes:
+            target = by_id.get(t)
+            if not target:
+                die(f"unknown supersedes target {t}")
+            if target["type"] != "hypothesis" or target["case"] != case:
+                die(f"supersedes target {t} is not a hypothesis in this case")
+            if grades.get(t) == "verified":
+                die(f"{t} is verified against ground truth — dispute it "
+                    "rather than silently replacing it")
+        extra["supersedes"] = args.supersedes
     if args.type == "question" and args.to:
         extra["to"] = args.to
     e = make_entry(entries, case, args.type, args.author, args.body,
@@ -775,6 +795,90 @@ def cmd_compact(args):
         total += len(ids)
         print(f"`{e['id']}` [{case}] {summary}")
     print(f"\ncompacted {total} observation(s) into {len(plan)} mechanical digest(s)")
+
+
+# -------- external journal sync (mechanical, §13)
+
+JOURNALS_FILE = "journals"
+JOURNAL_MAX_BODY = 2000
+
+_KV_SECRET = re.compile(r"(?i)\b(api[_-]?key|token|secret|password|passwd)(\s*[=:]\s*)\S+")
+_SECRET_PATTERNS = [
+    re.compile(r"\b(sk|pk)-[A-Za-z0-9_-]{16,}"),
+    re.compile(r"\bgh[pousr]_[A-Za-z0-9]{20,}"),
+    re.compile(r"\bAKIA[0-9A-Z]{16}\b"),
+    re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
+    re.compile(r"(?i)\bbearer\s+[A-Za-z0-9._-]{16,}"),
+]
+
+
+def redact_secrets(s: str) -> str:
+    s = _KV_SECRET.sub(r"\1\2[REDACTED]", s)
+    for rx in _SECRET_PATTERNS:
+        s = rx.sub("[REDACTED]", s)
+    return s
+
+
+def _journal_cursor_path(root: Path, jpath: Path) -> Path:
+    import hashlib
+    h = hashlib.sha256(str(jpath).encode()).hexdigest()[:12]
+    return root / DIR / "state" / f"journal-{h}.cursor"
+
+
+def cmd_sync_journal(args):
+    """Mechanically ingest new lines from external journals the agents already
+    maintain (operations logs, run diaries) as sourced observations. Config is
+    local-only: `.casefile/journals`, one absolute path per line. A journal
+    seen for the first time is registered at EOF — sync captures lines written
+    after configuration, never a historical flood."""
+    root, entries, meta = require_root()
+    cfg = root / DIR / JOURNALS_FILE
+    if not cfg.exists():
+        print("no journals configured (.casefile/journals: one absolute path per line)")
+        return
+    case = resolve_case(root, meta, args.case)
+    total = 0
+    for raw in cfg.read_text().splitlines():
+        p = raw.strip()
+        if not p or p.startswith("#"):
+            continue
+        jpath = Path(p).expanduser()
+        if not jpath.is_file():
+            print(f"missing: {jpath}")
+            continue
+        cur_file = _journal_cursor_path(root, jpath)
+        data = jpath.read_bytes()
+        if not cur_file.exists():
+            cur_file.parent.mkdir(parents=True, exist_ok=True)
+            cur_file.write_text(str(len(data)))
+            print(f"registered {jpath.name} at offset {len(data)} (new lines only)")
+            continue
+        cursor = int(cur_file.read_text())
+        if len(data) < cursor:
+            # journal shrank (rewritten): re-adopt EOF rather than re-import
+            cur_file.write_text(str(len(data)))
+            print(f"{jpath.name} shrank; cursor reset to EOF")
+            continue
+        chunk = data[cursor:]
+        cut = chunk.rfind(b"\n")  # consume only complete lines
+        if cut < 0:
+            continue
+        batch = []
+        for l in chunk[:cut].decode("utf-8", "replace").splitlines():
+            if not l.strip():
+                continue
+            body = redact_secrets(l.strip())[:JOURNAL_MAX_BODY]
+            batch.append(make_entry(entries + batch, case, "observation",
+                                    "system", body,
+                                    source=f"journal:{jpath.name}"))
+        if batch:
+            append_entries(root, batch)
+            entries.extend(batch)
+        cur_file.write_text(str(cursor + cut + 1))
+        total += len(batch)
+        if batch:
+            print(f"{jpath.name}: +{len(batch)}")
+    print(f"synced {total} journal line(s)")
 
 
 # -------- recall & dig (SPEC §10)
@@ -1280,6 +1384,25 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
             for v in viol:
                 problems.append(f"DIGEST-VIOLATION `{e['id']}` supersedes {v}")
 
+    # CHECK-FAILING: a live check that keeps failing needs an owner — fix the
+    # recipe, supersede the claim, or dispute it; letting it fail on schedule
+    # just teaches everyone to ignore recheck.
+    live = {e["id"]: e for e in live_checks(entries)}
+    consec_fails: dict[str, int] = {}
+    for e in entries:
+        src = str(e.get("source", ""))
+        if e["type"] == "observation" and src.startswith("recheck:"):
+            tid = src.split(":", 1)[1]
+            if tid in live:
+                if e["body"].startswith("[FAIL]"):
+                    consec_fails[tid] = consec_fails.get(tid, 0) + 1
+                elif e["body"].startswith("[PASS]"):
+                    consec_fails[tid] = 0
+    for tid, n in consec_fails.items():
+        if n >= 3:
+            problems.append(f"CHECK-FAILING    `{tid}` check failed the last {n} "
+                            f"recheck(s): {live[tid]['body'][:60]}")
+
     for start, end, n in unswept_blocks(entries, now=now):
         problems.append(f"UNSWEPT          session {start}..{end} ({n} entries) "
                         f"ended without a secretary sweep")
@@ -1451,6 +1574,8 @@ def main():
                           "--source", "hook:post-bash", body],
                    cwd=root, capture_output=True, timeout=10)
     subprocess.run(cli + ["compact"],  # §6.1: compaction rides hook batches
+                   cwd=root, capture_output=True, timeout=10)
+    subprocess.run(cli + ["sync-journal"],  # §13: external journals ride too
                    cwd=root, capture_output=True, timeout=10)
 
 
@@ -1820,6 +1945,19 @@ This project keeps its investigation state in an append-only casefile log.
 - At session start run `python3 casefile.py resume-context`, then
   `python3 casefile.py recheck --startup`, then `python3 casefile.py status`,
   and act on what they say.
+- **After any context compaction or summarization** (a "context compacted"
+  marker, a restored summary), re-run `python3 casefile.py resume-context`
+  before acting. The log outranks your compacted summary: your summary is
+  lossy and unreviewed; the log is the shared record.
+- **Before filing a decision or changing an agreed plan**, run
+  `python3 casefile.py dig "<topic>"` (and `recall` for past-case history)
+  and cite what you find in `--refs`. Decisions carry `--rationale` and
+  `--rejected` for the losing options — a bare decision is an unauditable
+  assertion.
+- **Echo every entry you file** as one line in your visible reply —
+  `recorded: decision “…” (user)` — your own filings included, not just the
+  user's words. Silent filing is how mistranscription survives; the echo is
+  how the operator catches it in the moment.
 - File hypotheses, decisions, observations, and questions as you work —
   the conventions in `.claude/skills/casefile/SKILL.md` apply to any agent,
   not just Claude. Never edit `.casefile/log.jsonl` by hand."""
@@ -2146,6 +2284,8 @@ def main():
                    help="decisions: losing alternatives, so they aren't re-proposed")
     s.add_argument("--source", help="observations")
     s.add_argument("--check", help="hypothesis/constraint: shell recipe, exit 0 = still holds")
+    s.add_argument("--supersedes", nargs="*", action="extend", default=[],
+                   help="hypotheses: prior hypothesis id(s) this re-file corrects")
     s.add_argument("--to", choices=["user", "any"], help="questions: mailbox routing")
     s.set_defaults(fn=cmd_add)
 
@@ -2207,6 +2347,11 @@ def main():
                         f"than {SLOW_CHECK_S}s last run, reporting their "
                         f"last conclusive result instead")
     s.set_defaults(fn=cmd_recheck)
+
+    s = sub.add_parser("sync-journal", help="ingest new lines from configured "
+                       "external journals as observations (.casefile/journals)")
+    s.add_argument("--case")
+    s.set_defaults(fn=cmd_sync_journal)
 
     s = sub.add_parser("compact", help="collapse steady-state hook observations (SPEC §6.1)")
     s.add_argument("--case")

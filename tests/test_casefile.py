@@ -558,6 +558,109 @@ class CliAuthorAndNudgeTests(CliBase):
         self.assertEqual(r.err, "")
 
 
+class CliSupersedeTests(CliBase):
+    def test_refile_supersedes_and_retires_check(self):
+        h1 = self.add("-t", "hypothesis", "-a", "claude", "old claim",
+                      "--check", "false")
+        h2 = self.add("-t", "hypothesis", "-a", "claude", "corrected claim",
+                      "--check", "true", "--supersedes", h1)
+        entries = self.log_entries()
+        self.assertIn(h1, cf.superseded_ids(entries))
+        live = [e["id"] for e in cf.live_checks(entries)]
+        self.assertEqual(live, [h2])
+
+    def test_supersede_verified_hypothesis_refused(self):
+        h1 = self.add("-t", "hypothesis", "-a", "claude", "true claim")
+        o = self.add("-t", "observation", "-a", "system", "evidence")
+        self.cli("verify", h1, o, "-a", "user", expect=0)
+        r = self.cli("add", "-t", "hypothesis", "-a", "claude", "replacement",
+                     "--supersedes", h1)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("dispute", r.err)
+
+    def test_supersedes_rejected_on_non_hypothesis(self):
+        d = self.add("-t", "decision", "-a", "user", "choice")
+        r = self.cli("add", "-t", "decision", "-a", "user", "new choice",
+                     "--supersedes", d)
+        self.assertNotEqual(r.rc, 0)
+
+
+class CliJournalSyncTests(CliBase):
+    def _journal(self, text):
+        j = self.dir / "ops-journal.md"
+        j.write_text(text)
+        (self.dir / ".casefile" / "journals").write_text(str(j) + "\n")
+        return j
+
+    def _obs(self):
+        return [e for e in self.log_entries()
+                if str(e.get("source", "")).startswith("journal:")]
+
+    def test_first_sight_registers_at_eof(self):
+        self._journal("old line one\nold line two\n")
+        r = self.cli("sync-journal", expect=0)
+        self.assertIn("registered", r.out)
+        self.assertEqual(self._obs(), [])
+
+    def test_new_complete_lines_ingest_once(self):
+        j = self._journal("old\n")
+        self.cli("sync-journal", expect=0)
+        j.write_text("old\nBEGIN deploy of thing\npartial tail without newline")
+        self.cli("sync-journal", expect=0)
+        obs = self._obs()
+        self.assertEqual(len(obs), 1)  # the partial line is not consumed
+        self.assertIn("BEGIN deploy", obs[0]["body"])
+        r = self.cli("sync-journal", expect=0)  # idempotent
+        self.assertIn("synced 0", r.out)
+        self.assertEqual(len(self._obs()), 1)
+
+    def test_secrets_redacted(self):
+        j = self._journal("old\n")
+        self.cli("sync-journal", expect=0)
+        j.write_text("old\ndeployed with api_key=abc123def456\n")
+        self.cli("sync-journal", expect=0)
+        self.assertIn("[REDACTED]", self._obs()[0]["body"])
+        self.assertNotIn("abc123def456", self._obs()[0]["body"])
+
+    def test_shrunk_journal_resets_without_reimport(self):
+        j = self._journal("a long first line of history\n")
+        self.cli("sync-journal", expect=0)
+        j.write_text("rewritten\n")
+        r = self.cli("sync-journal", expect=0)
+        self.assertIn("shrank", r.out)
+        self.assertEqual(self._obs(), [])
+
+
+class LintCheckFailingTests(unittest.TestCase):
+    def test_three_consecutive_fails_flagged(self):
+        es = [E("h1", "hypothesis", check="false")] + [
+            E(f"o{i}", "observation", author="system",
+              body="[FAIL] hypothesis h1: false", source="recheck:h1")
+            for i in range(3)]
+        self.assertTrue(any("CHECK-FAILING" in p
+                            for p in cf.lint_problems(es)))
+
+    def test_pass_resets_the_streak(self):
+        es = [E("h1", "hypothesis", check="true"),
+              E("o1", "observation", author="system",
+                body="[FAIL] hypothesis h1: x", source="recheck:h1"),
+              E("o2", "observation", author="system",
+                body="[FAIL] hypothesis h1: x", source="recheck:h1"),
+              E("o3", "observation", author="system",
+                body="[PASS] hypothesis h1: x", source="recheck:h1")]
+        self.assertFalse(any("CHECK-FAILING" in p
+                             for p in cf.lint_problems(es)))
+
+    def test_superseded_hypothesis_not_flagged(self):
+        es = [E("h1", "hypothesis", check="false")] + [
+            E(f"o{i}", "observation", author="system",
+              body="[FAIL] hypothesis h1: false", source="recheck:h1")
+            for i in range(3)] + [
+            E("h2", "hypothesis", body="corrected", supersedes=["h1"])]
+        self.assertFalse(any("CHECK-FAILING" in p
+                             for p in cf.lint_problems(es)))
+
+
 class CliAbstractTests(CliBase):
     def test_first_abstract_needs_no_supersedes(self):
         r = self.cli("digest", "Problem: X. Status: ongoing.", "-a", "claude",
