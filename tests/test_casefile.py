@@ -707,6 +707,31 @@ class CliMemoryTests(CliBase):
                  "--kind", "abstract", expect=0)
         r = self.cli("recall", "zzzznomatch", expect=0)
         self.assertIn("no matches", r.out)
+        self.assertIn("dig", r.out)  # the miss teaches the in-case tool
+
+    def test_recall_keyword_soup_matches_any_term(self):
+        # agents query with term soup; one matching term must be enough,
+        # both through FTS and through the scan fallback
+        self.cli("digest", "Encoding sniffer theory ruled out; BOM mismatch.",
+                 "-a", "claude", "--kind", "abstract", expect=0)
+        r = self.cli("recall", "sniffer latency 4ms inclusion E2E", expect=0)
+        self.assertIn("test-case", r.out)
+        (self.dir / ".casefile" / "index.db").unlink()
+        r = self.cli("recall", "sniffer latency 4ms inclusion E2E", expect=0)
+        self.assertIn("test-case", r.out)
+
+    def test_digest_auto_reindexes(self):
+        self.cli("digest", "Flux capacitor undervolt confirmed.", "-a", "claude",
+                 "--kind", "abstract", expect=0)
+        r = self.cli("recall", "capacitor", expect=0)  # no explicit reindex
+        self.assertIn("test-case", r.out)
+
+    def test_dig_keyword_soup_ranks_any_term(self):
+        self.add("-t", "note", "-a", "claude", "the flux capacitor undervolts")
+        self.add("-t", "note", "-a", "claude", "unrelated bookkeeping")
+        r = self.cli("dig", "capacitor undervolt zzznonsense", expect=0)
+        self.assertIn("flux capacitor", r.out)
+        self.assertNotIn("bookkeeping", r.out)
 
     def test_dig_finds_superseded(self):
         for i in range(4):

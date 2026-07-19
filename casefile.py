@@ -591,7 +591,12 @@ def cmd_digest(args):
     e = make_entry(entries, case, "digest", args.author, args.body,
                    supersedes=supersedes, kind=args.kind)
     append_entry(root, e)
+    entries.append(e)
     save_active(root, case)  # SPEC §5.1: active case follows "last touched"
+    if args.kind in ("abstract", "judgment"):
+        # compost changed: refresh the recall cache now rather than trusting
+        # the author to remember `reindex` (a stale index reads as amnesia)
+        build_index(root, entries, meta)
     print(e["id"])
 
 
@@ -926,14 +931,41 @@ def cmd_reindex(args):
     print(f"indexed {n} compost entr{'y' if n == 1 else 'ies'}")
 
 
+def _query_terms(query: str) -> list[str]:
+    return [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 2]
+
+
+def rank_matches(candidates: list[dict], query: str) -> list[dict]:
+    """Any-term ranked matching. Agents search with keyword soup, so
+    all-terms-AND (or whole-phrase substring) returns empty exactly when
+    search matters most. Score = distinct terms present; ties break to
+    recency. Returns candidates ordered best-first."""
+    terms = _query_terms(query)
+    if not terms:
+        return []
+    scored = []
+    for i, e in enumerate(candidates):
+        body = e["body"].lower()
+        n = sum(1 for t in terms if t in body)
+        if n:
+            scored.append((-n, -i, e))
+    scored.sort(key=lambda x: (x[0], x[1]))
+    return [e for _, _, e in scored]
+
+
+def _fts_or_query(query: str) -> str:
+    """Quoted OR-of-terms: bm25 still ranks multi-term hits first, but a
+    single matching term is enough — and quoting keeps hyphens, dots and
+    numbers from reading as FTS5 syntax."""
+    return " OR ".join(f'"{t}"' for t in _query_terms(query))
+
+
 def _scan_recall(entries, meta, query, limit):
-    q = query.lower()
     out = []
-    for e in compost_entries(entries):
-        if q in e["body"].lower():
-            title = meta.get("cases", {}).get(e["case"], {}).get("title", e["case"])
-            out.append((e["case"], title, e["body"]))
-    return out[:limit]
+    for e in rank_matches(compost_entries(entries), query)[:limit]:
+        title = meta.get("cases", {}).get(e["case"], {}).get("title", e["case"])
+        out.append((e["case"], title, e["body"]))
+    return out
 
 
 def cmd_recall(args):
@@ -941,20 +973,21 @@ def cmd_recall(args):
     import sqlite3
     hits = None
     p = index_path(root)
-    if p.exists():
+    fts = _fts_or_query(args.query)
+    if p.exists() and fts:
         db = sqlite3.connect(p)
         try:
             hits = db.execute(
                 "SELECT case_id, title, body FROM compost WHERE compost MATCH ? "
-                "ORDER BY bm25(compost) LIMIT ?", (args.query, args.limit)).fetchall()
+                "ORDER BY bm25(compost) LIMIT ?", (fts, args.limit)).fetchall()
         except sqlite3.OperationalError:
-            hits = None  # bad FTS query or no FTS5 — fall back
+            hits = None  # no FTS5 in this SQLite build — fall back
         db.close()
-    if hits is None:
+    if not hits:  # index missing, stale, or empty result — the log is truth
         hits = _scan_recall(entries, meta, args.query, args.limit)
     if not hits:
-        print("no matches in the compost "
-              "(run `casefile reindex` if you have abstracts/judgment digests)")
+        print("no matches in the compost (cross-case abstracts and judgment "
+              "digests). For this case's raw history use `dig \"<topic>\"`.")
         return
     for case, title, body in hits:
         first = body.strip().splitlines()[0] if body.strip() else ""
@@ -980,12 +1013,15 @@ def cmd_dig(args):
                 print(f"    ⤷ hidden by digest {d['id']} [{d.get('kind')}]: {d['body'][:60]}")
         return
 
-    q = args.query.lower()
-    matches = [e for e in entries if q in e["body"].lower()]
-    if not matches:
-        print("no matches in raw history")
+    ranked = rank_matches(entries, args.query)
+    if not ranked:
+        print("no matches in raw history (searched any of: "
+              f"{', '.join(_query_terms(args.query)) or '—'})")
         return
-    for e in matches[-args.limit:]:
+    # top hits by relevance, displayed in log order so causality reads right
+    order = {id(e): i for i, e in enumerate(entries)}
+    matches = sorted(ranked[:args.limit], key=lambda e: order[id(e)])
+    for e in matches:
         tag = "[superseded] " if e["id"] in hidden else ""
         print(f"{e['id']}  {e['type']:<11} {tag}{e['body'].splitlines()[0][:78]}")
         if e["type"] == "digest":
