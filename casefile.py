@@ -3374,6 +3374,7 @@ def main():
 
     s = sub.add_parser(
         "upgrade",
+        aliases=["update"],
         help="git-pull this CLI, install PATH symlink, refresh project skill/hooks")
     s.add_argument("--no-pull", action="store_true",
                    help="skip git pull of the casefile checkout")
