@@ -25,14 +25,7 @@ git clone https://github.com/dallonby/casefile.git \
   "$HOME/.local/share/casefile"
 cd /path/to/your-project
 python3 "$HOME/.local/share/casefile/casefile.py" init
-
-export PATH="$HOME/.local/bin:$PATH"
-export CASEFILE_AUTHOR=codex  # use claude or grok when running those agents
-casefile boot
 ```
-
-Add the `PATH` export to `~/.zshrc` (or your shell's startup file) to make
-the launcher available in future terminals.
 
 ### Linux
 
@@ -44,14 +37,7 @@ git clone https://github.com/dallonby/casefile.git \
   "$HOME/.local/share/casefile"
 cd /path/to/your-project
 python3 "$HOME/.local/share/casefile/casefile.py" init
-
-export PATH="$HOME/.local/bin:$PATH"
-export CASEFILE_AUTHOR=codex  # use claude or grok when running those agents
-casefile boot
 ```
-
-Add the `PATH` export to `~/.bashrc`, `~/.zshrc`, or the startup file for
-your shell.
 
 ### Windows
 
@@ -67,15 +53,10 @@ git clone https://github.com/dallonby/casefile.git \
   "$HOME/.local/share/casefile"
 cd /mnt/c/path/to/your-project
 python3 "$HOME/.local/share/casefile/casefile.py" init
-
-export PATH="$HOME/.local/bin:$PATH"
-export CASEFILE_AUTHOR=codex  # use claude or grok when running those agents
-casefile boot
 ```
 
-Add the `PATH` export to `~/.bashrc` inside WSL. Native PowerShell can run
-the core Python CLI, but WSL is currently required for the generated
-Claude Code, Codex, and Grok-compatible shell hooks.
+Native PowerShell can run the core Python CLI, but WSL is currently required
+for the generated Claude Code, Codex, and Grok-compatible shell hooks.
 
 `init` creates the local, gitignored `.casefile/` store and a default case;
 installs agent instructions and hooks; and creates a `casefile` launcher in
@@ -83,15 +64,12 @@ installs agent instructions and hooks; and creates a `casefile` launcher in
 hooks. Codex asks you to trust them through `/hooks`; Grok uses
 `/hooks-trust`.
 
-Set `CASEFILE_AUTHOR` in every agent's launch environment: `claude`,
-`codex`, or `grok`. On a brand-new empty case, `casefile boot` may exit with
-status 30 to signal that no rolling checkpoint exists yet; that is not an
-installation failure.
+The generated `AGENTS.md` bootstrap handles agent identity and first boot;
+no manual environment exports are part of installation.
 
 ## What a boot looks like
 
 ```
-$ export CASEFILE_AUTHOR=claude
 $ casefile boot
 === WHERE ===
 store: /path/to/project
@@ -238,7 +216,6 @@ casefile upgrade
 1. `git pull --ff-only` of the casefile checkout (optional `--no-pull`)
 2. Install/refresh a `casefile` launcher on PATH (`--bin-dir`, `$CASEFILE_BIN_DIR`)
 3. Rewrite project `SKILL.md`, hooks, and `AGENTS.md` from **this** CLI
-4. Remind you to `export CASEFILE_AUTHOR=…`
 
 Put `casefile upgrade` in agent session launch so porcelain never drifts.
 
