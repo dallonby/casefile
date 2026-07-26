@@ -26,9 +26,42 @@ resets, session crashes, and model swaps.
 
 ## Installation
 
-casefile requires **Git** and **Python 3.10 or newer**. It has no third-party
-Python dependencies. Clone the CLI once somewhere permanent, then run `init`
-from every project that should keep a casefile.
+casefile requires **Git** and **Python 3.10 or newer**. Core is stdlib-only;
+optional shared **Postgres** multi-writer needs `psycopg2`. Clone the CLI once
+somewhere permanent, then run `init` from every project that should keep a
+casefile.
+
+### Identity (no `export` required)
+
+Put the agent/human id in the project `.env` (loaded automatically):
+
+```bash
+CASEFILE_AUTHOR=codex
+```
+
+Or a one-line gitignored `.casefile/author`. Process env still wins if set.
+`-a` on write commands remains available as an override.
+
+### Persistence (local default, optional Postgres)
+
+Default is **local** `.casefile/log.jsonl` (rides in git). For multi-user shared
+history on the VPN (e.g. ashburn2):
+
+```bash
+CASEFILE_PERSISTENCE_MODE=postgres
+CASEFILE_POSTGRES_URL=postgres://rarbi:rarbi@ashburn2.a-star.io/rarbi
+# same namespace on every clone that should share one history:
+CASEFILE_PG_NAMESPACE=rarbi-q5-dynamic-fee
+```
+
+On first use, local history is imported into Postgres; later syncs **dedupe by
+entry id** (`ON CONFLICT DO NOTHING`). Local JSONL is still mirrored for git
+and offline. Check / force sync:
+
+```bash
+casefile persistence            # status
+casefile persistence reconcile  # push local→PG and pull PG→local missing ids
+```
 
 ### macOS
 

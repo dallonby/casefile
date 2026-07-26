@@ -26,6 +26,19 @@ STALE_LOCK_S = 60
 POINTER = ".casefile-pointer"  # optional committed path to the canonical store root
 ENV_ROOT = "CASEFILE_ROOT"
 ENV_AUTHOR = "CASEFILE_AUTHOR"
+# Persistence: default local FS (+ git). Opt-in shared Postgres multi-writer:
+#   CASEFILE_PERSISTENCE_MODE=local|postgres
+#   CASEFILE_POSTGRES_URL=postgres://user:pass@host/db
+#   CASEFILE_PG_NAMESPACE=shared-name   # optional; default from git remote+dir
+# Local identity without `export`: CASEFILE_AUTHOR in project `.env` /
+# `.env.local`, or a one-line `.casefile/author` file (gitignored).
+ENV_PERSISTENCE_MODE = "CASEFILE_PERSISTENCE_MODE"
+ENV_POSTGRES_URL = "CASEFILE_POSTGRES_URL"
+ENV_PG_NAMESPACE = "CASEFILE_PG_NAMESPACE"
+LOCAL_AUTHOR = "author"  # under .casefile/
+_DOTENV_LOADED = False
+# Per-root: whether we've reconciled local JSONL ↔ Postgres this process.
+_PG_RECONCILED: set[str] = set()
 
 # Orchestrator-friendly boot exit codes (lint remains 0/1).
 EXIT_OK = 0
@@ -127,6 +140,73 @@ def die(msg: str, code: int = 1):
     sys.exit(code)
 
 
+def _parse_dotenv_line(line: str) -> tuple[str, str] | None:
+    line = line.strip()
+    if not line or line.startswith("#"):
+        return None
+    if line.startswith("export "):
+        line = line[7:].strip()
+    if "=" not in line:
+        return None
+    key, _, val = line.partition("=")
+    key = key.strip()
+    if not key:
+        return None
+    val = val.strip()
+    if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
+        val = val[1:-1]
+    return key, val
+
+
+def _apply_dotenv_file(path: Path) -> None:
+    """Set env vars from a dotenv file; never override existing process env."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for line in text.splitlines():
+        parsed = _parse_dotenv_line(line)
+        if not parsed:
+            continue
+        key, val = parsed
+        if key not in os.environ:
+            os.environ[key] = val
+
+
+def ensure_dotenv_loaded(start: Path | None = None) -> None:
+    """Load nearest project `.env` / `.env.local` and `.casefile/author`.
+
+    Walks from cwd upward. Nearer files win (first assignment sticks).
+    Process environment always wins over files — no silent override of
+    a real export. Call is idempotent.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    start = (start or Path.cwd()).resolve()
+    for c in [start, *start.parents]:
+        for name in (".env.local", ".env"):
+            p = c / name
+            if p.is_file():
+                _apply_dotenv_file(p)
+        author_file = c / DIR / LOCAL_AUTHOR
+        if author_file.is_file() and ENV_AUTHOR not in os.environ:
+            try:
+                a = author_file.read_text(encoding="utf-8").strip()
+            except OSError:
+                a = ""
+            if a:
+                os.environ[ENV_AUTHOR] = a
+        # stop climbing past a discovered casefile store's parent once we've
+        # also considered its .env (same directory as .casefile/)
+        if (c / DIR).is_dir() and c != start:
+            # still allow this dir's .env (already applied above); continue
+            # one more level only if no author yet — actually keep walking
+            # so monorepo root .env works. No early break.
+            pass
+
+
 def normalize_author(author: str) -> str:
     """Map model/vendor nicknames to a stable family author id.
 
@@ -145,13 +225,31 @@ def normalize_author(author: str) -> str:
 
 
 def resolve_author(explicit: str | None = None) -> tuple[str, str]:
-    """Return (author, source) where source is 'flag' | 'env' | 'default'."""
+    """Return (author, source): flag | env | default.
+
+    Env includes values loaded from project ``.env`` / ``.env.local`` /
+    ``.casefile/author`` (see ``ensure_dotenv_loaded``). No manual export
+    required when those files are present.
+    """
+    ensure_dotenv_loaded()
     if explicit and str(explicit).strip():
         return normalize_author(str(explicit)), "flag"
     env = os.environ.get(ENV_AUTHOR, "").strip()
     if env:
         return normalize_author(env), "env"
     return "agent", "default"
+
+
+def resolved_write_author(explicit: str | None = None) -> str:
+    """Author for a filing command; die if still anonymous after dotenv."""
+    author, source = resolve_author(explicit)
+    if source == "default" or author in ("", "agent"):
+        die(
+            f"identity unset — set {ENV_AUTHOR}=claude|codex|grok in .env "
+            f"(or .casefile/author), or pass -a",
+            EXIT_IDENTITY,
+        )
+    return author
 
 
 def load_meta(root: Path) -> dict:
@@ -178,7 +276,55 @@ def save_active(root: Path, cid: str | None):
     (root / DIR / ACTIVE).write_text((cid or "") + "\n")
 
 
-def read_entries(root: Path) -> list[dict]:
+# ---------------------------------------------------------- persistence
+
+def persistence_mode() -> str:
+    """Return ``local`` (default) or ``postgres``."""
+    ensure_dotenv_loaded()
+    raw = (os.environ.get(ENV_PERSISTENCE_MODE) or "local").strip().lower()
+    if raw in ("postgres", "postgresql", "pg"):
+        return "postgres"
+    return "local"
+
+
+def pg_namespace(root: Path) -> str:
+    """Stable multi-clone namespace for a store.
+
+    Prefer explicit ``CASEFILE_PG_NAMESPACE`` so teammates share one history
+    even when worktree paths differ. Else git origin URL + directory name.
+    """
+    ensure_dotenv_loaded()
+    env = (os.environ.get(ENV_PG_NAMESPACE) or "").strip()
+    if env:
+        return env
+    try:
+        url = subprocess.check_output(
+            ["git", "-C", str(root), "remote", "get-url", "origin"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError):
+        url = ""
+    seed = f"{url}|{root.resolve().name}"
+    return hashlib.sha256(seed.encode()).hexdigest()[:20]
+
+
+def _pg_connect():
+    ensure_dotenv_loaded()
+    url = (os.environ.get(ENV_POSTGRES_URL) or "").strip()
+    if not url:
+        die(f"{ENV_PERSISTENCE_MODE}=postgres requires {ENV_POSTGRES_URL}")
+    try:
+        import psycopg2  # type: ignore
+    except ImportError:
+        die("psycopg2 is required for postgres persistence "
+            "(pip install psycopg2-binary)")
+    try:
+        return psycopg2.connect(url)
+    except Exception as ex:
+        die(f"postgres connect failed: {ex}")
+
+
+def _read_entries_local(root: Path) -> list[dict]:
     path = root / DIR / LOG
     if not path.exists():
         return []
@@ -193,6 +339,159 @@ def read_entries(root: Path) -> list[dict]:
             except json.JSONDecodeError:
                 die(f"corrupt log line {n} in {path}")
     return out
+
+
+def _append_entries_local(root: Path, batch: list[dict]) -> None:
+    with LogLock(root):
+        with (root / DIR / LOG).open("a") as f:
+            for entry in batch:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+
+
+def _pg_insert_batch(conn, namespace: str, batch: list[dict]) -> int:
+    """Insert entries; skip existing ids. Returns count newly inserted."""
+    if not batch:
+        return 0
+    sql = (
+        "INSERT INTO casefile_entries "
+        "(namespace, id, ts, case_id, type, author, body, payload) "
+        "VALUES (%s, %s, %s::timestamptz, %s, %s, %s, %s, %s::jsonb) "
+        "ON CONFLICT (namespace, id) DO NOTHING"
+    )
+    inserted = 0
+    with conn.cursor() as cur:
+        for e in batch:
+            cur.execute(sql, (
+                namespace,
+                e["id"],
+                e.get("ts") or datetime.now(timezone.utc).isoformat(),
+                e.get("case") or "",
+                e.get("type") or "note",
+                e.get("author") or "agent",
+                e.get("body") or "",
+                json.dumps(e, ensure_ascii=False),
+            ))
+            inserted += cur.rowcount
+    conn.commit()
+    return inserted
+
+
+def _pg_fetch_all(conn, namespace: str) -> list[dict]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT payload FROM casefile_entries "
+            "WHERE namespace = %s ORDER BY ts ASC, id ASC",
+            (namespace,),
+        )
+        rows = cur.fetchall()
+    out = []
+    for (payload,) in rows:
+        if isinstance(payload, dict):
+            out.append(payload)
+        else:
+            out.append(json.loads(payload))
+    return out
+
+
+def _pg_existing_ids(conn, namespace: str) -> set[str]:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT id FROM casefile_entries WHERE namespace = %s",
+            (namespace,),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
+def _pg_count(conn, namespace: str) -> int:
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT COUNT(*) FROM casefile_entries WHERE namespace = %s",
+            (namespace,),
+        )
+        return int(cur.fetchone()[0])
+
+
+def reconcile_postgres(root: Path, *, quiet: bool = False) -> dict:
+    """Push local-only entries to Postgres; pull remote-only into local log.
+
+    Dedupe key is entry ``id`` within the namespace. Safe to call often —
+    once per process per root by default via ``ensure_pg_reconciled``.
+    """
+    ns = pg_namespace(root)
+    local = _read_entries_local(root)
+    local_by_id = {e["id"]: e for e in local if e.get("id")}
+    conn = _pg_connect()
+    try:
+        remote_ids = _pg_existing_ids(conn, ns)
+        remote_count = len(remote_ids)
+        # If PG is empty and local has history → bulk import.
+        # Always push any local ids missing from PG (two clones enabling PG).
+        to_push = [e for i, e in local_by_id.items() if i not in remote_ids]
+        pushed = _pg_insert_batch(conn, ns, to_push) if to_push else 0
+
+        # Pull entries that exist only on PG into the local mirror (git/offline).
+        if remote_count + pushed > 0:
+            remote_all = _pg_fetch_all(conn, ns)
+        else:
+            remote_all = []
+        missing_local = [e for e in remote_all if e.get("id") not in local_by_id]
+        if missing_local:
+            # Preserve PG order when rewriting local log from full remote set
+            # only if local was empty; otherwise append missing only.
+            if not local:
+                path = root / DIR / LOG
+                with LogLock(root):
+                    with path.open("w") as f:
+                        for e in remote_all:
+                            f.write(json.dumps(e, ensure_ascii=False) + "\n")
+                        f.flush()
+                        os.fsync(f.fileno())
+                pulled = len(remote_all)
+            else:
+                _append_entries_local(root, missing_local)
+                pulled = len(missing_local)
+        else:
+            pulled = 0
+    finally:
+        conn.close()
+    report = {
+        "namespace": ns,
+        "local_before": len(local),
+        "remote_before": remote_count,
+        "pushed": pushed,
+        "pulled": pulled,
+    }
+    if not quiet and (pushed or pulled or remote_count == 0 and local):
+        print(
+            f"casefile postgres reconcile ns={ns}: "
+            f"pushed={pushed} pulled={pulled} "
+            f"local={len(local)} remote_was={remote_count}",
+            file=sys.stderr,
+        )
+    return report
+
+
+def ensure_pg_reconciled(root: Path) -> None:
+    key = str(root.resolve())
+    if key in _PG_RECONCILED:
+        return
+    reconcile_postgres(root, quiet=True)
+    _PG_RECONCILED.add(key)
+
+
+def read_entries(root: Path) -> list[dict]:
+    """Load the entry stream (local JSONL, or Postgres when configured)."""
+    if persistence_mode() != "postgres":
+        return _read_entries_local(root)
+    ensure_pg_reconciled(root)
+    ns = pg_namespace(root)
+    conn = _pg_connect()
+    try:
+        return _pg_fetch_all(conn, ns)
+    finally:
+        conn.close()
 
 
 class LogLock:
@@ -230,13 +529,29 @@ def append_entry(root: Path, entry: dict):
 
 
 def append_entries(root: Path, batch: list[dict]):
-    """Append a validated batch under one lock — import is all-or-nothing."""
-    with LogLock(root):
-        with (root / DIR / LOG).open("a") as f:
-            for entry in batch:
-                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
-            f.flush()
-            os.fsync(f.fileno())
+    """Append a validated batch under one lock — import is all-or-nothing.
+
+    ``local`` mode: JSONL only.
+    ``postgres`` mode: insert to Postgres (dedupe by id) and mirror to local
+    JSONL for git/offline continuity.
+    """
+    if not batch:
+        return
+    if persistence_mode() != "postgres":
+        _append_entries_local(root, batch)
+        return
+    ensure_pg_reconciled(root)
+    ns = pg_namespace(root)
+    conn = _pg_connect()
+    try:
+        _pg_insert_batch(conn, ns, batch)
+    finally:
+        conn.close()
+    # Mirror locally (skip ids already present — import may have raced).
+    local_ids = {e.get("id") for e in _read_entries_local(root)}
+    to_local = [e for e in batch if e.get("id") not in local_ids]
+    if to_local:
+        _append_entries_local(root, to_local)
 
 
 def new_id(existing: set[str], body: str) -> str:
@@ -668,6 +983,7 @@ def cmd_init(args):
             "state/\n"
             "cli\n"
             "journals\n"
+            "author\n"
         )
         print(f"initialized casefile in {d}")
     # Rollback prior local-only policy: do not gitignore the whole store.
@@ -2153,6 +2469,59 @@ def cmd_status(args):
               f"({'; '.join(c['signals'])}) — anything left, or shall I file it?")
     if st["lint"]:
         print(f"lint: {st['lint']} finding(s) — run `casefile lint`")
+    mode = persistence_mode()
+    print(f"persistence: {mode}")
+    if mode == "postgres":
+        print(f"  namespace: {pg_namespace(root)}")
+        print(f"  url: {(os.environ.get(ENV_POSTGRES_URL) or '').split('@')[-1] or '(unset)'}")
+
+
+def cmd_persistence(args):
+    """Report or force-reconcile the storage backend."""
+    root = find_root()
+    if root is None:
+        die(f"no casefile store found (run `casefile init`, or set {ENV_ROOT})")
+    mode = persistence_mode()
+    report = {
+        "mode": mode,
+        "root": str(root),
+        "local_entries": len(_read_entries_local(root)),
+    }
+    if mode == "postgres":
+        ns = pg_namespace(root)
+        report["namespace"] = ns
+        url = (os.environ.get(ENV_POSTGRES_URL) or "").strip()
+        report["postgres_url_host"] = url.split("@")[-1] if url else None
+        if args.action == "reconcile":
+            _PG_RECONCILED.discard(str(root.resolve()))
+            report["reconcile"] = reconcile_postgres(root, quiet=False)
+        else:
+            # status: light count without full pull noise
+            conn = _pg_connect()
+            try:
+                report["remote_entries"] = _pg_count(conn, ns)
+            finally:
+                conn.close()
+            report["hint"] = "run `casefile persistence reconcile` to sync"
+    if args.json:
+        print(json.dumps(report, indent=2))
+        return
+    print(f"mode: {report['mode']}")
+    print(f"store: {report['root']}")
+    print(f"local entries: {report['local_entries']}")
+    if mode == "postgres":
+        print(f"namespace: {report['namespace']}")
+        print(f"postgres: {report.get('postgres_url_host')}")
+        if "remote_entries" in report:
+            print(f"remote entries: {report['remote_entries']}")
+        if "reconcile" in report:
+            r = report["reconcile"]
+            print(
+                f"reconcile: pushed={r['pushed']} pulled={r['pulled']} "
+                f"(remote_was={r['remote_before']})"
+            )
+        elif report.get("hint"):
+            print(f"hint: {report['hint']}")
 
 
 # -------- multi-agent porcelain: boot / packet / inbox / next / checkpoint
@@ -4120,6 +4489,15 @@ def main():
     s.add_argument("-a", "--author", help="session author override")
     s.set_defaults(fn=cmd_status)
 
+    s = sub.add_parser(
+        "persistence",
+        help="show / reconcile storage backend (local JSONL or shared Postgres)")
+    s.add_argument("action", nargs="?", default="status",
+                   choices=["status", "reconcile"],
+                   help="status (default) or force reconcile")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_persistence)
+
     s = sub.add_parser("log", help="raw entry listing")
     s.add_argument("-n", type=int, default=30)
     s.set_defaults(fn=cmd_log)
@@ -4184,6 +4562,7 @@ def main():
     s.set_defaults(fn=cmd_checkpoint)
 
     args = p.parse_args()
+    ensure_dotenv_loaded()
     args.fn(args)
 
 
