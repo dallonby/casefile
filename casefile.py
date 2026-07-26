@@ -3411,7 +3411,8 @@ def main():
     s = sub.add_parser("spitball", help="two-model deliberation on the active case (§12)")
     s.add_argument("--topic", required=True)
     s.add_argument("--models", default="claude,codex",
-                   help="comma-separated adapter names, proposer first")
+                   help="comma-separated adapter names, proposer first "
+                        "(claude, claude-resume, codex, grok)")
     s.add_argument("--turns", type=int, default=6)
     s.add_argument("--budget-usd", type=float)
     s.add_argument("--blind", help="model name to seed with resume-context --blind")

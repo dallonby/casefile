@@ -223,6 +223,81 @@ class CodexAdapter:
         pass
 
 
+class GrokAdapter:
+    """Live xAI Grok Build CLI (`grok`) — subscription headless mode.
+
+    Uses ``grok -p/--single`` with ``--output-format json`` for each turn and
+    ``-r <sessionId>`` to resume the same conversation (verified against
+    grok 0.2.x: fields text, sessionId, total_cost_usd, usage.*).
+
+    Author identity for casefile filings is always ``grok`` (family id);
+    version nicknames (grok45, …) normalize the same way as casefile aliases.
+    Requires an authenticated ``grok`` on PATH (live subscription).
+    """
+    name = "grok"
+
+    def __init__(self, root: Path):
+        self.root = root
+        # Allow casefile CLI filings; auto-approve so deliberation is unattended.
+        # Match Claude adapter's tool allowlist shape.
+        self.base = [
+            "grok", "-p",
+            "--output-format", "json",
+            "--permission-mode", "auto",
+            "--always-approve",
+            "--cwd", str(root),
+            "--allow", f"Bash({CLI_STR}:*)",
+            "--allow", "Bash(python3 casefile.py:*)",
+            "--allow", "Bash(casefile:*)",
+        ]
+
+    def start(self, context: str) -> dict:
+        return self._call(None, context)
+
+    def send(self, handle: dict, msg: str) -> str:
+        h = self._call(handle.get("sid"), msg, handle)
+        return h["reply"]
+
+    def _call(self, sid, prompt, handle=None):
+        env = {**os.environ, "CASEFILE_AUTHOR": "grok"}
+        cmd = list(self.base)
+        if sid:
+            cmd += ["-r", sid]
+        cmd.append(prompt)
+        p = subprocess.run(cmd, cwd=self.root, capture_output=True, text=True,
+                           timeout=TURN_TIMEOUT_S, env=env)
+        if p.returncode != 0:
+            raise RuntimeError(
+                f"grok adapter: rc={p.returncode}: "
+                f"{(p.stderr or p.stdout)[:400]}")
+        # stdout is one JSON object (possibly with leading/trailing noise)
+        raw = (p.stdout or "").strip()
+        try:
+            d = json.loads(raw)
+        except json.JSONDecodeError:
+            # tolerate prefix junk: take last JSON object
+            start = raw.rfind("{")
+            if start < 0:
+                raise RuntimeError(f"grok adapter: non-JSON stdout: {raw[:300]}")
+            d = json.loads(raw[start:])
+        h = handle or {"sid": None, "usd": 0.0, "tokens": 0, "reply": ""}
+        h["sid"] = d.get("sessionId") or d.get("session_id") or h["sid"]
+        h["usd"] = (h.get("usd") or 0.0) + float(d.get("total_cost_usd") or 0.0)
+        usage = d.get("usage") or {}
+        h["tokens"] = (h.get("tokens") or 0) + int(
+            usage.get("total_tokens")
+            or (usage.get("input_tokens", 0) + usage.get("output_tokens", 0))
+            or 0)
+        h["reply"] = d.get("text") or d.get("result") or ""
+        return h
+
+    def cost(self, handle):
+        return {"usd": handle.get("usd"), "tokens": handle.get("tokens") or 0}
+
+    def stop(self, handle):
+        pass  # -p sessions end per call
+
+
 class FakeAdapter:
     """Scripted adapter for tests and the CI kill test (SPEC §18). The script
     file maps model name -> list of replies; a reply may be a string or
@@ -256,14 +331,20 @@ class FakeAdapter:
 def make_adapter(name: str, root: Path, fake_script: Path | None = None):
     if fake_script:
         return FakeAdapter(root, name, fake_script)
-    if name == "claude":  # stream promoted to default per the M6 measurement
+    key = (name or "").strip().lower()
+    # family aliases: versioned xAI names still use the grok adapter/author
+    if key in ("grok", "grok45", "grok-45", "grok4", "grok-4", "grok-4.5",
+               "xai") or key.startswith("grok"):
+        return GrokAdapter(root)
+    if key == "claude":  # stream promoted to default per the M6 measurement
         return StreamClaudeAdapter(root)
-    if name == "claude-resume":  # fallback transport (M4 v1)
+    if key == "claude-resume":  # fallback transport (M4 v1)
         return ClaudeAdapter(root)
-    if name == "codex":
+    if key == "codex":
         return CodexAdapter(root)
-    raise SystemExit(f"unknown model '{name}' "
-                     "(adapters: claude, claude-resume, codex)")
+    raise SystemExit(
+        f"unknown model '{name}' "
+        "(adapters: claude, claude-resume, codex, grok)")
 
 
 # ------------------------------------------------------------------- briefs
@@ -300,7 +381,11 @@ def role_brief(root: Path, role: str, model: str) -> str:
     if not p.exists():
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(DEFAULT_BRIEFS[role])
-    return p.read_text().replace("{name}", model).replace("{cli}", CLI_STR)
+    # casefile author id: version nicknames collapse to family (grok45→grok)
+    author = cf.normalize_author(model) if hasattr(cf, "normalize_author") else model
+    return (p.read_text()
+            .replace("{name}", author)
+            .replace("{cli}", CLI_STR))
 
 
 # -------------------------------------------------------------------- driver

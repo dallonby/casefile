@@ -49,6 +49,50 @@ class SpitballBase(unittest.TestCase):
         return spitball.run(**kw)
 
 
+class AdapterRegistryTests(unittest.TestCase):
+    def test_make_adapter_knows_grok_family(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        for name in ("grok", "grok45", "xai", "GROK47"):
+            a = spitball.make_adapter(name, root)
+            self.assertIsInstance(a, spitball.GrokAdapter)
+            self.assertEqual(a.name, "grok")
+
+    def test_make_adapter_rejects_unknown(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        with self.assertRaises(SystemExit) as cm:
+            spitball.make_adapter("gpt-nope", root)
+        self.assertIn("grok", str(cm.exception))
+
+    def test_role_brief_normalizes_grok45_author(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        (root / ".casefile" / "roles").mkdir(parents=True)
+        text = spitball.role_brief(root, "proposer", "grok45")
+        self.assertIn('-a grok', text)
+        self.assertNotIn('-a grok45', text)
+
+    def test_fake_driver_with_codex_and_grok_names(self):
+        # FakeAdapter path must accept grok as a model name in spitball.run
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        d = Path(tmp.name)
+        env = {**os.environ, "CODEX_HOME": str(d / ".codex-home")}
+        for args in (["init"], ["open", "Grok pair", "--goal", "pair"]):
+            p = subprocess.run([sys.executable, str(CASEFILE), *args],
+                               cwd=d, capture_output=True, text=True, env=env)
+            self.assertEqual(p.returncode, 0, p.stderr)
+        script = d / "fake.json"
+        script.write_text(json.dumps({
+            "codex": ["claim"] * 4,
+            "grok": ["critique"] * 4,
+        }))
+        r = spitball.run(topic="pair", models=("codex", "grok"), turns=1,
+                         fake_script=str(script), root=d)
+        self.assertEqual(r["outcome"], "turn-budget")
+
+
 class DriverTests(SpitballBase):
     def test_stalemate_when_nothing_filed(self):
         s = self.script({"claude": ["I think A"] * 8, "codex": ["I doubt A"] * 8})
