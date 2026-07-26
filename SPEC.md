@@ -588,6 +588,12 @@ payload and output contract are Claude Code-compatible (`session_id`,
 `hook_event_name`, `stop_hook_active`, `tool_name` "Bash", `decision:
 block`, `systemMessage`), so the same three hook scripts serve both
 vendors; the sweep hook takes the filing author as `argv[1]` (`codex`).
+Grok Build loads the same Claude-compatible settings and scripts but
+sends a **camelCase** envelope (`stopHookActive`, `sessionId`,
+`toolName`=`run_terminal_command`, `toolInput`, `toolResult`). Hooks
+must accept both snake_case and camelCase keys; ignoring camelCase
+re-blocks the Stop gate forever (up to the vendor continuation cap)
+because the re-fire never looks "active".
 Conventions land in a managed `AGENTS.md` section (Codex's project
 instructions file), pointing at the shared skill. Hook trust is per-hook,
 hash-based, and granted once interactively via `/hooks`; headless runs use

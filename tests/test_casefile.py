@@ -1285,6 +1285,63 @@ class LivenessPulseTests(CliBase):
         self.assertEqual(d["decision"], "block")
         self.assertIn("Secretary sweep", d["reason"])
 
+    def test_grok_camelcase_stop_active_pulses_not_blocks(self):
+        # Regression: Grok sends stopHookActive/sessionId (camelCase). Reading
+        # only snake_case re-blocks every Stop and loops until the vendor cap.
+        self.hook("session_start.py", {"sessionId": "g1"})
+        self.add("-t", "note", "-a", "grok", "filed during sweep")
+        out = self.hook("sweep.py", {
+            "stopHookActive": True,
+            "sessionId": "g1",
+            "hookEventName": "stop",
+            "reason": "end_turn",
+        })
+        d = json.loads(out)
+        self.assertIn("+1 since last look", d["systemMessage"])
+        # second active stop is silent (cursor advanced)
+        self.assertEqual(self.hook("sweep.py", {
+            "stopHookActive": True, "sessionId": "g1",
+        }), "")
+
+    def test_grok_camelcase_first_stop_still_blocks(self):
+        out = self.hook("sweep.py", {
+            "stopHookActive": False,
+            "sessionId": "g2",
+            "hookEventName": "stop",
+        })
+        d = json.loads(out)
+        self.assertEqual(d["decision"], "block")
+        self.assertIn("Secretary sweep", d["reason"])
+
+    def test_sweep_author_prefers_env_when_no_argv(self):
+        # Claude settings install has no argv; Grok should pick CASEFILE_AUTHOR.
+        env = {**os.environ, "CASEFILE_AUTHOR": "grok"}
+        p = subprocess.run(
+            [sys.executable, str(self.dir / ".casefile" / "hooks" / "sweep.py")],
+            cwd=self.dir, capture_output=True, text=True,
+            input=json.dumps({"stopHookActive": False, "sessionId": "g3"}),
+            env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = json.loads(p.stdout.strip())
+        self.assertIn('-a grok', d["reason"])
+
+    def test_observe_accepts_grok_run_terminal_command_payload(self):
+        payload = {
+            "toolName": "run_terminal_command",
+            "toolInput": {"command": "cargo test -p ghostsun-app --locked"},
+            "toolResult": {
+                "stdout": "test result: ok. 3 passed",
+                "stderr": "",
+            },
+        }
+        p = subprocess.run(
+            [sys.executable, str(self.dir / ".casefile" / "hooks" / "observe.py")],
+            cwd=self.dir, capture_output=True, text=True,
+            input=json.dumps(payload))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        bodies = [e["body"] for e in self.log_entries() if e["type"] == "observation"]
+        self.assertTrue(any("cargo test" in b for b in bodies), bodies)
+
 
 class CliChannelTests(CliBase):
     def _transcripts(self, session, models=("claude", "codex")):

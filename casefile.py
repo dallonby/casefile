@@ -2745,14 +2745,29 @@ def _cli(root):
     return ["casefile"]
 
 
+def _field(hook, *names, default=None):
+    """Claude/Codex use snake_case; Grok uses camelCase. Accept both."""
+    for name in names:
+        if name in hook and hook[name] is not None:
+            return hook[name]
+    return default
+
+
 def main():
     hook = json.loads(sys.stdin.read())
-    if hook.get("tool_name") != "Bash":
+    # Claude: tool_name=Bash; Grok: toolName=run_terminal_command (matcher
+    # still fires on Bash via alias, but the payload carries the real name).
+    tool = str(_field(hook, "tool_name", "toolName", default="") or "")
+    if tool not in ("Bash", "bash", "run_terminal_command"):
         return
-    cmd = (hook.get("tool_input") or {}).get("command", "")
+    tool_input = _field(hook, "tool_input", "toolInput", default={}) or {}
+    if not isinstance(tool_input, dict):
+        return
+    cmd = tool_input.get("command", "")
     if not cmd or "casefile" in cmd:
         return  # never observe the tool observing itself
-    resp = hook.get("tool_response") or {}
+    # Claude: tool_response; Grok: toolResult
+    resp = _field(hook, "tool_response", "toolResult", default={}) or {}
     if not isinstance(resp, dict):
         resp = {"stdout": str(resp)}
     stdout = str(resp.get("stdout", ""))
@@ -2785,14 +2800,15 @@ HOOK_SWEEP_PY = r'''#!/usr/bin/env python3
 """Stop hook: secretary sweep + liveness pulse (SPEC §13; decision 52694aa9).
 
 First stop of a session blocks so the model diffs its conversation against
-the casefile log and files the gaps. The re-fire (`stop_hook_active`) is the
-final pass: every write of the turn — model-filed and sweep-filed — is
-already in the log, so it emits at most ONE honest liveness pulse
-(synthesis H7): 'casefile +3 since last look (2 hypothesis, 1 observation)
-— 74 total'. The diff is 'since this session last looked' via a
-session-keyed atomic cursor — no per-session write provenance is claimed.
-Suppressed while the tmux UI holds a fresh heartbeat lease (it is the
-liveness surface then); the cursor still advances. Silent when idle.
+the casefile log and files the gaps. The re-fire (`stop_hook_active` /
+Grok `stopHookActive`) is the final pass: every write of the turn —
+model-filed and sweep-filed — is already in the log, so it emits at most
+ONE honest liveness pulse (synthesis H7): 'casefile +3 since last look
+(2 hypothesis, 1 observation) — 74 total'. The diff is 'since this session
+last looked' via a session-keyed atomic cursor — no per-session write
+provenance is claimed. Suppressed while the tmux UI holds a fresh heartbeat
+lease (it is the liveness surface then); the cursor still advances. Silent
+when idle.
 """
 import json
 import os
@@ -2804,9 +2820,22 @@ LEASE_FRESH_S = 10
 
 ROOT = Path(__file__).resolve().parents[2]  # <repo>/.casefile/hooks/sweep.py
 
-# the installing vendor passes the model author as argv[1] (codex sessions
-# must file as codex); default stays claude for the claude-code install
-AUTHOR = sys.argv[1] if len(sys.argv) > 1 else "claude"
+# installing vendor may pass author as argv[1] (codex); otherwise prefer
+# CASEFILE_AUTHOR so Grok (which loads Claude settings without argv) files
+# as itself; default stays claude for the bare claude-code install
+AUTHOR = (
+    (sys.argv[1] if len(sys.argv) > 1 else "").strip()
+    or (os.environ.get("CASEFILE_AUTHOR") or "").strip()
+    or "claude"
+)
+
+
+def _field(hook, *names, default=None):
+    """Claude/Codex: snake_case. Grok: camelCase. Accept both."""
+    for name in names:
+        if name in hook and hook[name] is not None:
+            return hook[name]
+    return default
 
 
 def _cli_display(root):
@@ -2883,8 +2912,11 @@ def pulse(root: Path, session_id: str):
 
 def main():
     hook = json.load(sys.stdin)
-    if hook.get("stop_hook_active"):
-        pulse(ROOT, str(hook.get("session_id", "")))  # final pass: pulse (H7)
+    # Claude/Codex: stop_hook_active + session_id
+    # Grok: stopHookActive + sessionId  (camelCase envelope — see Grok hooks docs)
+    if _field(hook, "stop_hook_active", "stopHookActive"):
+        sid = str(_field(hook, "session_id", "sessionId", default="") or "")
+        pulse(ROOT, sid)  # final pass: pulse (H7)
         return
     if not _active_case(ROOT):
         return  # no active case means nothing to sweep
@@ -2924,6 +2956,14 @@ import sys
 from pathlib import Path
 
 
+def _field(hook, *names, default=None):
+    """Claude/Codex: snake_case. Grok: camelCase. Accept both."""
+    for name in names:
+        if name in hook and hook[name] is not None:
+            return hook[name]
+    return default
+
+
 def main():
     hook = json.load(sys.stdin)
     root = Path(__file__).resolve().parents[2]
@@ -2953,7 +2993,7 @@ def main():
             resolved.update(e.get("refs", []))
     open_q = sum(1 for e in parsed if e.get("type") == "question"
                  and e["id"] not in resolved)
-    sid = str(hook.get("session_id", "")) or "default"
+    sid = str(_field(hook, "session_id", "sessionId", default="") or "") or "default"
     state = cf / "state"
     state.mkdir(parents=True, exist_ok=True)
     tmp = state / f"pulse-{sid}.tmp"
@@ -3185,6 +3225,9 @@ def _ensure_hook(settings: dict, event: str, matcher: str | None,
 # Claude-style groups); hook commands run through a shell with cwd = the
 # project dir; the stdin payload is Claude Code-compatible (session_id,
 # hook_event_name, stop_hook_active, tool_name 'Bash', tool_input.command).
+# Grok reuses the same scripts via .claude/settings.json but sends camelCase
+# (sessionId, stopHookActive, toolName=run_terminal_command, toolInput,
+# toolResult) — hooks must accept both envelopes.
 # There is no project-level codex config, so the global block dispatches:
 # each command no-ops unless the cwd has the casefile hook script.
 CODEX_HOOKS_BEGIN = "# >>> casefile hooks (managed by `casefile hooks install codex`) >>>"
