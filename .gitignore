@@ -1,5 +1,3 @@
 __pycache__/
 *.pyc
 .DS_Store
-# local store if you `casefile init` at the casefile repo root
-/.casefile/
