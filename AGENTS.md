@@ -22,6 +22,11 @@ This project keeps its investigation state in an append-only casefile log.
   `python3 casefile.py dig "<topic>"` (and `recall`) and cite what you find
   in `--refs`. Decisions carry `--rationale` and `--rejected` for losing
   options.
+- **Before a consequential spitball**, sweep the current conversation into
+  the log and freeze a manifest of verbatim requirements, criteria/weights,
+  alternatives, evidence domains, analysis layers, and open questions.
+  Prefer `--manifest-mode enforce`; use `warn` only when an exploratory run
+  may proceed without manufacturing a final judgment.
 - **Echo every entry you file** as one line in your visible reply —
   `recorded: decision "…" (user)` — your own filings included.
 - File hypotheses, decisions, observations, and questions as you work —

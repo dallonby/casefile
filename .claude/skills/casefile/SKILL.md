@@ -56,12 +56,19 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 
 - **hypothesis** — falsifiable claim, author is whoever proposed it. Add
   `--check '<shell>'` when a one-liner can test it (exit 0 = still holds).
+  For any claim that could drive a ranking/decision, also record its
+  `--claim-mode`, `--comparator`, `--analysis-layer`, `--falsifier`,
+  `--counterfactual`, `--horizon`, `--testability`, and (for causal claims)
+  `--mechanism`.
 - **decision** — author `user` ONLY for choices the user actually made;
   your own proposals are author `claude` (they render as "asserted, not
   user-confirmed"). Always give `--rationale`; record losing alternatives
   with `--rejected "option:reason"` so they aren't re-proposed.
 - **observation** — ground truth only: test output, command results, log
   lines, with `--source`. Never file your own inference as an observation.
+  Remote/time-sensitive evidence should carry `--source-uri`,
+  `--source-type`, `--accessed-at`, `--effective-at`, `--expires-at`, and a
+  precise `--locator` when available.
 - **verify** — links a hypothesis to a real observation. Model agreement is
   never verification; endorse instead (`consensus` is explicitly weaker).
 - **dispute** when you disagree with a recorded claim; `resolve` with
@@ -71,6 +78,17 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
   abstract current (`--kind abstract`; `--supersedes` is automatic for
   abstracts): problem, status with grade in words, leading theory,
   ruled-out list, key decisions, open items. Run `reindex` after.
+- Prefer `--body-stdin` for multiline text and repeatable singular
+  `--ref`/`--reject`/`--supersede` flags. Use `--json` receipts when another
+  process must parse the id. A constraint correction can supersede an older
+  constraint only with the same authority and `--rationale`; decisions still
+  use revoke/replace.
+- In multi-model work, never directly promote a recommendation: file
+  `--kind candidate`, have a different author review that exact id, then use
+  `finalize-digest`. Reference the frozen casefile requirement ids with
+  repeatable `--ref` so later replacements mark the judgment stale. A model
+  recommendation, cross-model consensus, stale judgment, and user decision
+  are distinct.
 
 ## Recognizing casefile-directed speech
 
@@ -120,5 +138,30 @@ all-or-nothing; each imported entry echoes.
   `import`. Before the first hypothesis, `recall` the problem statement —
   surface strong compost hits ("this resembles the March importer case…").
 - When the differential stalls (two theories, no discriminating evidence,
-  ~3 windows without progress), propose escalating to a spitball (once the
-  driver exists — M4).
+  ~3 windows without progress), propose escalating to a manifest-backed
+  spitball.
+
+## Before every consequential debate
+
+1. Sweep the current conversation into the log *before* launching models:
+   verbatim user requirements/constraints, decisions, open questions, and
+   already-mentioned alternatives. Do not wait until after architectural
+   convergence.
+2. Freeze a deliberation manifest. Include requirements, evaluation criteria
+   and weights (mark user-confirmed vs inferred), evidence domains, competing
+   alternatives/packages, analysis layers, and known open questions. Give
+   every alternative the same criteria and implementation-detail budget.
+3. Prefer `spitball --manifest <json> --manifest-mode enforce`. If the user
+   does not want to supply weights, record that they are inferred and use
+   `warn`: exploration may continue, but casefile should not manufacture a
+   final judgment from missing normative input.
+4. Require the verbose independent round-by-round synopses and exact
+   opening/round ledger; they are echoed in full and retained in `run.json`.
+   Treat manifest coverage as "addressed", never as agreement or verification.
+5. Continuity comes from each adapter's continuous vendor session plus the
+   atomic `transcripts/<session>/run.json`, not tmux. After interruption use
+   `spitball-recover <session>`; tmux is only a viewport.
+6. Finalization is guarded: only convergence, complete coverage, aligned
+   summaries, no live disputes/questions, complete claim cards, and exact
+   candidate review can create a judgment. Turn/spend budget and stalemate
+   preserve the differential as-is.

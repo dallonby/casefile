@@ -1,6 +1,7 @@
 # casefile
 
-**An append-only, epistemically-graded investigation log for AI-assisted debugging.**
+**An append-only, epistemically-graded record for AI-assisted investigations
+and deliberations.**
 
 AI coding sessions lose their minds between context windows. Hypotheses get
 re-proposed after being ruled out, decisions get relitigated, and "we tested
@@ -65,17 +66,82 @@ tamper-evident by construction.
   fast by skipping known-slow checks.
 - **`casefile lint`** — flags epistemic smells: laundering (an unverified
   claim cited like fact), contradictions (verified then disputed), stale
-  disputes, orphan decisions.
+  disputes, orphan decisions, expired sources, and incomplete claim cards
+  once a claim becomes ranking-driving.
 - **Hooks** — a Stop-hook "secretary sweep" diffs each AI session against
   the log and files what the conversation decided but never recorded; a
   one-line liveness pulse shows what changed since you last looked.
 - **`casefile spitball`** — a two-model deliberation driver (proposer vs
   critic) that ferries turns between live CLIs (**Claude Code, Codex, Grok**);
   both models file claims and disputes into the same log, and convergence is
-  detected from the log itself, not from the transcript.
-  Example: `casefile spitball --topic "…" --models codex,grok`.
+  detected from the log itself, not from the transcript. A frozen manifest
+  makes requirements, criteria, evidence domains, alternatives, and the
+  alternative×criterion symmetry grid explicit. Every input/reply and vendor
+  session id is written atomically to `run.json` before it is ferried.
+  Receipt-only/progress-only output is rejected and retried.
+  Token telemetry separates uncached input/output from cache reads so a long
+  resumed context does not masquerade as fresh token spend.
+  Transcript, manifest, and journal files are local/gitignored and created
+  private to the user because debates may contain proprietary code or strategy.
+  Complete independent round-by-round synopses (and any reconciled variants)
+  are echoed at completion as well as retained in the private journal.
+  Raw filing receipts remain auditable there, while model-to-model transport
+  compacts them into one structured turn delta to avoid context churn.
+- **Guarded conclusions** — the proposer can only create an inert
+  `candidate` digest. The critic reviews that exact id; only a foreign
+  endorsement mechanically promotes it to a system-authored judgment.
+  Candidate/final digests reference the frozen casefile requirements they
+  relied on, so replacing or revoking one marks the old judgment stale.
+  Recommendations, cross-model consensus, stale conclusions, and user
+  decisions stay distinct.
+- **`casefile spitball-recover <session>`** — reconstructs each model's private
+  conversational view from an interrupted run journal and continues in fresh
+  vendor sessions. Within a live run, adapters use continuous stream/session
+  resume; tmux is only an optional viewport, never the memory mechanism.
 - **`dig` and `recall`** — full history search (superseded entries
   included) and cross-case compost: "have we seen this before?"
+
+For a consequential debate, freeze the contract before the first argument:
+
+```bash
+casefile spitball \
+  --topic "choose the production design" \
+  --models codex,grok \
+  --requirement "preserve correctness under reorgs" \
+  --criterion "measured failure rate" \
+  --criterion "p99 latency" \
+  --weighting "failure rate 2x latency" \
+  --alternative "optimistic cache" \
+  --alternative "canonical reads" \
+  --evidence-domain "replay benchmarks" \
+  --manifest-mode enforce
+```
+
+Use a JSON `--manifest` when criteria need explicit weights or
+confirmed/inferred provenance. `warn` mode still runs an exploratory debate
+but blocks judgment while the manifest is incomplete; `off` is an explicit
+escape hatch.
+
+## High-integrity filing
+
+Multiline model output no longer has to fight variadic shell flags:
+
+```bash
+printf '%s\n' "$BODY" | casefile add -t hypothesis -a codex \
+  --body-stdin --claim-mode causal-inference \
+  --mechanism "…" --comparator "…" --analysis-layer "transaction execution" \
+  --falsifier "…" --counterfactual "…" --horizon "30d" \
+  --testability within-session --json
+
+casefile add -t observation -a codex "measured inclusion latency" \
+  --source benchmark --source-type test --locator "run 184 / p99" \
+  --accessed-at 2026-07-26T12:00:00Z --expires-at 2026-08-02T12:00:00Z
+```
+
+Singular `--ref`, `--reject`, and `--supersede` flags are repeatable and avoid
+the positional swallowing ambiguity of their legacy variadic counterparts.
+Constraints can be corrected by the same authority with `--supersede` plus a
+reason; decisions still use explicit revoke/replace semantics.
 
 ## Install
 

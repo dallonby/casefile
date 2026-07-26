@@ -59,6 +59,7 @@ AUTHOR_ALIASES = {
     "opus": "claude",
     "haiku": "claude",
     "fable": "claude",
+    "claude-resume": "claude",  # transport alias, never a second reviewer
     # xAI models → family author "grok" (not a version pin like grok45)
     "xai": "grok",
     "grok-4": "grok",
@@ -73,7 +74,14 @@ ENTRY_TYPES = {
     "endorsement", "dispute", "resolution", "verification", "digest",
     "revocation", "note",
 }
-DIGEST_KINDS = {"mechanical", "judgment", "abstract"}
+DIGEST_KINDS = {"mechanical", "candidate", "judgment", "abstract"}
+CLAIM_MODES = {
+    "association", "causal-inference", "diagnosis", "forecast",
+    "mechanistic", "normative-premise", "recommendation",
+}
+CLAIM_TESTABILITY = {
+    "within-session", "external-now", "longitudinal", "not-empirical",
+}
 
 # ------------------------------------------------------------------ storage
 
@@ -245,9 +253,12 @@ def new_id(existing: set[str], body: str) -> str:
 def superseded_ids(entries: list[dict]) -> set[str]:
     s: set[str] = set()
     for e in entries:
-        # digests supersede at checkpoints (§6); a corrected hypothesis
+        # Final digests supersede at checkpoints (§6). A candidate is inert
+        # until an independent reviewer endorses it and `finalize-digest`
+        # promotes the exact candidate. A corrected hypothesis
         # supersedes the claim it re-files, retiring its stale check with it
-        if e["type"] in ("digest", "hypothesis"):
+        if (e["type"] == "digest" and e.get("kind") != "candidate") \
+                or e["type"] in ("hypothesis", "constraint"):
             s.update(e.get("supersedes", []))
             # a newer abstract supersedes older abstracts of the same case
     # abstracts: only the latest per case is live
@@ -472,6 +483,86 @@ def cmd_whoami(args):
         sys.exit(EXIT_IDENTITY)
 
 
+def cmd_preflight(args):
+    """Non-epistemic read/write probe for nested model adapters."""
+    root, entries, meta = require_root()
+    author, source = resolve_author(args.author)
+    if source == "default":
+        die(f"identity unset — export {ENV_AUTHOR} or pass -a", EXIT_IDENTITY)
+    state = root / DIR / "state"
+    state.mkdir(parents=True, exist_ok=True)
+    probe = state / f"preflight-{os.getpid()}-{time.time_ns()}.tmp"
+    try:
+        with probe.open("x") as f:
+            f.write(author + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        if probe.read_text().strip() != author:
+            die("preflight write/read mismatch")
+    finally:
+        probe.unlink(missing_ok=True)
+    # Exercise the exact append permission and lock path used by filings
+    # without writing an epistemic entry or changing the log length.
+    log_path = root / DIR / LOG
+    with LogLock(root):
+        log_size = log_path.stat().st_size
+        fd = os.open(log_path, os.O_WRONLY | os.O_APPEND)
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+        if log_path.stat().st_size != log_size:
+            die("preflight unexpectedly changed the append-only log")
+    report = {
+        "ok": True, "root": str(root), "author": author,
+        "author_source": source, "case": load_active(root, meta),
+        "entries": len(entries), "log_readable": os.access(root / DIR / LOG, os.R_OK),
+        "log_appendable": True, "log_lockable": True,
+        "state_writable": os.access(state, os.W_OK),
+    }
+    if args.receipt:
+        if not args.nonce:
+            die("--receipt requires --nonce")
+        target = Path(args.receipt)
+        if not target.is_absolute():
+            target = (root / target).resolve()
+        else:
+            target = target.resolve()
+        transcript_root = (root / DIR / "transcripts").resolve()
+        if transcript_root not in target.parents:
+            die("--receipt must be inside .casefile/transcripts/")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        report["nonce"] = args.nonce
+        report["receipt"] = str(target)
+        tmp = target.with_name(f".{target.name}.tmp-{os.getpid()}")
+        try:
+            with tmp.open("w") as f:
+                json.dump(report, f)
+                f.write("\n")
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, target)
+            try:
+                target.chmod(0o600)
+            except OSError:
+                pass
+            try:
+                dfd = os.open(target.parent, os.O_RDONLY)
+                try:
+                    os.fsync(dfd)
+                finally:
+                    os.close(dfd)
+            except OSError:
+                pass  # directory fsync is unavailable on some platforms
+        finally:
+            tmp.unlink(missing_ok=True)
+    if args.json:
+        print(json.dumps(report))
+    else:
+        print(f"ok: {root} author={author} case={report['case']} "
+              f"entries={len(entries)} read/write=yes")
+
+
 def resolve_case(root: Path, meta: dict, explicit: str | None) -> str:
     if explicit:
         if explicit not in meta.get("cases", {}):
@@ -587,6 +678,35 @@ def cmd_open(args):
     print(open_case(root, meta, args.title, args.goal))
 
 
+def _body_arg(args) -> str:
+    """Resolve a positional body or lossless stdin body, but never both."""
+    positional = getattr(args, "body", None)
+    from_stdin = getattr(args, "body_stdin", False)
+    if positional is not None and from_stdin:
+        die("provide either positional body or --body-stdin, not both")
+    if from_stdin:
+        body = sys.stdin.read().strip()
+    else:
+        body = str(positional or "").strip()
+    if not body:
+        die("entry body is required (positional or --body-stdin)")
+    return body
+
+
+def _combined(args, plural: str, singular: str) -> list[str]:
+    return [*(getattr(args, plural, None) or []),
+            *(getattr(args, singular, None) or [])]
+
+
+def _validate_iso_field(flag: str, value: str | None):
+    if not value:
+        return
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        die(f"{flag} must be an ISO-8601 date/time")
+
+
 def _migrate_legacy_active(root: Path, meta: dict):
     """One-time cleanup: drop the git-tracked active_case pointer from meta.json
     now that it lives in the untracked `.casefile/active` file."""
@@ -598,6 +718,33 @@ def _migrate_legacy_active(root: Path, meta: dict):
 def cmd_add(args):
     root, entries, meta = require_root()
     case = resolve_case(root, meta, args.case)
+    body = _body_arg(args)
+    args.refs = _combined(args, "refs", "ref")
+    args.rejected = _combined(args, "rejected", "reject")
+    args.supersedes = _combined(args, "supersedes", "supersede")
+    claim_fields = (
+        "claim_mode", "mechanism", "comparator", "analysis_layer",
+        "falsifier", "counterfactual", "horizon", "testability",
+    )
+    provenance_fields = (
+        "source", "source_uri", "source_type", "published_at", "accessed_at",
+        "effective_at", "expires_at", "locator", "jurisdiction",
+    )
+    if args.type != "hypothesis" and any(
+            getattr(args, key, None) for key in claim_fields):
+        die("claim-card flags are only valid for hypotheses")
+    if args.type != "observation" and any(
+            getattr(args, key, None) for key in provenance_fields):
+        die("source/provenance flags are only valid for observations")
+    if args.check and args.type not in ("hypothesis", "constraint"):
+        die("--check is only valid for hypotheses/constraints")
+    if args.to and args.type not in ("question", "note"):
+        die("--to is only valid for questions/notes")
+    if args.rejected and args.type != "decision":
+        die("--rejected/--reject is only valid for decisions")
+    if args.rationale and args.type != "decision" \
+            and not (args.type == "constraint" and args.supersedes):
+        die("--rationale is valid for decisions or constraint replacement")
     extra = {}
     if args.type == "decision":
         extra["rationale"] = args.rationale
@@ -609,34 +756,62 @@ def cmd_add(args):
             extra["rejected"] = rej
     if args.type == "observation":
         extra["source"] = args.source or "manual"
+        for key in ("source_uri", "source_type", "published_at", "accessed_at",
+                    "effective_at", "expires_at", "locator", "jurisdiction"):
+            value = getattr(args, key, None)
+            if key.endswith("_at"):
+                _validate_iso_field("--" + key.replace("_", "-"), value)
+            if value:
+                extra[key] = value
     if args.type in ("hypothesis", "constraint") and args.check:
         extra["check"] = args.check
+    if args.type == "hypothesis":
+        for key in ("claim_mode", "mechanism", "comparator", "analysis_layer",
+                    "falsifier", "counterfactual", "horizon", "testability"):
+            value = getattr(args, key, None)
+            if value:
+                extra[key] = value
     if args.supersedes:
-        # like-for-like correction: a hypothesis re-filed with a fixed body
-        # or check retires its predecessor in one step (no digest ceremony)
-        if args.type != "hypothesis":
-            die("--supersedes on add is for hypotheses; decisions revoke, "
-                "digests supersede everything else")
+        # Like-for-like correction: a hypothesis or constraint re-filed with a
+        # fixed body/check retires its predecessor in one step. Constraints are
+        # authority-sensitive: another model cannot silently replace one.
+        if args.type not in ("hypothesis", "constraint"):
+            die("--supersedes on add is for hypotheses/constraints; decisions "
+                "revoke, digests supersede everything else")
         by_id = {e["id"]: e for e in entries}
         grades = compute_grades(entries)
         for t in args.supersedes:
             target = by_id.get(t)
             if not target:
                 die(f"unknown supersedes target {t}")
-            if target["type"] != "hypothesis" or target["case"] != case:
-                die(f"supersedes target {t} is not a hypothesis in this case")
-            if grades.get(t) == "verified":
+            if target["type"] != args.type or target["case"] != case:
+                die(f"supersedes target {t} is not a {args.type} in this case")
+            if args.type == "hypothesis" and grades.get(t) == "verified":
                 die(f"{t} is verified against ground truth — dispute it "
                     "rather than silently replacing it")
+            if args.type == "constraint" and normalize_author(
+                    target["author"]) != normalize_author(args.author):
+                die(f"{t} was authored by {target['author']}; only that "
+                    "authority may replace it")
+        if args.type == "constraint":
+            if not args.rationale:
+                die("constraint replacement requires --rationale")
+            extra["supersession_reason"] = args.rationale
         extra["supersedes"] = args.supersedes
     if args.type in ("question", "note") and args.to:
         extra["to"] = normalize_author(args.to) if args.to not in ("user", "any") \
             else args.to
-    e = make_entry(entries, case, args.type, args.author, args.body,
+    e = make_entry(entries, case, args.type, args.author, body,
                    refs=args.refs, **extra)
     append_entry(root, e)
     save_active(root, case)  # SPEC §5.1: active case follows "last touched"
-    print(e["id"])
+    if args.json:
+        print(json.dumps({
+            "id": e["id"], "case": case, "type": e["type"],
+            "author": e["author"], "body": e["body"],
+        }, ensure_ascii=False))
+    else:
+        print(e["id"])
     # filing nudges: cheapest at write time, when the context to fix them is
     # still in hand — lint catches the same gaps, but only after the fact
     if args.type == "decision" and not args.rationale and not args.refs:
@@ -732,21 +907,29 @@ def latest_abstract_id(entries: list[dict], case: str) -> str | None:
 def cmd_digest(args):
     root, entries, meta = require_root()
     case = resolve_case(root, meta, args.case)
+    body = _body_arg(args)
+    refs = _combined(args, "refs", "ref")
     if args.kind not in DIGEST_KINDS:
         die(f"kind must be one of {sorted(DIGEST_KINDS)}")
-    supersedes = list(args.supersedes or [])
+    supersedes = _combined(args, "supersedes", "supersede")
     if args.kind == "abstract" and not supersedes:
         # the rolling abstract (§6.3) supersedes the prior abstract; the first
         # one supersedes nothing. Auto-fill so callers needn't track it.
         prev = latest_abstract_id(entries, case)
         supersedes = [prev] if prev else []
     elif not supersedes:
-        die("--supersedes is required for mechanical/judgment digests")
+        die("--supersedes is required for mechanical/candidate/judgment digests")
     viol = digest_invariant_violations(entries, supersedes)
     if viol:
         die("digest violates the evidence-chain invariant:\n  " + "\n  ".join(viol))
-    e = make_entry(entries, case, "digest", args.author, args.body,
-                   supersedes=supersedes, kind=args.kind)
+    extra = {"supersedes": supersedes, "kind": args.kind}
+    if args.kind in ("candidate", "judgment"):
+        # This is a model/author recommendation unless and until an exact
+        # candidate is independently endorsed. User decisions remain separate
+        # `decision` entries authored by the user.
+        extra["conclusion_class"] = "model-recommendation"
+    e = make_entry(
+        entries, case, "digest", args.author, body, refs=refs, **extra)
     append_entry(root, e)
     entries.append(e)
     save_active(root, case)  # SPEC §5.1: active case follows "last touched"
@@ -754,7 +937,84 @@ def cmd_digest(args):
         # compost changed: refresh the recall cache now rather than trusting
         # the author to remember `reindex` (a stale index reads as amnesia)
         build_index(root, entries, meta)
-    print(e["id"])
+    if args.json:
+        print(json.dumps({
+            "id": e["id"], "case": case, "type": "digest",
+            "kind": args.kind, "author": e["author"],
+        }))
+    else:
+        print(e["id"])
+
+
+def cmd_finalize_digest(args):
+    """Promote one exact, independently endorsed candidate judgment.
+
+    The final entry is system-authored because promotion is mechanical.  It
+    preserves the candidate body verbatim, records the proposer/reviewer
+    provenance, and is the first entry that actually supersedes the span.
+    """
+    root, entries, meta = require_root()
+    candidate = _target(entries, args.candidate)
+    if candidate["type"] != "digest" or candidate.get("kind") != "candidate":
+        die(f"{args.candidate} is not a candidate digest")
+    by_id = {e["id"]: e for e in entries}
+    hidden = superseded_ids(entries)
+    revoked = revoked_ids(entries)
+    stale_requirements = [
+        rid for rid in candidate.get("refs", [])
+        if by_id.get(rid, {}).get("type") in ("constraint", "decision")
+        and (rid in hidden or rid in revoked)
+    ]
+    if stale_requirements:
+        die("candidate relies on replaced/revoked requirement(s): "
+            + ", ".join(stale_requirements))
+    review_state = dispute_state(entries).get(
+        candidate["id"], {"open": [], "upheld": []})
+    blocking_disputes = [
+        *review_state["open"], *review_state["upheld"],
+    ]
+    if blocking_disputes:
+        die("candidate has open or upheld review dispute(s): "
+            + ", ".join(blocking_disputes))
+    endorsements = [
+        e for e in entries if e["type"] == "endorsement"
+        and candidate["id"] in e.get("refs", [])
+        and normalize_author(e["author"]) != normalize_author(candidate["author"])
+    ]
+    if not endorsements:
+        die("candidate has no independent endorsement")
+    # Idempotence: return an existing promotion rather than duplicating it.
+    for e in entries:
+        if e["type"] == "digest" and e.get("kind") == "judgment" \
+                and candidate["id"] in e.get("refs", []):
+            print(e["id"])
+            return
+    supersedes = list(candidate.get("supersedes", [])) + [candidate["id"]]
+    viol = digest_invariant_violations(entries, supersedes)
+    if viol:
+        die("final digest violates the evidence-chain invariant:\n  "
+            + "\n  ".join(viol))
+    reviewers = sorted({
+        normalize_author(e["author"]) for e in endorsements
+    })
+    final_refs = list(dict.fromkeys([
+        candidate["id"],
+        *[e["id"] for e in endorsements],
+        *candidate.get("refs", []),
+    ]))
+    final = make_entry(
+        entries, candidate["case"], "digest", "system", candidate["body"],
+        refs=final_refs,
+        supersedes=supersedes, kind="judgment",
+        conclusion_class="cross-model-consensus",
+        proposed_by=normalize_author(candidate["author"]),
+        reviewed_by=reviewers,
+    )
+    append_entry(root, final)
+    entries.append(final)
+    save_active(root, candidate["case"])
+    build_index(root, entries, meta)
+    print(final["id"])
 
 
 # -------- recheck (SPEC §8)
@@ -1193,8 +1453,16 @@ def cmd_dig(args):
 IMPORT_TYPES = {"hypothesis", "decision", "observation", "constraint",
                 "question", "note"}
 _IMPORT_EXTRAS = {"decision": {"rationale", "rejected"},
-                  "observation": {"source"},
-                  "hypothesis": {"check"},
+                  "observation": {
+                      "source", "source_uri", "source_type", "published_at",
+                      "accessed_at", "effective_at", "expires_at", "locator",
+                      "jurisdiction",
+                  },
+                  "hypothesis": {
+                      "check", "claim_mode", "mechanism", "comparator",
+                      "analysis_layer", "falsifier", "counterfactual", "horizon",
+                      "testability",
+                  },
                   "constraint": {"check"},
                   "question": {"to"}}
 
@@ -1228,6 +1496,16 @@ def cmd_import(args):
         extra = {k: d[k] for k in allowed if k in d}
         if t == "observation":
             extra.setdefault("source", "import")
+            for key in ("published_at", "accessed_at", "effective_at", "expires_at"):
+                _validate_iso_field(key, extra.get(key))
+        if t == "hypothesis" and extra.get("claim_mode") \
+                and extra["claim_mode"] not in CLAIM_MODES:
+            die(f"{src}:{n}: claim_mode must be one of "
+                f"{sorted(CLAIM_MODES)}")
+        if t == "hypothesis" and extra.get("testability") \
+                and extra["testability"] not in CLAIM_TESTABILITY:
+            die(f"{src}:{n}: testability must be one of "
+                f"{sorted(CLAIM_TESTABILITY)}")
         # entries+staged: refs may point at earlier lines of the same import
         e = make_entry(entries + staged, case, t, author, body,
                        refs=d.get("refs"), **extra)
@@ -1262,6 +1540,70 @@ def case_view(entries, meta, case):
     ce = [e for e in entries if e["case"] == case and e["id"] not in hidden]
     grades = compute_grades(entries)
     return ce, grades
+
+
+def digest_conclusion_class(entries: list[dict], digest: dict) -> str:
+    """Derived authority label; model consensus is never a user decision."""
+    if digest.get("kind") == "mechanical":
+        return "mechanical-summary"
+    if digest.get("kind") == "abstract":
+        return "rolling-abstract"
+    if digest.get("conclusion_class"):
+        conclusion = digest["conclusion_class"]
+    else:
+        foreign_endorsement = any(
+            e["type"] == "endorsement"
+            and digest["id"] in e.get("refs", [])
+            and normalize_author(e["author"]) != normalize_author(digest["author"])
+            for e in entries)
+        conclusion = (
+            "cross-model-consensus" if foreign_endorsement
+            else "model-recommendation")
+    grades = compute_grades(entries)
+    if any(
+            e["type"] == "decision"
+            and normalize_author(e["author"]) == "user"
+            and digest["id"] in e.get("refs", [])
+            and grades.get(e["id"]) not in ("revoked",)
+            for e in entries):
+        conclusion = "user-decision"
+    by_id = {e["id"]: e for e in entries}
+    hidden = superseded_ids(entries)
+    revoked = revoked_ids(entries)
+    stale_requirements = [
+        rid for rid in digest.get("refs", [])
+        if by_id.get(rid, {}).get("type") in ("constraint", "decision")
+        and (rid in hidden or rid in revoked)
+    ]
+    return f"stale-{conclusion}" if stale_requirements else conclusion
+
+
+def observation_source_label(e: dict) -> str:
+    bits = [str(e.get("source", "manual"))]
+    if e.get("source_type"):
+        bits.append(str(e["source_type"]))
+    if e.get("source_uri"):
+        bits.append(str(e["source_uri"]))
+    if e.get("locator"):
+        bits.append(f"at {e['locator']}")
+    if e.get("effective_at"):
+        bits.append(f"effective {e['effective_at']}")
+    if e.get("accessed_at"):
+        bits.append(f"accessed {e['accessed_at']}")
+    if e.get("expires_at"):
+        bits.append(f"review by {e['expires_at']}")
+    return "; ".join(bits)
+
+
+def claim_card_text(e: dict) -> str:
+    labels = (
+        ("claim_mode", "mode"), ("analysis_layer", "layer"),
+        ("mechanism", "mechanism"), ("comparator", "comparator"),
+        ("falsifier", "falsifier"), ("counterfactual", "counterfactual"),
+        ("horizon", "horizon"), ("testability", "testability"),
+    )
+    bits = [f"{label}: {e[key]}" for key, label in labels if e.get(key)]
+    return "; ".join(bits)
 
 
 def cmd_show(args):
@@ -1299,13 +1641,21 @@ def cmd_show(args):
     if livehyps:
         out += ["## Differential", ""]
         for g in GRADE_ORDER:
-            out += [f"- `{e['id']}` **[{g}]** ({e['author']}) {e['body']}"
-                    for e in livehyps if grades[e["id"]] == g]
+            for e in (h for h in livehyps if grades[h["id"]] == g):
+                line = f"- `{e['id']}` **[{g}]** ({e['author']}) {e['body']}"
+                if claim_card_text(e):
+                    line += f"\n  - claim card: {claim_card_text(e)}"
+                out.append(line)
         out.append("")
     ruled = [h for h in hyps if grades[h["id"]] == "refuted"]
     if ruled:
         out += ["## Ruled out", ""]
-        out += [f"- `{e['id']}` ({e['author']}) {e['body']}" for e in ruled] + [""]
+        for e in ruled:
+            line = f"- `{e['id']}` ({e['author']}) {e['body']}"
+            if claim_card_text(e):
+                line += f"\n  - claim card: {claim_card_text(e)}"
+            out.append(line)
+        out.append("")
 
     if ds:
         out += ["## Open disputes", ""]
@@ -1319,13 +1669,15 @@ def cmd_show(args):
     dig = [e for e in by_type.get("digest", []) if e.get("kind") != "abstract"]
     if dig:
         out += ["## Digests", ""]
-        out += [f"- `{e['id']}` [{e['kind']}] ({e['author']}) {e['body']}"
+        out += [f"- `{e['id']}` [{e['kind']}; "
+                f"{digest_conclusion_class(entries, e)}] "
+                f"({e['author']}) {e['body']}"
                 for e in dig] + [""]
 
     obs = by_type.get("observation", [])
     if obs:
         out += ["## Recent observations", ""]
-        out += [f"- `{e['id']}` ({e.get('source','manual')}) {e['body']}"
+        out += [f"- `{e['id']}` ({observation_source_label(e)}) {e['body']}"
                 for e in obs[-args.observations:]] + [""]
     print("\n".join(out))
 
@@ -1356,6 +1708,22 @@ def cmd_resume_context(args):
         sections.append(("STATUS (rolling abstract — the case in one paragraph):",
                          [abstracts[-1]["body"]]))
 
+    judgments = [e for e in by_type.get("digest", [])
+                 if e.get("kind") == "judgment"]
+    if judgments:
+        sections.append(("JUDGMENTS (authority class is explicit):", [
+            f"- [{digest_conclusion_class(entries, e)}] {e['body']} "
+            f"(id {e['id']})" for e in judgments[-3:]
+        ]))
+    candidates = [e for e in by_type.get("digest", [])
+                  if e.get("kind") == "candidate"]
+    if candidates:
+        sections.append(("UNFINALIZED CANDIDATE RECOMMENDATIONS:", [
+            f"- [{digest_conclusion_class(entries, e)}] {e['body']} "
+            f"(id {e['id']}; "
+            "requires exact independent review)" for e in candidates[-3:]
+        ]))
+
     live = lambda es: [e for e in es if grades.get(e["id"]) != "revoked"]
     cons = live(by_type.get("constraint", []))
     if cons:
@@ -1384,13 +1752,17 @@ def cmd_resume_context(args):
     ruled = [h for h in hyps if grades[h["id"]] == "refuted"]
     if ruled and not args.blind:
         sections.append(("RULED OUT (do not re-propose without new evidence):", [
-            f"- {e['body']} (by {e['author']})" for e in ruled]))
+            f"- {e['body']} (by {e['author']}"
+            f"{'; ' + claim_card_text(e) if claim_card_text(e) else ''})"
+            for e in ruled]))
     livehyps = [h for h in hyps if grades[h["id"]] != "refuted"]
     if livehyps and not args.blind:
         lines = []
         for g in GRADE_ORDER:
-            lines += [f"- [{PHRASE[g]}] {e['body']} (by {e['author']})"
-                      for e in livehyps if grades[e["id"]] == g]
+            for e in (h for h in livehyps if grades[h["id"]] == g):
+                card = f"; {claim_card_text(e)}" if claim_card_text(e) else ""
+                lines.append(
+                    f"- [{PHRASE[g]}] {e['body']} (by {e['author']}{card})")
         sections.append(("CURRENT DIFFERENTIAL (grade in brackets — treat accordingly):", lines))
     if qs:
         sections.append(("OPEN QUESTIONS:", [
@@ -1398,7 +1770,7 @@ def cmd_resume_context(args):
     obs = by_type.get("observation", [])
     if obs:
         sections.append((f"RECENT OBSERVATIONS (ground truth; bodies are fenced data):", [
-            f"- [{e.get('source','manual')}] {fence(e['body'])}"
+            f"- [{observation_source_label(e)}] {fence(e['body'])}"
             for e in obs[-args.observations:]]))
 
     header = ["You are resuming an in-progress task. Trust ground truth over "
@@ -1510,6 +1882,9 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
     grades = compute_grades(entries)
     by_id = {e["id"]: e for e in entries}
     problems = []
+    clock = now or datetime.now(timezone.utc)
+    if clock.tzinfo is None:
+        clock = clock.replace(tzinfo=timezone.utc)
 
     ref_counts: dict[str, int] = {}
     meta_types = {"endorsement", "dispute", "verification", "resolution",
@@ -1545,6 +1920,76 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
         if e["type"] == "decision" and not e.get("refs") and not e.get("rationale"):
             problems.append(f"ORPHAN           decision `{e['id']}` has no refs and "
                             f"no rationale: {e['body'][:60]}")
+
+    # A judgment linked to a replaced/revoked normative requirement remains
+    # historical, but must not keep presenting as the current conclusion.
+    hidden = superseded_ids(entries)
+    revoked = revoked_ids(entries)
+    for e in entries:
+        if e["type"] != "digest" or e.get("kind") != "judgment":
+            continue
+        stale = [
+            rid for rid in e.get("refs", [])
+            if by_id.get(rid, {}).get("type") in ("constraint", "decision")
+            and (rid in hidden or rid in revoked)
+        ]
+        if stale:
+            problems.append(
+                f"STALE-JUDGMENT    `{e['id']}` relies on replaced/revoked "
+                f"requirement(s) {', '.join(stale)}")
+
+    # Ranking-driving claims need enough structure for another domain/model to
+    # challenge them. This remains quiet for exploratory hypotheses until a
+    # decision or candidate/judgment actually leans on them.
+    ranking_refs = set()
+    for e in entries:
+        if e["type"] == "decision":
+            ranking_refs.update(e.get("refs", []))
+        elif e["type"] == "digest" and e.get("kind") in (
+                "candidate", "judgment"):
+            ranking_refs.update(e.get("supersedes", []))
+    for hid in sorted(ranking_refs):
+        h = by_id.get(hid)
+        if not h or h["type"] != "hypothesis":
+            continue
+        required = [
+            "claim_mode", "comparator", "analysis_layer", "falsifier",
+            "counterfactual", "horizon", "testability",
+        ]
+        if h.get("claim_mode") in (
+                "causal-inference", "diagnosis", "mechanistic"):
+            required.append("mechanism")
+        missing = [key for key in required if not h.get(key)]
+        if missing:
+            problems.append(
+                f"CLAIM-CARD       `{hid}` is ranking-driving but lacks "
+                f"{', '.join(missing)}: {h['body'][:60]}")
+
+    # Time-sensitive world facts retain their provenance and review horizon.
+    hidden = superseded_ids(entries)
+    for e in entries:
+        if e["type"] != "observation" or e["id"] in hidden:
+            continue
+        if e.get("expires_at"):
+            try:
+                expiry = datetime.fromisoformat(
+                    str(e["expires_at"]).replace("Z", "+00:00"))
+                if expiry.tzinfo is None:
+                    expiry = expiry.replace(tzinfo=timezone.utc)
+                if expiry <= clock:
+                    problems.append(
+                        f"EXPIRED-SOURCE   observation `{e['id']}` expired "
+                        f"{e['expires_at']}: {e['body'][:60]}")
+            except ValueError:
+                problems.append(
+                    f"PROVENANCE       observation `{e['id']}` has invalid "
+                    f"expires_at {e['expires_at']!r}")
+        if str(e.get("source_type", "")).lower() in (
+                "api", "filing", "paper", "web") \
+                and not e.get("accessed_at"):
+            problems.append(
+                f"PROVENANCE       observation `{e['id']}` source_type "
+                f"{e['source_type']} lacks accessed_at")
 
     # CONTRADICTION (SPEC §7): a hypothesis verified against ground truth and
     # *later* disputed. Scan chronologically, growing the verified set as
@@ -1642,6 +2087,7 @@ def _last_spitball_spend(root: Path):
     try:
         d = json.loads((root / DIR / UI_DIR / "spitball.json").read_text())
         return {"usd": d.get("spend_usd"), "tokens": d.get("tokens"),
+                "cache_read_tokens": d.get("cache_read_tokens"),
                 "models": d.get("models"), "turn": d.get("turn")}
     except Exception:
         return None
@@ -1736,7 +2182,15 @@ def synthesize_abstract(entries: list[dict], meta: dict, case: str) -> str:
                     f"({PHRASE.get(g, g)}; id {h['id']})")
                 break
     else:
-        lines.append("STATUS: no live hypotheses on the differential")
+        judgments = [e for e in by_type.get("digest", [])
+                     if e.get("kind") == "judgment"]
+        if judgments:
+            j = judgments[-1]
+            lines.append(
+                f"STATUS: {digest_conclusion_class(entries, j)} judgment — "
+                f"{j['body'][:240]} (id {j['id']})")
+        else:
+            lines.append("STATUS: no live hypotheses on the differential")
     ruled = [h for h in by_type.get("hypothesis", []) if grades.get(h["id"]) == "refuted"]
     if ruled:
         lines.append("RULED OUT: " + "; ".join(
@@ -2583,12 +3037,19 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 
 - **hypothesis** — falsifiable claim, author is whoever proposed it. Add
   `--check '<shell>'` when a one-liner can test it (exit 0 = still holds).
+  For any claim that could drive a ranking/decision, also record its
+  `--claim-mode`, `--comparator`, `--analysis-layer`, `--falsifier`,
+  `--counterfactual`, `--horizon`, `--testability`, and (for causal claims)
+  `--mechanism`.
 - **decision** — author `user` ONLY for choices the user actually made;
   your own proposals are author `claude` (they render as "asserted, not
   user-confirmed"). Always give `--rationale`; record losing alternatives
   with `--rejected "option:reason"` so they aren't re-proposed.
 - **observation** — ground truth only: test output, command results, log
   lines, with `--source`. Never file your own inference as an observation.
+  Remote/time-sensitive evidence should carry `--source-uri`,
+  `--source-type`, `--accessed-at`, `--effective-at`, `--expires-at`, and a
+  precise `--locator` when available.
 - **verify** — links a hypothesis to a real observation. Model agreement is
   never verification; endorse instead (`consensus` is explicitly weaker).
 - **dispute** when you disagree with a recorded claim; `resolve` with
@@ -2598,6 +3059,17 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
   abstract current (`--kind abstract`; `--supersedes` is automatic for
   abstracts): problem, status with grade in words, leading theory,
   ruled-out list, key decisions, open items. Run `reindex` after.
+- Prefer `--body-stdin` for multiline text and repeatable singular
+  `--ref`/`--reject`/`--supersede` flags. Use `--json` receipts when another
+  process must parse the id. A constraint correction can supersede an older
+  constraint only with the same authority and `--rationale`; decisions still
+  use revoke/replace.
+- In multi-model work, never directly promote a recommendation: file
+  `--kind candidate`, have a different author review that exact id, then use
+  `finalize-digest`. Reference the frozen casefile requirement ids with
+  repeatable `--ref` so later replacements mark the judgment stale. A model
+  recommendation, cross-model consensus, stale judgment, and user decision
+  are distinct.
 
 ## Recognizing casefile-directed speech
 
@@ -2647,8 +3119,33 @@ all-or-nothing; each imported entry echoes.
   `import`. Before the first hypothesis, `recall` the problem statement —
   surface strong compost hits ("this resembles the March importer case…").
 - When the differential stalls (two theories, no discriminating evidence,
-  ~3 windows without progress), propose escalating to a spitball (once the
-  driver exists — M4).
+  ~3 windows without progress), propose escalating to a manifest-backed
+  spitball.
+
+## Before every consequential debate
+
+1. Sweep the current conversation into the log *before* launching models:
+   verbatim user requirements/constraints, decisions, open questions, and
+   already-mentioned alternatives. Do not wait until after architectural
+   convergence.
+2. Freeze a deliberation manifest. Include requirements, evaluation criteria
+   and weights (mark user-confirmed vs inferred), evidence domains, competing
+   alternatives/packages, analysis layers, and known open questions. Give
+   every alternative the same criteria and implementation-detail budget.
+3. Prefer `spitball --manifest <json> --manifest-mode enforce`. If the user
+   does not want to supply weights, record that they are inferred and use
+   `warn`: exploration may continue, but casefile should not manufacture a
+   final judgment from missing normative input.
+4. Require the verbose independent round-by-round synopses and exact
+   opening/round ledger; they are echoed in full and retained in `run.json`.
+   Treat manifest coverage as "addressed", never as agreement or verification.
+5. Continuity comes from each adapter's continuous vendor session plus the
+   atomic `transcripts/<session>/run.json`, not tmux. After interruption use
+   `spitball-recover <session>`; tmux is only a viewport.
+6. Finalization is guarded: only convergence, complete coverage, aligned
+   summaries, no live disputes/questions, complete claim cards, and exact
+   candidate review can create a judgment. Turn/spend budget and stalemate
+   preserve the differential as-is.
 '''
 
 CLAUDE_HOOKS = [  # event, matcher, command, timeout
@@ -2738,6 +3235,11 @@ This project keeps its investigation state in an append-only casefile log.
   `python3 casefile.py dig "<topic>"` (and `recall`) and cite what you find
   in `--refs`. Decisions carry `--rationale` and `--rejected` for losing
   options.
+- **Before a consequential spitball**, sweep the current conversation into
+  the log and freeze a manifest of verbatim requirements, criteria/weights,
+  alternatives, evidence domains, analysis layers, and open questions.
+  Prefer `--manifest-mode enforce`; use `warn` only when an exploratory run
+  may proceed without manufacturing a final judgment.
 - **Echo every entry you file** as one line in your visible reply —
   `recorded: decision "…" (user)` — your own filings included.
 - File hypotheses, decisions, observations, and questions as you work —
@@ -3210,7 +3712,24 @@ def cmd_spitball(args):
         die("spitball needs exactly two models (--models a,b)")
     spitball.run(topic=args.topic, models=models, turns=args.turns,
                  budget_usd=args.budget_usd, blind=args.blind,
-                 fake_script=args.fake_script)
+                 fake_script=args.fake_script,
+                 manifest_path=args.manifest,
+                 requirements=args.requirement,
+                 criteria=args.criterion,
+                 alternatives=args.alternative,
+                 evidence_domains=args.evidence_domain,
+                 analysis_layers=args.analysis_layer,
+                 open_questions=args.open_question,
+                 weighting=args.weighting,
+                 manifest_mode=args.manifest_mode,
+                 output_retries=args.output_retries)
+
+
+def cmd_spitball_recover(args):
+    import spitball
+    spitball.recover(
+        args.session, turns=args.turns, budget_usd=args.budget_usd,
+        fake_script=args.fake_script)
 
 
 def cmd_talk(args):
@@ -3265,20 +3784,50 @@ def main():
         ENTRY_TYPES - {"endorsement", "dispute", "resolution", "verification",
                        "digest", "revocation"}))
     s.add_argument("-a", "--author", required=True)
-    s.add_argument("body")
+    s.add_argument("body", nargs="?")
+    s.add_argument("--body-stdin", action="store_true",
+                   help="read a multiline body from stdin")
     s.add_argument("--case")
     # extend: a repeated flag accumulates instead of silently overwriting —
     # `--refs a --refs b` and `--refs a b` both record both
     s.add_argument("--refs", nargs="*", action="extend", default=[])
+    s.add_argument("--ref", action="append", default=[],
+                   help="one referenced id; repeat without variadic ambiguity")
     s.add_argument("--rationale", help="decisions")
     s.add_argument("--rejected", nargs="*", action="extend", metavar="OPTION:REASON",
                    help="decisions: losing alternatives, so they aren't re-proposed")
+    s.add_argument("--reject", action="append", default=[], metavar="OPTION:REASON",
+                   help="one rejected option; repeat without variadic ambiguity")
     s.add_argument("--source", help="observations")
+    s.add_argument("--source-uri", help="observations: stable source URL/URI")
+    s.add_argument("--source-type",
+                   help="observations: e.g. test, log, API, filing, paper")
+    s.add_argument("--published-at", help="observations: ISO-8601 publication time")
+    s.add_argument("--accessed-at", help="observations: ISO-8601 retrieval time")
+    s.add_argument("--effective-at", help="observations: ISO-8601 effective time")
+    s.add_argument("--expires-at", help="observations: ISO-8601 review/expiry time")
+    s.add_argument("--locator", help="observations: page, line, block, tx, or query")
+    s.add_argument("--jurisdiction", help="observations: applicable jurisdiction")
     s.add_argument("--check", help="hypothesis/constraint: shell recipe, exit 0 = still holds")
+    s.add_argument("--claim-mode", choices=sorted(CLAIM_MODES),
+                   help="hypotheses: epistemic/argument mode")
+    s.add_argument("--mechanism", help="hypotheses: proposed causal mechanism")
+    s.add_argument("--comparator", help="hypotheses: explicit baseline/comparator")
+    s.add_argument("--analysis-layer",
+                   help="hypotheses: facts, causality, values, or delivery layer")
+    s.add_argument("--falsifier", help="hypotheses: evidence that would refute it")
+    s.add_argument("--counterfactual",
+                   help="hypotheses: expected outcome absent the proposed cause")
+    s.add_argument("--horizon", help="hypotheses: time horizon")
+    s.add_argument("--testability", choices=sorted(CLAIM_TESTABILITY),
+                   help="hypotheses: when/how the claim can be discriminated")
     s.add_argument("--supersedes", nargs="*", action="extend", default=[],
-                   help="hypotheses: prior hypothesis id(s) this re-file corrects")
+                   help="hypotheses/constraints: like-for-like ids this corrects")
+    s.add_argument("--supersede", action="append", default=[],
+                   help="one like-for-like replacement id; repeatable")
     s.add_argument("--to",
                    help="questions/notes: route to user|any|<author> (mailbox / packet peer)")
+    s.add_argument("--json", action="store_true", help="machine-readable receipt")
     s.set_defaults(fn=cmd_add)
 
     for name, fn, extras in [
@@ -3309,14 +3858,29 @@ def main():
     s.set_defaults(fn=cmd_verify)
 
     s = sub.add_parser("digest", help="summarize and supersede a span (non-destructive)")
-    s.add_argument("body")
+    s.add_argument("body", nargs="?")
+    s.add_argument("--body-stdin", action="store_true",
+                   help="read a multiline body from stdin")
     s.add_argument("-a", "--author", required=True)
     s.add_argument("--kind", required=True, choices=sorted(DIGEST_KINDS))
-    s.add_argument("--supersedes", nargs="+",
+    s.add_argument("--supersedes", nargs="*",
                    help="ids to hide; optional for --kind abstract (auto-supersedes "
                         "the prior abstract)")
+    s.add_argument("--supersede", action="append", default=[],
+                   help="one id to supersede; repeat without variadic ambiguity")
+    s.add_argument("--refs", nargs="*", action="extend", default=[],
+                   help="requirement/evidence ids this digest relies on")
+    s.add_argument("--ref", action="append", default=[],
+                   help="one relied-on id; repeat without variadic ambiguity")
     s.add_argument("--case")
+    s.add_argument("--json", action="store_true", help="machine-readable receipt")
     s.set_defaults(fn=cmd_digest)
+
+    s = sub.add_parser(
+        "finalize-digest",
+        help="promote an exact independently-endorsed candidate judgment")
+    s.add_argument("candidate")
+    s.set_defaults(fn=cmd_finalize_digest)
 
     s = sub.add_parser("show", help="compiled markdown view of a case")
     s.add_argument("--case")
@@ -3417,8 +3981,41 @@ def main():
     s.add_argument("--turns", type=int, default=6)
     s.add_argument("--budget-usd", type=float)
     s.add_argument("--blind", help="model name to seed with resume-context --blind")
+    s.add_argument("--manifest",
+                   help="JSON deliberation manifest (topic must match)")
+    s.add_argument("--requirement", action="append", default=[],
+                   help="verbatim requirement; repeatable")
+    s.add_argument("--criterion", action="append", default=[],
+                   help="evaluation criterion; repeatable (weights via JSON manifest)")
+    s.add_argument("--weighting",
+                   help="confirmed criterion weighting/priority scheme, e.g. "
+                        "'equal' or 'safety 2x latency'")
+    s.add_argument("--alternative", action="append", default=[],
+                   help="alternative/package/hypothesis; repeatable")
+    s.add_argument("--evidence-domain", action="append", default=[],
+                   help="required evidence domain or source class; repeatable")
+    s.add_argument("--analysis-layer", action="append", default=[],
+                   help="required analysis layer; repeatable")
+    s.add_argument("--open-question", action="append", default=[],
+                   help="known unresolved question; repeatable")
+    s.add_argument("--manifest-mode", choices=["enforce", "warn", "off"],
+                   default="warn",
+                   help="enforce=refuse incomplete; warn=run but block judgment; "
+                        "off=disable coverage finalization gates")
+    s.add_argument("--output-retries", type=int, default=1,
+                   help="bounded retries for receipt/progress/invalid model output")
     s.add_argument("--fake-script", help=argparse.SUPPRESS)  # tests/CI (§18)
     s.set_defaults(fn=cmd_spitball)
+
+    s = sub.add_parser(
+        "spitball-recover",
+        help="recover an interrupted deliberation from its atomic run journal")
+    s.add_argument("session")
+    s.add_argument("--turns", type=int,
+                   help="remaining rounds (default: old budget minus completed)")
+    s.add_argument("--budget-usd", type=float)
+    s.add_argument("--fake-script", help=argparse.SUPPRESS)
+    s.set_defaults(fn=cmd_spitball_recover)
 
     s = sub.add_parser("lint", help="drift detection; exit 1 on findings")
     s.add_argument("--launder-threshold", type=int, default=3)
@@ -3439,6 +4036,16 @@ def main():
     s.add_argument("-a", "--author", help="override author for this invocation")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_whoami)
+
+    s = sub.add_parser(
+        "preflight",
+        help="non-epistemic casefile read/write/identity probe for adapters")
+    s.add_argument("-a", "--author")
+    s.add_argument("--json", action="store_true")
+    s.add_argument("--receipt",
+                   help="write nonce-bound receipt under .casefile/transcripts")
+    s.add_argument("--nonce", help="caller nonce copied into --receipt")
+    s.set_defaults(fn=cmd_preflight)
 
     s = sub.add_parser(
         "boot",

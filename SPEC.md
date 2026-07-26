@@ -1,4 +1,4 @@
-# CASEFILE — Product Specification v1.0
+# CASEFILE — Product Specification v1.1
 
 *Working name: **casefile** (final name TBC by David; the v0 prototype is called
 `statelog` and ships alongside this spec as `statelog.py`). This document is
@@ -33,11 +33,13 @@ is complete, but it is plumbing operated by models on the user's behalf.
 These are load-bearing. Any implementation decision that violates one of
 these is wrong even if it is convenient.
 
-**P1. The log is the product; everything else is disposable.** Drivers,
-concierges, UIs, and indexes may be killed, rewritten, or lost with zero loss
-of consequence. Test: `kill -9` any process mid-session; on restart, nothing
-of consequence is gone. If something was lost, that component held state it
-should not have.
+**P1. The log is the epistemic product; operational state is journaled.**
+Drivers, concierges, UIs, and indexes may be killed without losing a filed
+claim, decision, constraint, or observation. A local atomic run journal may
+retain transport state (inputs, replies, vendor session ids, pending calls)
+so an interrupted deliberation is diagnosable/replayable; it can never promote
+model output to evidence. Test: `kill -9` any process mid-session; the log is
+intact and the journal identifies the exact durable/pending boundary.
 
 **P2. Append-only; corrections are new entries.** No entry is ever edited or
 deleted. Supersession (see digests) hides entries from compiled views but
@@ -66,8 +68,9 @@ disputed, and are subject to lint. A careless summary is the stealthiest
 laundering vector in the system.
 
 **P8. The coordinator is a switchboard, not a brain.** Any orchestrating
-process (driver, concierge) holds no plan, no opinions about the task, and no
-memory beyond the log. It routes; it never gates the hot path.
+process (driver, concierge) holds no task opinion. It routes and records
+transparent operational state; epistemic gates are deterministic functions
+of the manifest and log, never the coordinator's prose judgment.
 
 **P9. Human effort is optional everywhere.** Nudges may be ignored; silence
 merely lowers a grade (e.g. `inferred-resolved` vs `user-confirmed`), never
@@ -80,6 +83,15 @@ lives in thin adapters at the edges.
 **P11. Model-authored text from the world is untrusted.** Observations can
 contain adversarial strings (a malicious file quoted in a test failure).
 Compiled views must fence observation bodies as data-not-instructions.
+
+**P12. Coverage precedes convergence.** A debate cannot call itself concluded
+while a frozen requirement, criterion, evidence domain, analysis layer, or
+alternative×criterion cell is undispositioned. Symmetric coverage is not
+agreement; it prevents omission and package caricature.
+
+**P13. Conclusion authority is explicit.** A model recommendation,
+cross-model consensus, and user decision are different states. No model or
+driver may silently upgrade one into another.
 
 ## 3. Terminology
 
@@ -99,6 +111,9 @@ Compiled views must fence observation bodies as data-not-instructions.
 | **driver** | the process running a multi-model spitball session |
 | **hot path** | mechanical, model-free routing of `@addressed` user messages |
 | **secretary sweep** | end-of-session diff of conversation vs log to catch unrecorded decisions |
+| **manifest** | frozen per-run contract: requirements, criteria/weights, alternatives, evidence domains, analysis layers, open questions, coverage grid |
+| **run journal** | atomic local record of prompts/replies/call state/vendor ids; operational, never epistemic |
+| **candidate digest** | inert model recommendation awaiting review of that exact id |
 
 ## 4. Architecture
 
@@ -119,7 +134,7 @@ Compiled views must fence observation bodies as data-not-instructions.
 ┌───────────────▼─────────────────────────────────────────┐
 │ .casefile/log.jsonl  (truth)                            │
 │ .casefile/index.db   (FTS cache — destroyable)          │
-│ .casefile/meta.json, transcripts/, config               │
+│ .casefile/meta.json, transcripts/{manifest,run,…}       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -144,6 +159,11 @@ git (provide a starter `.gitignore`).
   via `casefile reindex`; corruption or deletion is a non-event (P1).
 - `transcripts/<session>/<model>.log` — raw spitball transcripts. Ephemeral,
   gitignored; the log is the distillate.
+- `transcripts/<session>/manifest.json` — frozen deliberation coverage
+  contract.
+- `transcripts/<session>/run.json` — atomically replaced operational journal.
+  Each call is persisted `pending` before invocation and `completed` with its
+  reply and serializable vendor handle before ferrying.
 - `config.toml` — models, adapters, budgets, echo volume, hook verbosity.
 
 ### 5.2 Entry envelope (all types)
@@ -165,16 +185,16 @@ git (provide a starter `.gitignore`).
 
 | type | purpose | extra fields |
 |---|---|---|
-| `hypothesis` | falsifiable claim by a model | `check` (optional shell recipe, §8); `supersedes` (optional: prior hypothesis id(s) this re-file corrects — retires them and their checks; a verified target must be disputed instead) |
+| `hypothesis` | falsifiable claim by a model | `check`; like-for-like `supersedes`; claim card: `claim_mode`, `mechanism`, `comparator`, `analysis_layer`, `falsifier`, `counterfactual`, `horizon`, `testability` |
 | `decision` | a choice constraining future work | `rationale`, `rejected` (list of `{option, reason}` — the losing alternatives, so they aren't re-proposed) |
-| `observation` | ground truth from the world | `source` (`pytest`, `git`, `hook:*`, `manual`, …) |
-| `constraint` | invariant that must hold | `check` (optional) |
+| `observation` | ground truth from the world | `source`; optional `source_uri`, `source_type`, `published_at`, `accessed_at`, `effective_at`, `expires_at`, `locator`, `jurisdiction` |
+| `constraint` | invariant that must hold | `check`; same-author correction via `supersedes` + `supersession_reason` |
 | `question` | open unknown; user-authored questions form the **mailbox** | `to` (optional: `user`, `any`) |
 | `endorsement` | author X supports another author's entry | `comment` |
 | `dispute` | author X challenges entry; **blocks promotion** while open | `reason` in body |
 | `resolution` | closes a dispute or question; marks a decision fulfilled | `outcome`: `upheld`/`withdrawn`/`answered`; `fulfilled` (decisions only) |
 | `verification` | links hypothesis → observation(s) | refs must include ≥1 observation |
-| `digest` | summarizes and hides a span | `supersedes` (list of ids), `kind`: `mechanical`/`judgment`/`abstract` |
+| `digest` | summarizes a span | `supersedes`; `kind`: `mechanical`/`candidate`/`judgment`/`abstract`; candidate is inert; judgment carries explicit `conclusion_class` |
 | `revocation` | explicitly retires a constraint or decision | refs the retired entry |
 | `note` | anything else; zero epistemic weight | — |
 
@@ -242,17 +262,26 @@ Runs on hook batches or pre-commit. Targets hook-sourced observations only:
 
 Never touches anything protected by the evidence-chain invariant (§5.3).
 
-### 6.2 Judgment digests (model-authored)
+### 6.2 Candidate and judgment digests
 
 Triggered at natural checkpoints: end of a spitball session, closure of a
 differential branch, or when `resume-context` exceeds its token budget (the
 honest trigger — the budget is why distillation exists). A model writes the
 digest; because compaction is an epistemic act (P7):
 
-- the digest carries its author;
-- in multi-model settings, a **second model reviews the digest against the
-  raw span** with a narrow adversarial brief — "find anything dropped or
-  upgraded" — and endorses or disputes it;
+- the proposer writes a `kind: candidate` digest carrying its author and the
+  intended span; candidates are inert and hide nothing;
+- a **second model reviews that exact candidate id** against the raw
+  session-scoped span and frozen manifest — never "newest judgment" and never
+  a fallback id — then endorses or disputes it;
+- only an independent endorsement mechanically creates a system-authored
+  `kind: judgment` with the candidate body preserved verbatim,
+  `conclusion_class: cross-model-consensus`, and explicit proposer/reviewer
+  refs. Candidate and final judgment also reference the frozen casefile
+  requirements they relied on; replacement/revocation marks the conclusion
+  stale. An open or upheld dispute leaves the raw span and candidate visible;
+- a direct model-authored judgment is labelled `model-recommendation`; only a
+  separate user-authored decision referencing a digest yields `user-decision`;
 - refuted hypotheses compress to one dense line each — conclusion +
   evidence pointer ("ruled out gas theory: revert strings were
   nonce-too-low (679a46cb)") — and join the case's permanent **ruled-out
@@ -284,6 +313,13 @@ conversationally (§11.4) — lint is a smoke alarm, not a report.
   flag for human review; the tool never adjudicates.
 - **DIGEST-VIOLATION**: any digest whose supersedes list breaches the
   evidence-chain invariant (belt-and-braces with append-time checks).
+- **CLAIM-CARD**: a ranking-driving hypothesis lacks its mode, comparator,
+  layer, falsifier, counterfactual, horizon, testability, or (for a
+  causal/mechanistic claim) mechanism.
+- **EXPIRED-SOURCE / PROVENANCE**: a live observation passed its review date
+  or a remote source class lacks retrieval provenance.
+- **STALE-JUDGMENT**: a judgment references a constraint/decision that has
+  since been replaced or revoked.
 - **UNSWEPT**: a session ended without a secretary sweep entry (requires
   hooks; see §13).
 
@@ -355,14 +391,16 @@ system laundering its own conclusion.
 
 `init`, `open <title>` (creates or switches case; first mention creates —
 no ceremony), `add`, `endorse`, `dispute`, `resolve`, `verify`, `revoke`,
-`digest`, `show`, `resume-context [--blind]`, `recheck`, `recall`, `dig
+`digest`, `finalize-digest`, `show`, `resume-context [--blind]`, `recheck`, `recall`, `dig
 <query>` (search superseded/raw history; expand digests), `lint`, `log`,
-`reindex`, `hooks install <vendor>`, `ui`, `spitball`, `status` (JSON:
+`reindex`, `hooks install <vendor>`, `ui`, `spitball`,
+`spitball-recover`, `preflight`, `status` (JSON:
 active case, mailbox count, lint count, dormancy candidates, spend).
 
 Conventions: mutating commands print the new entry id on stdout, exit 0;
-all errors to stderr, exit ≠0; `--json` on read commands for structured
-output. Exit codes are API — models script against them.
+all errors to stderr, exit ≠0. `add`/`digest` accept `--body-stdin`, JSON
+receipts, and repeatable singular `--ref`/`--reject`/`--supersede` flags so
+models do not lose positional bodies to variadic parsing. Exit codes are API.
 
 `resume-context` composition, in fixed priority order with a token budget
 (config, default 2000): constraints → open disputes → decisions (with
@@ -430,19 +468,41 @@ extraction into typed entries, each echoed for confirmation in bulk).
 
 ### 12.1 Driver
 
-`casefile spitball --topic "…" [--models claude,codex] [--config …]` — a
-**disposable** (P1, P8) turn-ferrying loop:
+`casefile spitball --topic "…" [--models claude,codex] [--manifest …]` — a
+kill-safe (P1, P8) turn-ferrying loop:
 
-1. Open one headless session per model via its adapter; seed each with
-   `resume-context` (or `--blind` variants per role) + role brief + strong
-   recall matches.
-2. Ferry turns: model A's visible message → model B, and vice versa. Each
+1. Freeze `manifest.json`: verbatim requirements with confirmed/inferred
+   provenance, criteria and optional weights, evidence domains, alternatives,
+   analysis layers, open questions, and every alternative×criterion cell.
+   `enforce` refuses an incomplete manifest before paid calls; `warn` permits
+   exploration but blocks judgment; `off` is explicit.
+2. Run cheap adapter preflight (binary/version/root/writeability/hook-isolation
+   declaration), then require the opening model turn to execute
+   `casefile preflight` and create a nonce-bound receipt inside the session
+   transcript directory. Open one headless session per model with
+   `resume-context`, role brief, recall, and manifest.
+3. Before every vendor call, atomically journal its input as `pending`; after
+   return, journal reply, cost, and vendor session id as `completed` before
+   transcript append or ferrying. Reject/retry empty, progress-only,
+   receipt-only, malformed-envelope, or unknown-coverage output.
+4. Ferry turns: model A's validated visible message → model B, and vice versa. Each
    model keeps its **own continuous session** (its private view of the
-   argument) — never a shared scraped transcript.
-3. Every turn: append transcript file; tee to viewport; models file entries
+   argument) — never a shared scraped transcript. Full replies stay in the
+   journal; repetitive filing receipts/protocol lines are reduced to one
+   structured turn delta before transport.
+5. Every turn: append transcript file; tee to viewport; models file entries
    via the CLI as they argue (the skill/role brief mandates it).
-4. On session end: secretary sweep per model, judgment digest proposed by
-   one model, adversarially reviewed by the other (§6.2).
+6. Each model independently writes a verbose round-by-round synopsis:
+   arguments, evidence, assumptions, concessions, falsifiers, open points,
+   and manifest coverage. Its structured envelope must enumerate the exact
+   opening/round ledger. Full independent synopses are echoed and retained;
+   a bounded reconciliation pass runs on divergence.
+7. Both models perform secretary sweeps. Judgment is blocked on an
+   unconverged outcome, structural manifest gaps, uncovered rows, summary
+   divergence, open questions/disputes, incomplete claim cards, or blocking
+   provenance/contradiction lint.
+8. If every gate passes, candidate→exact critic review→mechanical judgment
+   follows §6.2.
 
 Roles: default proposer/critic; models are systematically better critics of
 theories they didn't generate, so each attacks the *other's* leading
@@ -450,13 +510,14 @@ hypothesis. Role briefs are prompt files in the repo (`.casefile/roles/`),
 user-editable.
 
 Stop conditions (agreeable models chat forever): **converge** (no open
-disputes; leading hypothesis endorsed or verified) → digest and halt;
-**turn budget** or **spend budget** → halt with the differential as-is;
+disputes; leading hypothesis endorsed or verified) → attempt guarded
+finalization; **turn budget** or **spend budget** → halt with the differential as-is;
 **stalemate** → halt; an open dispute is a valid, valuable output.
 
-End-of-session independent summaries: each model writes what it believes
-was decided *without seeing the other's*; the driver diffs them; divergence
-is a miscommunication detector; only the reconciled version is digested.
+`casefile spitball-recover <session>` replays each model's private completed
+calls and explicit pending boundary from `run.json` into fresh vendor sessions.
+Within a live run, adapters use long-lived streams or vendor session resume.
+tmux is an optional viewport only; it is never the continuity mechanism.
 
 ### 12.2 Model adapters
 
@@ -626,13 +687,19 @@ Each milestone ends with the dogfood test: use casefile on casefile.
 - Property: replaying any log prefix yields consistent grades (grades are
   pure functions of the log); reindex is idempotent; digest+dig round-trips
   content.
-- **The kill test** (P1): `kill -9` driver/concierge mid-session; restart;
-  assert no consequential loss. Run in CI with a scripted fake adapter.
+- **The kill test** (P1): `kill -9` driver mid-call; assert the append-only
+  log remains parseable, `run.json` identifies the exact pending input, and
+  `spitball-recover` replays the private context into a new run.
 - Adversarial fixtures: observation bodies containing prompt-injection
   strings — assert resume-context fences them; digest attempts that drop a
   constraint — assert append-time rejection + lint.
-- A scripted two-fake-model spitball (deterministic adapters) exercising
-  dispute → observation → verify → digest → review end-to-end.
+- Deterministic adapter tests for hook-receipt output replacement, progress
+  preambles, malformed/unknown coverage envelopes, cache-token telemetry,
+  manifest symmetry grids, incomplete-manifest refusal, and transcript/run
+  journaling.
+- A scripted two-model spitball exercising convergence → complete claim card
+  → candidate digest → exact foreign endorsement → mechanical system judgment;
+  dispute/missing review paths must leave the candidate inert.
 
 ## 19. Open questions (decide during build, with David)
 

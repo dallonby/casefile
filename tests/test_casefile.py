@@ -240,12 +240,12 @@ class CliBase(unittest.TestCase):
         self.assertEqual(self.cli("init").rc, 0)
         self.assertEqual(self.cli("open", "Test case", "--goal", "g").rc, 0)
 
-    def cli(self, *args, expect=None):
+    def cli(self, *args, expect=None, stdin=None):
         # CODEX_HOME sandboxed: init/hooks-install must never touch ~/.codex
         env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home")}
         p = subprocess.run([sys.executable, str(CASEFILE), *args],
                            cwd=self.dir, capture_output=True, text=True,
-                           env=env)
+                           env=env, input=stdin)
         r = type("R", (), {"rc": p.returncode,
                            "out": p.stdout.strip(), "err": p.stderr.strip()})
         if expect is not None:
@@ -271,6 +271,35 @@ class CliValidationTests(CliBase):
         r = self.cli("add", "-t", "note", "-a", "claude", "x", "--refs", "deadbeef")
         self.assertNotEqual(r.rc, 0)
         self.assertIn("unknown ref", r.err)
+
+    def test_preflight_proves_write_path_without_filing(self):
+        before = len(self.log_entries())
+        receipt = self.dir / ".casefile" / "transcripts" / "s1" / "codex.json"
+        r = self.cli("preflight", "-a", "codex", "--json", expect=0)
+        report = json.loads(r.out)
+        self.assertTrue(report["ok"])
+        self.assertTrue(report["log_readable"])
+        self.assertTrue(report["log_appendable"])
+        self.assertTrue(report["log_lockable"])
+        self.assertTrue(report["state_writable"])
+        self.assertEqual(report["author"], "codex")
+        self.assertEqual(len(self.log_entries()), before)
+        leftovers = list((self.dir / ".casefile" / "state").glob("preflight-*"))
+        self.assertEqual(leftovers, [])
+        r = self.cli(
+            "preflight", "-a", "codex", "--json",
+            "--receipt", str(receipt), "--nonce", "nonce-1", expect=0)
+        written = json.loads(receipt.read_text())
+        self.assertEqual(written["nonce"], "nonce-1")
+        self.assertEqual(written["author"], "codex")
+        self.assertEqual(json.loads(r.out)["receipt"], str(receipt))
+
+    def test_preflight_receipt_cannot_escape_transcript_store(self):
+        r = self.cli(
+            "preflight", "-a", "codex", "--json",
+            "--receipt", str(self.dir / "outside.json"), "--nonce", "n")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn(".casefile/transcripts", r.err)
 
     def test_self_endorsement_rejected(self):
         h = self.add("-t", "hypothesis", "-a", "claude", "theory X")
@@ -583,6 +612,240 @@ class CliSupersedeTests(CliBase):
         r = self.cli("add", "-t", "decision", "-a", "user", "new choice",
                      "--supersedes", d)
         self.assertNotEqual(r.rc, 0)
+
+    def test_same_author_can_replace_constraint_with_reason(self):
+        c1 = self.add("-t", "constraint", "-a", "user", "never deploy")
+        c2 = self.add("-t", "constraint", "-a", "user", "deploy only to testnet",
+                      "--supersede", c1, "--rationale", "scope clarified")
+        entries = self.log_entries()
+        self.assertIn(c1, cf.superseded_ids(entries))
+        self.assertEqual(next(e for e in entries if e["id"] == c2)
+                         ["supersession_reason"], "scope clarified")
+        self.assertNotIn("never deploy",
+                         self.cli("resume-context", expect=0).out)
+
+    def test_constraint_replacement_respects_authority_and_reason(self):
+        c1 = self.add("-t", "constraint", "-a", "user", "never deploy")
+        r = self.cli("add", "-t", "constraint", "-a", "codex",
+                     "deploy now", "--supersede", c1, "--rationale", "faster")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("only that authority", r.err)
+        r = self.cli("add", "-t", "constraint", "-a", "user",
+                     "deploy later", "--supersede", c1)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("--rationale", r.err)
+
+
+class CliFilingErgonomicsTests(CliBase):
+    def test_multiline_body_stdin_and_json_receipt(self):
+        body = "first line\nsecond line with --refs-looking text\n"
+        r = self.cli("add", "-t", "note", "-a", "codex",
+                     "--body-stdin", "--json", stdin=body, expect=0)
+        receipt = json.loads(r.out)
+        self.assertEqual(receipt["type"], "note")
+        entry = next(e for e in self.log_entries() if e["id"] == receipt["id"])
+        self.assertEqual(entry["body"], body.strip())
+
+    def test_repeatable_singular_refs_do_not_swallow_body(self):
+        a = self.add("-t", "note", "-a", "codex", "one")
+        b = self.add("-t", "note", "-a", "codex", "two")
+        r = self.cli("add", "-t", "decision", "-a", "codex",
+                     "--ref", a, "--ref", b, "--rationale", "both",
+                     "ship it", expect=0)
+        entry = next(e for e in self.log_entries() if e["id"] == r.out)
+        self.assertEqual(entry["refs"], [a, b])
+        self.assertEqual(entry["body"], "ship it")
+
+    def test_body_stdin_and_positional_are_mutually_exclusive(self):
+        r = self.cli("add", "-t", "note", "-a", "codex", "positional",
+                     "--body-stdin", stdin="stdin")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("either positional", r.err)
+
+    def test_type_specific_flags_are_not_silently_ignored(self):
+        r = self.cli("add", "-t", "note", "-a", "codex", "x",
+                     "--falsifier", "not x")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("only valid for hypotheses", r.err)
+        r = self.cli("add", "-t", "hypothesis", "-a", "codex", "x",
+                     "--source-uri", "https://example.test")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("only valid for observations", r.err)
+
+
+class CliCandidateDigestTests(CliBase):
+    def full_hypothesis(self, author="claude"):
+        return self.add(
+            "-t", "hypothesis", "-a", author, "option A is safer",
+            "--claim-mode", "causal-inference", "--mechanism", "fewer writes",
+            "--comparator", "option B", "--analysis-layer", "execution",
+            "--falsifier", "B has fewer failures",
+            "--counterfactual", "equal failures absent write count",
+            "--horizon", "30 days", "--testability", "within-session")
+
+    def test_candidate_is_inert_until_exact_independent_endorsement(self):
+        h = self.full_hypothesis()
+        candidate = self.cli(
+            "digest", "-a", "claude", "--kind", "candidate",
+            "--supersede", h, "--body-stdin",
+            stdin="Recommend option A; evidence remains provisional.",
+            expect=0).out
+        entries = self.log_entries()
+        self.assertNotIn(h, cf.superseded_ids(entries))
+        self.assertEqual(
+            next(e for e in entries if e["id"] == candidate)
+            ["conclusion_class"], "model-recommendation")
+
+        r = self.cli("finalize-digest", candidate)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("independent endorsement", r.err)
+        review = self.cli("endorse", candidate, "-a", "codex",
+                          "--comment", "exact span preserved", expect=0).out
+        final = self.cli("finalize-digest", candidate, expect=0).out
+        entries = self.log_entries()
+        f = next(e for e in entries if e["id"] == final)
+        self.assertEqual(f["author"], "system")
+        self.assertEqual(f["conclusion_class"], "cross-model-consensus")
+        self.assertEqual(f["refs"], [candidate, review])
+        self.assertIn(h, cf.superseded_ids(entries))
+        self.assertIn(candidate, cf.superseded_ids(entries))
+        self.assertEqual(self.cli("finalize-digest", candidate, expect=0).out,
+                         final)  # idempotent
+        ctx = self.cli("resume-context", expect=0).out
+        self.assertIn("cross-model-consensus", ctx)
+        self.assertIn("Recommend option A", ctx)
+
+    def test_open_exact_review_dispute_blocks_promotion(self):
+        h = self.full_hypothesis()
+        candidate = self.cli(
+            "digest", "recommend A", "-a", "claude", "--kind", "candidate",
+            "--supersede", h, expect=0).out
+        self.cli("endorse", candidate, "-a", "codex", expect=0)
+        self.cli("dispute", candidate, "-a", "grok",
+                 "--reason", "criterion omitted", expect=0)
+        r = self.cli("finalize-digest", candidate)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("open or upheld review dispute", r.err)
+
+    def test_upheld_dispute_blocks_but_withdrawn_dispute_allows_promotion(self):
+        h1 = self.full_hypothesis()
+        candidate1 = self.cli(
+            "digest", "recommend A", "-a", "claude", "--kind", "candidate",
+            "--supersede", h1, expect=0).out
+        self.cli("endorse", candidate1, "-a", "codex", expect=0)
+        d1 = self.cli(
+            "dispute", candidate1, "-a", "grok",
+            "--reason", "candidate drops a caveat", expect=0).out
+        self.cli(
+            "resolve", d1, "-a", "grok", "--outcome", "upheld",
+            "--reason", "the caveat is material", expect=0)
+        blocked = self.cli("finalize-digest", candidate1)
+        self.assertNotEqual(blocked.rc, 0)
+        self.assertIn("upheld review dispute", blocked.err)
+
+        h2 = self.full_hypothesis(author="codex")
+        candidate2 = self.cli(
+            "digest", "recommend revised A", "-a", "codex",
+            "--kind", "candidate", "--supersede", h2, expect=0).out
+        self.cli("endorse", candidate2, "-a", "claude", expect=0)
+        d2 = self.cli(
+            "dispute", candidate2, "-a", "grok",
+            "--reason", "possible omission", expect=0).out
+        self.cli(
+            "resolve", d2, "-a", "grok", "--outcome", "withdrawn",
+            "--reason", "the candidate preserves it", expect=0)
+        promoted = self.cli("finalize-digest", candidate2)
+        self.assertEqual(promoted.rc, 0, promoted.err)
+
+    def test_replaced_manifest_constraint_marks_linked_judgment_stale(self):
+        constraint = self.add(
+            "-t", "constraint", "-a", "user", "never deploy to mainnet")
+        h = self.full_hypothesis()
+        candidate = self.cli(
+            "digest", "recommend A on testnet", "-a", "claude",
+            "--kind", "candidate", "--supersede", h,
+            "--ref", constraint, expect=0).out
+        review = self.cli(
+            "endorse", candidate, "-a", "codex", expect=0).out
+        final = self.cli("finalize-digest", candidate, expect=0).out
+        entries = self.log_entries()
+        judgment = next(e for e in entries if e["id"] == final)
+        self.assertEqual(judgment["refs"], [candidate, review, constraint])
+        self.assertEqual(
+            cf.digest_conclusion_class(entries, judgment),
+            "cross-model-consensus")
+
+        self.add(
+            "-t", "constraint", "-a", "user", "mainnet only after audit",
+            "--supersede", constraint, "--rationale", "deployment gate refined")
+        entries = self.log_entries()
+        judgment = next(e for e in entries if e["id"] == final)
+        self.assertEqual(
+            cf.digest_conclusion_class(entries, judgment),
+            "stale-cross-model-consensus")
+        self.assertTrue(any(
+            problem.startswith("STALE-JUDGMENT")
+            and final in problem and constraint in problem
+            for problem in cf.lint_problems(entries)))
+
+    def test_requirement_replaced_before_promotion_blocks_candidate(self):
+        constraint = self.add(
+            "-t", "constraint", "-a", "user", "testnet only")
+        h = self.full_hypothesis()
+        candidate = self.cli(
+            "digest", "recommend testnet", "-a", "claude",
+            "--kind", "candidate", "--supersede", h,
+            "--ref", constraint, expect=0).out
+        self.cli("endorse", candidate, "-a", "codex", expect=0)
+        self.add(
+            "-t", "constraint", "-a", "user", "mainnet after audit",
+            "--supersede", constraint, "--rationale", "gate changed")
+        blocked = self.cli("finalize-digest", candidate)
+        self.assertNotEqual(blocked.rc, 0)
+        self.assertIn("replaced/revoked requirement", blocked.err)
+
+
+class CliProvenanceAndClaimCardTests(CliBase):
+    def test_structured_observation_provenance_round_trips_and_expires(self):
+        r = self.cli(
+            "add", "-t", "observation", "-a", "codex", "API says 42",
+            "--source", "metrics", "--source-type", "api",
+            "--source-uri", "https://example.test/metric",
+            "--accessed-at", "2026-01-01T00:00:00+00:00",
+            "--effective-at", "2025-12-31T00:00:00+00:00",
+            "--expires-at", "2026-01-02T00:00:00+00:00",
+            "--locator", "query=throughput", expect=0)
+        entry = next(e for e in self.log_entries() if e["id"] == r.out)
+        self.assertEqual(entry["source_type"], "api")
+        self.assertEqual(entry["locator"], "query=throughput")
+        problems = cf.lint_problems(
+            self.log_entries(),
+            now=cf.datetime(2026, 1, 3, tzinfo=cf.timezone.utc))
+        self.assertTrue(any(p.startswith("EXPIRED-SOURCE") for p in problems))
+        self.assertIn("query=throughput",
+                      self.cli("resume-context", expect=0).out)
+
+    def test_candidate_makes_incomplete_claim_card_lintable(self):
+        h = self.add("-t", "hypothesis", "-a", "claude", "A wins")
+        self.cli("digest", "recommend A", "-a", "claude",
+                 "--kind", "candidate", "--supersede", h, expect=0)
+        r = self.cli("lint")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("CLAIM-CARD", r.out)
+
+    def test_claim_card_survives_resume_context(self):
+        self.add(
+            "-t", "hypothesis", "-a", "codex", "lower writes reduce failures",
+            "--claim-mode", "causal-inference", "--mechanism", "less state",
+            "--comparator", "current design", "--analysis-layer", "execution",
+            "--falsifier", "same error rate",
+            "--counterfactual", "errors unchanged absent write reduction",
+            "--horizon", "14 days", "--testability", "longitudinal")
+        ctx = self.cli("resume-context", expect=0).out
+        self.assertIn("mechanism: less state", ctx)
+        self.assertIn("falsifier: same error rate", ctx)
+        self.assertIn("counterfactual:", ctx)
+        self.assertIn("testability: longitudinal", ctx)
 
 
 class CliJournalSyncTests(CliBase):
@@ -1227,6 +1490,7 @@ class IdentityAndDiscoveryTests(CliBase):
         self.assertEqual(cf.normalize_author("grok"), "grok")
         self.assertEqual(cf.normalize_author("grok47"), "grok")  # future versions
         self.assertEqual(cf.normalize_author("claude"), "claude")
+        self.assertEqual(cf.normalize_author("claude-resume"), "claude")
 
 
 class BootTests(CliBase):
