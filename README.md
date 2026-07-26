@@ -84,13 +84,24 @@ Python ≥ 3.10, zero dependencies.
 git clone https://github.com/dallonby/casefile
 cd your-project
 python3 /path/to/casefile/casefile.py init
+# or, after the first install:
+casefile upgrade    # pull + PATH symlink + refresh skill/hooks in this project
 ```
 
-`init` is the whole onboarding: it opens a default case named after your
-project and wires the sweep/observe/liveness hooks for **both Claude Code
-and Codex** (same hook scripts — codex-cli's hook wire is Claude-compatible,
-verified against 0.144.5). Open named cases later for distinct
-investigations: `casefile open "intermittent 502s" --goal "find the cause"`.
+`init` onboards a project: default case, hooks for **Claude Code and Codex**,
+and a best-effort `casefile` symlink under `~/.local/bin` or `~/bin`.
+
+**`casefile upgrade`** (run from a project with `.casefile/`, or set
+`CASEFILE_ROOT`) is the cross-machine / launcher command:
+
+1. `git pull --ff-only` of the casefile checkout (optional `--no-pull`)
+2. Install/refresh a `casefile` launcher on PATH (`--bin-dir`, `$CASEFILE_BIN_DIR`)
+3. Rewrite project `SKILL.md`, hooks, and `AGENTS.md` from **this** CLI
+4. Remind you to `export CASEFILE_AUTHOR=…`
+
+Put `casefile upgrade` in agent session launch so porcelain never drifts.
+
+Open named cases: `casefile open "intermittent 502s" --goal "find the cause"`.
 
 ## Dogfooded
 

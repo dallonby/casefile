@@ -545,6 +545,14 @@ def cmd_init(args):
         cid = open_case(root, meta, root.name or "case", None)
         print(f"opened default case: {cid}")
     install_hooks(root, "all")
+    # best-effort: put this CLI on PATH so agents can just run `casefile`
+    try:
+        link = install_cli_symlink(force=False)
+        print(f"cli: {link['action']} {link['path']} → {link['target']}")
+    except SystemExit:
+        raise
+    except Exception as ex:
+        print(f"cli: symlink skipped ({ex})")
 
 
 def open_case(root: Path, meta: dict, title: str, goal: str | None) -> str:
@@ -2517,6 +2525,17 @@ The CLI is `python3 casefile.py <cmd>` from the repo root (or `casefile` if
 installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 **never edit it by hand**; corrections are new entries.
 
+## Keep current (other machines / launch)
+
+```bash
+# in the project that owns .casefile/  (or set CASEFILE_ROOT)
+casefile upgrade
+# = git pull this CLI + symlink onto PATH + hooks install (SKILL.md, AGENTS, hooks)
+```
+
+Put `casefile upgrade` (or `python3 /path/to/casefile.py upgrade`) in agent
+launch scripts so SKILL.md never drifts from the CLI.
+
 ## Identity (do this first — every session, every agent)
 
 **You MUST export your own identity before filing anything:**
@@ -2534,8 +2553,8 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 
 ## Session start
 
-1. `export CASEFILE_AUTHOR=…` (see Identity above).
-2. **Prefer one command:** `python3 casefile.py boot`
+1. `export CASEFILE_AUTHOR=…` (see Identity above). Prefer `casefile upgrade` at launch.
+2. **Prefer one command:** `casefile boot`
    (discovers the store, stamps author, runs `recheck --startup`, prints
    WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD).
    Exit codes: 0 ok, 10 mailbox, 20 drift, 30 abstract stale, **40 identity unset**.
@@ -2688,11 +2707,13 @@ This project keeps its investigation state in an append-only casefile log.
 
 - **Upgrade / keep skill current:** from the project root run
   `casefile upgrade` (git-pulls the casefile checkout, installs a `casefile`
-  symlink on PATH, rewrites SKILL.md + hooks from that CLI).
+  symlink on PATH, rewrites SKILL.md + hooks from that CLI). Put this in
+  agent launch scripts so every session starts on current porcelain.
 - **REQUIRED every session:** `export CASEFILE_AUTHOR=<your-id>` then
-  `casefile boot`. Pick a durable id (e.g. `claude`, `codex`, `grok45`;
-  `fable`→claude). If `whoami` shows author `agent` / `from default`, stop
-  and export first (boot exit 40). Never file as anonymous `agent`.
+  `casefile boot`. Pick a durable id for *this* agent (e.g. `claude`,
+  `codex`, `grok45`; `fable`→claude). If `whoami` shows author `agent` /
+  `from default`, stop and export first (boot exit 40). Never file as
+  anonymous `agent`.
 - Handoff via the log: `packet --to <peer>`, `inbox --for <you>`, `next`.
 - Checkpoint abstracts: `checkpoint` then `recall` for compost search.
 - **After any context compaction or summarization**, re-run `casefile boot`
@@ -2793,6 +2814,215 @@ def install_hooks(root: Path, vendor: str):
 def cmd_hooks(args):
     root, entries, meta = require_root()
     install_hooks(root, args.vendor)
+
+
+# ---------------------------------------------------------- self-install / upgrade
+
+def cli_source_path() -> Path:
+    """Absolute path of this casefile.py (the upgrade/install source of truth)."""
+    return Path(__file__).resolve()
+
+
+def default_bin_dirs() -> list[Path]:
+    """Candidate directories for a user-local `casefile` launcher (first writable wins)."""
+    home = Path.home()
+    return [
+        Path(os.environ["CASEFILE_BIN_DIR"]).expanduser()
+        if os.environ.get("CASEFILE_BIN_DIR") else None,
+        home / ".local" / "bin",
+        home / "bin",
+    ]
+
+
+def resolve_bin_dir(explicit: str | Path | None = None) -> Path:
+    if explicit:
+        d = Path(explicit).expanduser().resolve()
+        d.mkdir(parents=True, exist_ok=True)
+        return d
+    for d in default_bin_dirs():
+        if d is None:
+            continue
+        try:
+            d = d.expanduser()
+            d.mkdir(parents=True, exist_ok=True)
+            # writable probe
+            probe = d / ".casefile-write-probe"
+            probe.write_text("ok")
+            probe.unlink(missing_ok=True)
+            return d.resolve()
+        except OSError:
+            continue
+    die("no writable bin dir — pass --bin-dir or set CASEFILE_BIN_DIR")
+
+
+def install_cli_symlink(bin_dir: Path | None = None, *, force: bool = False) -> dict:
+    """Install a `casefile` launcher that always runs this casefile.py.
+
+    Unix: symlink `bin_dir/casefile` → this file (or a tiny wrapper if the
+    target is not directly executable as a script name). Windows: write a
+    `casefile.cmd` shim that invokes `python casefile.py`.
+    """
+    src = cli_source_path()
+    bdir = resolve_bin_dir(bin_dir)
+    is_win = os.name == "nt"
+    if is_win:
+        link = bdir / "casefile.cmd"
+        body = (
+            f"@echo off\r\n"
+            f"python \"{src}\" %*\r\n"
+        )
+        if link.exists() and not force:
+            old = link.read_text(encoding="utf-8", errors="replace")
+            if old == body:
+                return {"path": str(link), "action": "unchanged", "target": str(src),
+                        "bin_dir": str(bdir)}
+            if "casefile" not in old.lower() and not force:
+                die(f"{link} exists and does not look like a casefile shim "
+                    f"(pass --force-link to overwrite)")
+        link.write_text(body, encoding="utf-8")
+        action = "wrote" if not link.exists() else "updated"
+        return {"path": str(link), "action": action, "target": str(src),
+                "bin_dir": str(bdir)}
+
+    link = bdir / "casefile"
+    if link.exists() or link.is_symlink():
+        if link.is_symlink():
+            cur = link.resolve()
+            if cur == src:
+                return {"path": str(link), "action": "unchanged", "target": str(src),
+                        "bin_dir": str(bdir)}
+            if not force:
+                # replace our own previous symlink; refuse foreign files
+                try:
+                    prev = os.readlink(link)
+                except OSError:
+                    prev = ""
+                if "casefile" not in str(prev) and not force:
+                    die(f"{link} is a symlink to {prev!r}, not casefile "
+                        f"(pass --force-link to replace)")
+            link.unlink()
+        else:
+            # regular file
+            if not force:
+                die(f"{link} exists and is not a symlink "
+                    f"(pass --force-link to replace)")
+            link.unlink()
+    link.symlink_to(src)
+    try:
+        link.chmod(link.stat().st_mode | 0o111)
+    except OSError:
+        pass
+    # ensure source is executable for shebang use
+    try:
+        mode = src.stat().st_mode
+        if not (mode & 0o111):
+            src.chmod(mode | 0o755)
+    except OSError:
+        pass
+    return {"path": str(link), "action": "linked", "target": str(src),
+            "bin_dir": str(bdir)}
+
+
+def git_pull_self(*, ff_only: bool = True) -> dict:
+    """Best-effort `git pull` in the directory that owns this casefile.py."""
+    src = cli_source_path()
+    repo = src.parent
+    if not (repo / ".git").exists() and not (repo / ".git").is_file():
+        return {"ok": False, "skipped": True, "reason": "not a git checkout",
+                "repo": str(repo)}
+    cmd = ["git", "-C", str(repo), "pull"]
+    if ff_only:
+        cmd.append("--ff-only")
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except Exception as ex:
+        return {"ok": False, "skipped": False, "reason": str(ex), "repo": str(repo)}
+    return {
+        "ok": p.returncode == 0,
+        "skipped": False,
+        "repo": str(repo),
+        "rc": p.returncode,
+        "stdout": (p.stdout or "").strip(),
+        "stderr": (p.stderr or "").strip(),
+    }
+
+
+def cmd_upgrade(args):
+    """Refresh this machine: optional git pull, CLI on PATH, project skill/hooks.
+
+    Run from a project with `.casefile/` (or set CASEFILE_ROOT) so SKILL.md /
+    AGENTS / hooks are rewritten from *this* CLI. Safe to put in agent launchers.
+    """
+    report: dict = {"cli": str(cli_source_path())}
+
+    do_reexec = not getattr(args, "no_reexec", False)
+    if not getattr(args, "no_pull", False):
+        pull = git_pull_self(ff_only=True)
+        report["pull"] = pull
+        if pull.get("skipped"):
+            print(f"pull: skipped ({pull.get('reason')}) repo={pull.get('repo')}")
+        elif pull.get("ok"):
+            out = pull.get("stdout") or "ok"
+            print(f"pull: {out}")
+            # re-exec if the file on disk may have changed under us
+            already = ("Already up to date" in out) or ("Already up-to-date" in out)
+            if do_reexec and not already and out and out != "ok":
+                print("pull: code updated — re-running upgrade with new CLI…")
+                new = [sys.executable, str(cli_source_path()), "upgrade",
+                       "--no-pull", "--no-reexec"]
+                if getattr(args, "bin_dir", None):
+                    new += ["--bin-dir", str(args.bin_dir)]
+                if getattr(args, "force_link", False):
+                    new.append("--force-link")
+                if getattr(args, "no_hooks", False):
+                    new.append("--no-hooks")
+                if getattr(args, "vendor", None) and args.vendor != "all":
+                    new += ["--vendor", args.vendor]
+                if getattr(args, "author", None):
+                    new += ["-a", args.author]
+                os.execv(sys.executable, new)
+        else:
+            print(f"pull: FAILED rc={pull.get('rc')}\n"
+                  f"{pull.get('stderr') or pull.get('stdout')}", file=sys.stderr)
+            if not getattr(args, "ignore_pull_fail", False):
+                die("git pull failed (pass --ignore-pull-fail to continue)")
+
+    link = install_cli_symlink(
+        Path(args.bin_dir) if getattr(args, "bin_dir", None) else None,
+        force=getattr(args, "force_link", False))
+    report["symlink"] = link
+    print(f"cli: {link['action']} {link['path']} → {link['target']}")
+    print(f"cli: ensure PATH includes {link['bin_dir']} "
+          f"(e.g. export PATH=\"{link['bin_dir']}:$PATH\")")
+
+    root = find_root()
+    if root is None:
+        print("hooks: no .casefile here or in parents "
+              f"(cd into a project or set {ENV_ROOT}, then re-run upgrade)")
+        report["hooks"] = None
+    elif getattr(args, "no_hooks", False):
+        print("hooks: skipped (--no-hooks)")
+        report["hooks"] = "skipped"
+    else:
+        vendor = getattr(args, "vendor", None) or "all"
+        print(f"hooks: installing vendor={vendor} into {root}")
+        install_hooks(root, vendor)
+        report["hooks"] = {"root": str(root), "vendor": vendor}
+
+    author, asource = resolve_author(getattr(args, "author", None))
+    report["author"] = author
+    report["author_source"] = asource
+    print(f"identity: {author} (from {asource})")
+    for line in identity_mandate(author, asource):
+        print(line)
+    if asource == "default":
+        print(f"hint: export {ENV_AUTHOR}=claude|codex|grok45|fable before boot")
+
+    if getattr(args, "json", False):
+        print(json.dumps(report, indent=2))
+
+    if asource == "default":
+        sys.exit(EXIT_IDENTITY)
 
 
 # ------------------------------------------------------------ tmux UI (§14)
@@ -3124,6 +3354,28 @@ def main():
     s.add_argument("action", choices=["install"])
     s.add_argument("vendor", choices=["claude-code", "codex", "all"])
     s.set_defaults(fn=cmd_hooks)
+
+    s = sub.add_parser(
+        "upgrade",
+        help="git-pull this CLI, install PATH symlink, refresh project skill/hooks")
+    s.add_argument("--no-pull", action="store_true",
+                   help="skip git pull of the casefile checkout")
+    s.add_argument("--ignore-pull-fail", action="store_true",
+                   help="continue if git pull fails")
+    s.add_argument("--no-reexec", action="store_true",
+                   help="do not re-exec after a successful pull (testing)")
+    s.add_argument("--no-hooks", action="store_true",
+                   help="only update CLI link; do not rewrite project skill/hooks")
+    s.add_argument("--bin-dir",
+                   help="directory for the casefile launcher "
+                        f"(default: $CASEFILE_BIN_DIR, else ~/.local/bin, else ~/bin)")
+    s.add_argument("--force-link", action="store_true",
+                   help="replace an existing non-casefile file at the link path")
+    s.add_argument("--vendor", choices=["claude-code", "codex", "all"], default="all",
+                   help="which vendor hooks to refresh (default all)")
+    s.add_argument("-a", "--author", help="session author for identity reminder")
+    s.add_argument("--json", action="store_true", help="also print a JSON report")
+    s.set_defaults(fn=cmd_upgrade)
 
     s = sub.add_parser("channel", help="switch the ui viewport (state | <model> | list)")
     s.add_argument("name", nargs="?", default="list")

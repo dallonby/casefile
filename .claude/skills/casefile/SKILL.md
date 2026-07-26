@@ -9,6 +9,17 @@ The CLI is `python3 casefile.py <cmd>` from the repo root (or `casefile` if
 installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 **never edit it by hand**; corrections are new entries.
 
+## Keep current (other machines / launch)
+
+```bash
+# in the project that owns .casefile/  (or set CASEFILE_ROOT)
+casefile upgrade
+# = git pull this CLI + symlink onto PATH + hooks install (SKILL.md, AGENTS, hooks)
+```
+
+Put `casefile upgrade` (or `python3 /path/to/casefile.py upgrade`) in agent
+launch scripts so SKILL.md never drifts from the CLI.
+
 ## Identity (do this first — every session, every agent)
 
 **You MUST export your own identity before filing anything:**
@@ -26,8 +37,8 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 
 ## Session start
 
-1. `export CASEFILE_AUTHOR=…` (see Identity above).
-2. **Prefer one command:** `python3 casefile.py boot`
+1. `export CASEFILE_AUTHOR=…` (see Identity above). Prefer `casefile upgrade` at launch.
+2. **Prefer one command:** `casefile boot`
    (discovers the store, stamps author, runs `recheck --startup`, prints
    WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD).
    Exit codes: 0 ok, 10 mailbox, 20 drift, 30 abstract stale, **40 identity unset**.

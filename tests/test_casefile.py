@@ -1365,6 +1365,64 @@ class UnitPorcelainHelpers(unittest.TestCase):
         self.assertFalse(st["present"])
 
 
+class UpgradeAndSymlinkTests(CliBase):
+    """casefile upgrade: PATH launcher + refresh skill/hooks from this CLI."""
+
+    def test_install_cli_symlink_and_idempotent(self):
+        bindir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(bindir, ignore_errors=True))
+        r1 = cf.install_cli_symlink(bindir, force=False)
+        self.assertEqual(r1["action"], "linked")
+        link = Path(r1["path"])
+        self.assertTrue(link.is_symlink() or link.exists())
+        self.assertEqual(link.resolve(), cf.cli_source_path())
+        r2 = cf.install_cli_symlink(bindir, force=False)
+        self.assertEqual(r2["action"], "unchanged")
+        # launcher runs boot --help via the symlink
+        p = subprocess.run([str(link), "boot", "--help"],
+                           capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        helptext = (p.stdout + p.stderr).lower()
+        self.assertIn("skip-recheck", helptext)
+        self.assertIn("casefile_author", helptext)
+
+    def test_upgrade_refreshes_skill_and_link(self):
+        bindir = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(bindir, ignore_errors=True))
+        skill = self.dir / ".claude" / "skills" / "casefile" / "SKILL.md"
+        skill.parent.mkdir(parents=True, exist_ok=True)
+        skill.write_text("STALE SKILL CONTENT\n")
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home"),
+               "CASEFILE_AUTHOR": "claude", "CASEFILE_BIN_DIR": str(bindir)}
+        p = subprocess.run(
+            [sys.executable, str(CASEFILE), "upgrade", "--no-pull", "--no-reexec",
+             "--bin-dir", str(bindir)],
+            cwd=self.dir, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertIn("cli:", p.stdout)
+        self.assertIn("hooks:", p.stdout)
+        body = skill.read_text()
+        self.assertNotIn("STALE SKILL CONTENT", body)
+        self.assertIn("CASEFILE_AUTHOR", body)
+        link = bindir / "casefile"
+        self.assertTrue(link.exists())
+        self.assertEqual(link.resolve(), CASEFILE.resolve())
+
+    def test_upgrade_without_project_still_links(self):
+        bindir = Path(tempfile.mkdtemp())
+        empty = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(bindir, ignore_errors=True))
+        self.addCleanup(lambda: __import__("shutil").rmtree(empty, ignore_errors=True))
+        env = {**os.environ, "CASEFILE_AUTHOR": "claude"}
+        env.pop("CASEFILE_ROOT", None)
+        p = subprocess.run(
+            [sys.executable, str(CASEFILE), "upgrade", "--no-pull", "--no-hooks",
+             "--bin-dir", str(bindir)],
+            cwd=empty, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr + p.stdout)
+        self.assertTrue((bindir / "casefile").exists())
+
+
 class IdentityMandateTests(CliBase):
     """Every agent must be told to export CASEFILE_AUTHOR."""
 
