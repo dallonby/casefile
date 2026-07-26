@@ -18,11 +18,12 @@ entry ids in the GIF match the committed `demo/fixture/.casefile/log.jsonl`.
 ## Play / regenerate
 
 ```bash
-# rebuild cast from scenes.json (~58s cinematic pacing)
+# rebuild cast from scenes.json (fast user prompts + ≥10s end hold)
 python3 demo/build_cast.py
 
-# render frontpage GIF
-agg --cols 100 --rows 30 --font-size 14 \
+# render frontpage GIF — idle-time-limit must exceed the 10s loop hold
+# (agg defaults to 5s and would clamp the pause otherwise)
+agg --cols 100 --rows 30 --font-size 14 --idle-time-limit 15 \
   demo/casefile-continuity.cast demo/casefile-continuity.gif
 
 # optional: play the cast

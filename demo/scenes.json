@@ -51,38 +51,24 @@
     "No code changed. Fresh model: casefile boot."
   ],
   "user_grok": "where are we on the free shipping bug?",
-  "grok_think": "empty chat — booting from the casefile…",
+  "grok_think": "no chat history — reading the casefile…",
   "grok_tools": [
     [
-      "$ export CASEFILE_AUTHOR=grok && casefile boot",
+      "$ casefile boot",
       [
-        "=== WHERE ===",
-        "active case: free-shipping-threshold",
-        "goal: find root cause of free-shipping mismatch with marketing",
-        "=== BRIEF ===",
-        "STATUS: leading theory is shipping_for compares tax-inclusive",
-        "  amount against the $500 threshold … (verified; id 5fbd68af)",
-        "constraints:",
-        "  Investigation only; do not fix the storefront yet.",
-        "=== NEXT ===",
-        "1. casefile packet --to codex -a grok"
-      ]
-    ],
-    [
-      "$ casefile inbox --for grok",
-      [
-        "inbox for grok: 1 item",
-        "  ffd85dd7 [note] from codex — PACKET for grok"
+        "(read log · 1 verified claim · packet from codex)"
       ]
     ]
   ],
   "grok_reply": [
-    "Open case: free-shipping-threshold — free-shipping vs marketing.",
-    "Root cause (verified): hyp 5fbd68af — shipping_for uses tax-inclusive",
-    "  total vs $500, not merchandise subtotal.",
-    "Constraint: investigation only — do not fix yet.",
-    "Do not re-investigate: claim already verified. No need to re-run tests.",
-    "Next: packet back to codex when ready to act on the fix."
+    "Synopsis — already on the log, no need to re-debug:",
+    "",
+    "  Free shipping is wrong because we compare the tax-inclusive total",
+    "  to the $500 threshold. A $480 cart + tax looks like $518, so it",
+    "  ships free even though marketing means $500 of merchandise.",
+    "",
+    "  Codex verified that (hyp 5fbd68af). Investigation only — don't fix yet.",
+    "  I didn't re-run the tests; the casefile already has the answer."
   ],
   "_source": {
     "codex_thread": "019f9fb9-1e78-7b83-90d1-3facb7baaa50",

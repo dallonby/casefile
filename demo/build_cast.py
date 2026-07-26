@@ -9,12 +9,14 @@ Story (agents run casefile — the user never types it):
   4. User: "where are we on the free shipping bug?"
   5. Grok casefile boots and already knows the verified root cause.
 
-Timings are cinematic (slow user prompts, brief agent tools, long pauses
-on the model switch). Scene text is derived from a real `codex exec` +
-`grok -p` run against demo/fixture/ (see demo/scenes.json).
+Timings: quick user prompts, brief agent tools, a long beat on the model
+switch, and ≥10s hold on the final frame so the GIF loop can be read.
+Scene text is from a real `codex exec` + `grok -p` run on demo/fixture/
+(see demo/scenes.json).
 
   python3 demo/build_cast.py
-  agg --cols 100 --rows 30 --font-size 14 \\
+  # idle-time-limit must exceed END_HOLD_S or agg clamps the loop pause
+  agg --cols 100 --rows 30 --font-size 14 --idle-time-limit 15 \\
     demo/casefile-continuity.cast demo/casefile-continuity.gif
 """
 from __future__ import annotations
@@ -25,8 +27,13 @@ from pathlib import Path
 
 OUT_DIR = Path(__file__).resolve().parent
 WIDTH, HEIGHT = 100, 30
-# ~55–65s feels watchable on a README; slow prompts + long switch beat.
-TARGET_S = 58.0
+# Content target (before the final loop-hold). Keep readable, not draggy.
+CONTENT_S = 48.0
+# Hold the last frame so readers finish the punchline before loop restarts.
+END_HOLD_S = 10.0
+# User prompt typing speed (chars/sec). High on purpose: content is later
+# scaled to CONTENT_S, which would otherwise stretch a "natural" type rate.
+USER_CPS = 90.0
 
 # ANSI
 DIM = "\x1b[2m"
@@ -87,32 +94,21 @@ DEFAULT_SCENES = {
         "No code changed. Fresh model: casefile boot.",
     ],
     "user_grok": "where are we on the free shipping bug?",
-    "grok_think": "empty chat — booting from the casefile…",
+    "grok_think": "no chat history — reading the casefile…",
     "grok_tools": [
-        ("$ export CASEFILE_AUTHOR=grok && casefile boot", [
-            "=== WHERE ===",
-            "active case: free-shipping-threshold",
-            "goal: find root cause of free-shipping mismatch with marketing",
-            "=== BRIEF ===",
-            "STATUS: leading theory is shipping_for compares tax-inclusive",
-            "  amount against the $500 threshold … (verified; id 5fbd68af)",
-            "constraints:",
-            "  Investigation only; do not fix the storefront yet.",
-            "=== NEXT ===",
-            "1. casefile packet --to codex -a grok",
-        ]),
-        ("$ casefile inbox --for grok", [
-            "inbox for grok: 1 item",
-            "  ffd85dd7 [note] from codex — PACKET for grok",
+        ("$ casefile boot", [
+            "(read log · 1 verified claim · packet from codex)",
         ]),
     ],
     "grok_reply": [
-        "Open case: free-shipping-threshold — free-shipping vs marketing.",
-        "Root cause (verified): hyp 5fbd68af — shipping_for uses tax-inclusive",
-        "  total vs $500, not merchandise subtotal.",
-        "Constraint: investigation only — do not fix yet.",
-        "Do not re-investigate: claim already verified. No need to re-run tests.",
-        "Next: packet back to codex when ready to act on the fix.",
+        "Synopsis — already on the log, no need to re-debug:",
+        "",
+        "  Free shipping is wrong because we compare the tax-inclusive total",
+        "  to the $500 threshold. A $480 cart + tax looks like $518, so it",
+        "  ships free even though marketing means $500 of merchandise.",
+        "",
+        "  Codex verified that (hyp 5fbd68af). Investigation only — don't fix yet.",
+        "  I didn't re-run the tests; the casefile already has the answer.",
     ],
 }
 
@@ -132,12 +128,12 @@ class Cast:
     def line(self, s: str = "", after: float = 0.04) -> None:
         self.out(s + "\r\n", after=after)
 
-    def type_text(self, text: str, cps: float = 18.0) -> None:
-        """Type text at ~cps characters/sec (user prompts: slow)."""
+    def type_text(self, text: str, cps: float = USER_CPS) -> None:
+        """Type text at ~cps characters/sec (user prompts: snappy)."""
         delay = 1.0 / max(cps, 1.0)
         for ch in text:
             if ch == "\n":
-                self.out("\r\n", after=delay * 2.5)
+                self.out("\r\n", after=delay * 1.5)
             else:
                 self.out(ch, after=delay)
 
@@ -158,16 +154,14 @@ class Cast:
         self.line(f"{BOLD}{color}╰────────────────────────────────────────────────────────────╯{RST}", after=0.12)
 
     def user_prompt(self, text: str) -> None:
-        self.line(f"{BOLD}{BLU}▸ you{RST}", after=0.15)
-        self.pause(0.55)  # beat before the human types
-        # indent each line of the prompt
+        self.line(f"{BOLD}{BLU}▸ you{RST}", after=0.1)
+        self.pause(0.25)  # short beat, then type quickly
         lines = text.split("\n")
         for i, ln in enumerate(lines):
-            prefix = "  "
-            self.out(prefix)
-            self.type_text(ln, cps=16.0)
-            self.out("\r\n", after=0.12 if i < len(lines) - 1 else 0.35)
-        self.pause(0.7)  # hold after user message before agent moves
+            self.out("  ")
+            self.type_text(ln, cps=USER_CPS)
+            self.out("\r\n", after=0.06 if i < len(lines) - 1 else 0.15)
+        self.pause(0.4)  # hold after user message before agent moves
 
     def think(self, text: str, color: str) -> None:
         # brief dim thought — intentionally short
@@ -185,7 +179,10 @@ class Cast:
         self.line(f"{BOLD}{color}▸ {name}{RST}", after=0.18)
         self.pause(0.3)
         for ln in lines:
-            self.line(f"  {ln}", after=0.09)
+            if ln == "":
+                self.line("", after=0.06)
+            else:
+                self.line(f"  {ln}", after=0.1)
         self.pause(0.55)
 
 
@@ -211,23 +208,28 @@ def build() -> None:
     c.agent_say(sc["codex_reply"], MAG, "codex")
     c.pause(1.0)
 
-    # ── SWITCH ─────────────────────────────────────────────
+    # ── SWITCH (make the handoff unmissable) ───────────────
+    c.pause(0.6)
+    c.clear()
     c.line()
-    c.line(f"{BOLD}{YEL}  ✦ context reset{RST}", after=0.15)
-    c.line(f"{DIM}    close codex · empty chat · same repo · log still on disk{RST}", after=0.12)
-    c.pause(1.6)  # long beat on the switch — this is the product moment
-    c.line(f"{DIM}    open grok…{RST}", after=0.2)
-    c.pause(1.0)
+    c.line(f"{BOLD}{YEL}{'═' * 72}{RST}", after=0.08)
+    c.line(f"{BOLD}{YEL}  CONTEXT RESET{RST}", after=0.12)
+    c.line(f"{YEL}  close Codex · wipe the chat · same repo on disk{RST}", after=0.1)
+    c.line()
+    c.line(f"{BOLD}{GRN}  >>>  NOW OPENING GROK  <<<{RST}", after=0.15)
+    c.line(f"{DIM}{GRN}  (new model · empty context · casefile is the only memory){RST}", after=0.1)
+    c.line(f"{BOLD}{YEL}{'═' * 72}{RST}", after=0.1)
+    c.pause(1.8)  # product moment: sit on the switch
 
     # ── GROK ───────────────────────────────────────────────
     c.agent_hdr("grok", GRN)
-    c.pause(0.85)
+    c.pause(0.7)
     c.user_prompt(sc["user_grok"])
     c.think(sc["grok_think"], GRN)
     for cmd, out_lines in sc["grok_tools"]:
         c.tool(cmd, out_lines, GRN)
     c.agent_say(sc["grok_reply"], GRN, "grok")
-    c.pause(0.8)
+    c.pause(0.9)
 
     # ── coda ───────────────────────────────────────────────
     c.line()
@@ -236,15 +238,20 @@ def build() -> None:
         f"— grades + abstract + packet; no shared chat required{RST}",
         after=0.15,
     )
-    c.pause(1.4)
+    c.pause(0.8)
 
-    # scale to TARGET_S
+    # Scale content only, then append a hard end-hold so the GIF loop
+    # parks on the punchline (≥ END_HOLD_S). agg --idle-time-limit must
+    # be > END_HOLD_S or the renderer will clamp this pause.
     if c.events:
         end = c.events[-1][0]
         if end > 0.05:
-            scale = TARGET_S / end
+            scale = CONTENT_S / end
             for ev in c.events:
                 ev[0] = round(ev[0] * scale, 4)
+        last_t = c.events[-1][0]
+        # zero-width space keeps the frame alive without changing the screen
+        c.events.append([round(last_t + END_HOLD_S, 4), "o", "\x1b[0m"])
 
     header = {
         "version": 2,
@@ -253,6 +260,7 @@ def build() -> None:
         "timestamp": int(time.time()),
         "env": {"TERM": "xterm-256color", "SHELL": "/bin/bash"},
         "title": "casefile — codex files · grok resumes after context reset",
+        "idle_time_limit": END_HOLD_S + 2,
     }
     cast_path = OUT_DIR / "casefile-continuity.cast"
     with cast_path.open("w") as f:
@@ -261,8 +269,12 @@ def build() -> None:
             f.write(json.dumps(ev) + "\n")
 
     dur = c.events[-1][0] if c.events else 0
+    content = dur - END_HOLD_S if c.events else 0
     print(f"wrote {cast_path}")
-    print(f"duration≈{dur:.1f}s events={len(c.events)} target={TARGET_S}s")
+    print(
+        f"duration≈{dur:.1f}s (content≈{content:.1f}s + hold={END_HOLD_S:.0f}s) "
+        f"events={len(c.events)}"
+    )
 
 
 if __name__ == "__main__":
