@@ -1,0 +1,95 @@
+{
+  "user_codex": "Support keeps saying free shipping is wrong on checkout-demo.\nFind the root cause — don't fix yet. Use the casefile.",
+  "codex_think": "reproducing the failing shipping test…",
+  "codex_tools": [
+    [
+      "$ python3 test_shipping.py",
+      [
+        "PASS test_under_threshold_pays_shipping",
+        "PASS test_exactly_500_free_shipping_intended",
+        "FAIL test_480_should_still_pay_shipping_per_marketing:",
+        "  BUG: $480 merch got shipping=0.0  total=518.4"
+      ]
+    ],
+    [
+      "$ casefile open \"free shipping threshold\" --goal \"find root cause…\"",
+      [
+        "opened free-shipping-threshold"
+      ]
+    ],
+    [
+      "$ casefile add -t hypothesis -a codex --body-stdin <<'EOF'",
+      [
+        "… shipping_for compares tax-inclusive amount vs $500 merch threshold",
+        "recorded: 5fbd68af"
+      ]
+    ],
+    [
+      "$ casefile add -t observation -a codex --source test_shipping.py …",
+      [
+        "recorded: 11188444  [ground-truth]"
+      ]
+    ],
+    [
+      "$ casefile verify 5fbd68af 11188444 -a codex",
+      [
+        "verified 5fbd68af ← 11188444"
+      ]
+    ],
+    [
+      "$ casefile checkpoint -a codex && casefile packet --to grok -a codex",
+      [
+        "checkpoint abstract b6232838",
+        "recorded: packet note ffd85dd7 → grok"
+      ]
+    ]
+  ],
+  "codex_reply": [
+    "Root cause: shipping_for compares tax-inclusive total, not merch subtotal.",
+    "Evidence: $480 + $38.40 tax incorrectly yields $0 shipping; test fails.",
+    "Filed hyp 5fbd68af (verified) · obs 11188444 · packet → grok.",
+    "No code changed. Fresh model: casefile boot."
+  ],
+  "user_grok": "where are we on the free shipping bug?",
+  "grok_think": "empty chat — booting from the casefile…",
+  "grok_tools": [
+    [
+      "$ export CASEFILE_AUTHOR=grok && casefile boot",
+      [
+        "=== WHERE ===",
+        "active case: free-shipping-threshold",
+        "goal: find root cause of free-shipping mismatch with marketing",
+        "=== BRIEF ===",
+        "STATUS: leading theory is shipping_for compares tax-inclusive",
+        "  amount against the $500 threshold … (verified; id 5fbd68af)",
+        "constraints:",
+        "  Investigation only; do not fix the storefront yet.",
+        "=== NEXT ===",
+        "1. casefile packet --to codex -a grok"
+      ]
+    ],
+    [
+      "$ casefile inbox --for grok",
+      [
+        "inbox for grok: 1 item",
+        "  ffd85dd7 [note] from codex — PACKET for grok"
+      ]
+    ]
+  ],
+  "grok_reply": [
+    "Open case: free-shipping-threshold — free-shipping vs marketing.",
+    "Root cause (verified): hyp 5fbd68af — shipping_for uses tax-inclusive",
+    "  total vs $500, not merchandise subtotal.",
+    "Constraint: investigation only — do not fix yet.",
+    "Do not re-investigate: claim already verified. No need to re-run tests.",
+    "Next: packet back to codex when ready to act on the fix."
+  ],
+  "_source": {
+    "codex_thread": "019f9fb9-1e78-7b83-90d1-3facb7baaa50",
+    "hyp": "5fbd68af",
+    "obs": "11188444",
+    "verify": "bdd09180",
+    "packet": "ffd85dd7",
+    "note": "Transcript text condensed from a real codex exec + grok -p run on demo/fixture. Agent commands and casefile ids are real; timing is cinematic."
+  }
+}

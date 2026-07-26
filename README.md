@@ -12,14 +12,15 @@ resets, session crashes, and model swaps.
 <p align="center">
   <img
     src="demo/casefile-continuity.gif"
-    alt="15s demo: codex hands off via casefile packet; after a context reset, grok boots from the log and continues"
+    alt="Codex investigates a free-shipping bug and files findings to casefile; after a context reset, Grok boots and already knows the verified root cause"
     width="860"
   />
   <br />
   <sub>
-    ~15s multi-model handoff: codex → packet → context reset → grok boot.
-    Cast source: <a href="demo/casefile-continuity.cast"><code>demo/casefile-continuity.cast</code></a>
-    (<code>asciinema play</code>).
+    Real agents, same repo: <b>codex</b> files a verified root cause → context reset →
+    <b>grok</b> already knows via <code>casefile boot</code> (user never types casefile).
+    <a href="demo/"><code>demo/</code></a> ·
+    <a href="demo/casefile-continuity.cast">cast</a>
   </sub>
 </p>
 
