@@ -618,10 +618,35 @@ def make_entry(entries, case, type_, author, body, refs=None, **extra):
 
 # ----------------------------------------------------------------- commands
 
+def _ensure_casefile_tracked_in_git(root: Path) -> None:
+    """SPEC §5.1: the log belongs in git. Remove a blanket `.casefile/` ignore
+    from the project .gitignore if a previous policy added one. Leave an
+    optional comment so operators know derived state is ignored inside
+    `.casefile/.gitignore` instead."""
+    pgi = root / ".gitignore"
+    if not pgi.exists():
+        return
+    lines = pgi.read_text().splitlines()
+    kept = []
+    removed = False
+    for line in lines:
+        stripped = line.strip()
+        if stripped in (".casefile/", ".casefile", "**/.casefile/"):
+            removed = True
+            continue
+        kept.append(line)
+    if removed:
+        text = "\n".join(kept)
+        if text and not text.endswith("\n"):
+            text += "\n"
+        pgi.write_text(text)
+        print("updated: .gitignore (removed .casefile/ — log tracks in git per SPEC §5.1)")
+
+
 def cmd_init(args):
-    """One command onboards a project (user decision f5cee4f6/e0dfa650):
-    create .casefile, open a default case named after the directory, and
-    wire hooks for every supported vendor. Idempotent — safe to re-run."""
+    """One command onboards a project: create .casefile, open a default case
+    named after the directory, and wire hooks for every supported vendor.
+    Idempotent — safe to re-run."""
     root = Path.cwd()
     d = root / DIR
     if d.exists():
@@ -633,15 +658,21 @@ def cmd_init(args):
                          "cases": {}})
         (d / LOG).touch()
         gi = d / ".gitignore"
-        gi.write_text("index.db\ntranscripts/\nlog.lock\nui/\nactive\nstate/\ncli\njournals\n")
+        # SPEC §5.1: log/meta ride in git; ignore only derived/local state
+        gi.write_text(
+            "index.db\n"
+            "transcripts/\n"
+            "log.lock\n"
+            "ui/\n"
+            "active\n"
+            "state/\n"
+            "cli\n"
+            "journals\n"
+        )
         print(f"initialized casefile in {d}")
-    # the log is local state, never repo content (constraint dfae9509):
-    # make the project's own .gitignore enforce that on fresh projects too
-    pgi = root / ".gitignore"
-    lines = pgi.read_text().splitlines() if pgi.exists() else []
-    if ".casefile/" not in lines:
-        pgi.write_text("\n".join(lines + [".casefile/"]) + "\n")
-        print("updated: .gitignore (+.casefile/)")
+    # Rollback prior local-only policy: do not gitignore the whole store.
+    # Cross-machine continuity requires log.jsonl + meta.json in the repo.
+    _ensure_casefile_tracked_in_git(root)
     meta = load_meta(root)
     if not meta.get("cases"):
         cid = open_case(root, meta, root.name or "case", None)
@@ -3519,6 +3550,10 @@ def cmd_upgrade(args):
     AGENTS / hooks are rewritten from *this* CLI. Safe to put in agent launchers.
     """
     report: dict = {"cli": str(cli_source_path())}
+    # Always repair project git policy when upgrading an existing case store
+    root_early = find_root()
+    if root_early is not None:
+        _ensure_casefile_tracked_in_git(root_early)
 
     do_reexec = not getattr(args, "no_reexec", False)
     if not getattr(args, "no_pull", False):
@@ -3751,8 +3786,19 @@ def cmd_ui(args):
     print("casefile ui window created")
 
 
+def _require_spitball():
+    """Spitball is an optional companion module (vendor CLI transports).
+    Core casefile (log/grades/boot/recheck) does not depend on it."""
+    try:
+        import spitball  # noqa: F401
+        return spitball
+    except ImportError as ex:
+        die("spitball addon not available (spitball.py missing next to "
+            f"casefile.py): {ex}")
+
+
 def cmd_spitball(args):
-    import spitball
+    spitball = _require_spitball()
     models = tuple(m.strip() for m in args.models.split(",") if m.strip())
     if len(models) != 2:
         die("spitball needs exactly two models (--models a,b)")
@@ -3772,7 +3818,7 @@ def cmd_spitball(args):
 
 
 def cmd_spitball_recover(args):
-    import spitball
+    spitball = _require_spitball()
     spitball.recover(
         args.session, turns=args.turns, budget_usd=args.budget_usd,
         fake_script=args.fake_script)
@@ -3780,8 +3826,9 @@ def cmd_spitball_recover(args):
 
 def cmd_talk(args):
     """§11.2: humans direct casefile by talking. A REPL over one continuous
-    headless concierge session, seeded with the skill + resume-context."""
-    import spitball
+    headless concierge session, seeded with the skill + resume-context.
+    Uses the optional spitball adapter layer for the concierge transport."""
+    spitball = _require_spitball()
     root, entries, meta = require_root()
     adapter = spitball.make_adapter("claude", root,
                                     Path(args.fake_script) if args.fake_script else None)

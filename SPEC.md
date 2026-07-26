@@ -143,8 +143,11 @@ Language: **Python ≥3.10, stdlib only** for plumbing and driver (`subprocess`,
 dependencies is a feature: the tool must run anywhere a model can shell out.
 
 Repo discovery: git-style — walk upward from cwd for `.casefile/`.
-Everything under `.casefile/` except `index.db` and `transcripts/` belongs in
-git (provide a starter `.gitignore`).
+**The investigation log rides in git** (cross-machine continuity). Everything
+under `.casefile/` except derived/local state (`index.db`, `transcripts/`,
+`log.lock`, `ui/`, `active`, `state/`, `cli`, `journals`) belongs in git —
+starter ignore list lives in `.casefile/.gitignore`, **not** a blanket
+`.casefile/` entry in the project root `.gitignore`.
 
 ## 5. Data model
 
@@ -216,16 +219,20 @@ Rules enforced at append time:
 
 For a `hypothesis`, first match wins:
 
-1. `disputed` — has ≥1 open dispute (dispute with no resolution).
-2. `verified` — referenced by a verification whose refs include ≥1 observation.
-3. `consensus` — endorsed by ≥1 author ≠ its own author.
-4. `hypothesis` — default.
+1. `refuted` — a dispute against it was resolved with `outcome: upheld`
+   (ruled out; appears on the ruled-out list, not the live differential).
+2. `disputed` — has ≥1 open dispute (dispute with no resolution).
+3. `verified` — referenced by a verification whose refs include ≥1 observation.
+4. `consensus` — endorsed by ≥1 author ≠ its own author.
+5. `hypothesis` — default.
 
 Other grades: `observation` → `ground-truth`; user-authored
 `decision`/`constraint` → `stated`; model-authored `decision`/`constraint` →
 `asserted` (rendered as "asserted, not user-confirmed"). A revoked
 constraint/decision is grade `revoked` and drops from compiled views (but
-its revocation is shown in `dig`).
+its revocation is shown in `dig`). A decision closed by
+`resolution --outcome fulfilled` is grade `fulfilled` (work shipped;
+digestible under the evidence-chain invariant).
 
 Provenance phrases (P5) for compiled views:
 
@@ -235,8 +242,10 @@ ground-truth→ "[<source>] observation"
 verified    → "verified against ground truth"
 consensus   → "cross-model consensus — NOT independently verified"
 disputed    → "UNDER ACTIVE DISPUTE"
+refuted     → "refuted"
 hypothesis  → "an unverified hypothesis"
 asserted    → "asserted, not user-confirmed"
+fulfilled   → "fulfilled — shipped and observed; digestible"
 ```
 
 ## 6. Distillation

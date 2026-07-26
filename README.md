@@ -58,14 +58,19 @@ python3 "$HOME/.local/share/casefile/casefile.py" init
 Native PowerShell can run the core Python CLI, but WSL is currently required
 for the generated Claude Code, Codex, and Grok-compatible shell hooks.
 
-`init` creates the local, gitignored `.casefile/` store and a default case;
-installs agent instructions and hooks; and creates a `casefile` launcher in
-`~/.local/bin`. Restart the agent after initialization so it loads the new
-hooks. Codex asks you to trust them through `/hooks`; Grok uses
-`/hooks-trust`.
+`init` creates `.casefile/` (log + meta **tracked in git** for cross-machine
+continuity; only derived state is ignored via `.casefile/.gitignore`), opens
+a default case, installs agent instructions and hooks, and creates a
+`casefile` launcher in `~/.local/bin`. Restart the agent after initialization
+so it loads the new hooks. Codex asks you to trust them through `/hooks`;
+Grok uses `/hooks-trust`.
 
-The generated `AGENTS.md` bootstrap handles agent identity and first boot;
-no manual environment exports are part of installation.
+**Core vs spitball.** The log half (`boot`, grades, recheck, recall, lint,
+packet) is durable and vendor-neutral. **Spitball** (multi-model
+deliberation driver) is an optional companion module in `spitball.py` —
+vendor CLI transports (Claude, Codex, Grok) that break on CLI upgrades.
+Core does not import spitball except when you invoke `spitball` /
+`spitball-recover` / `talk`.
 
 ## What a boot looks like
 
@@ -230,11 +235,11 @@ authoritative design document.
 
 ## Status
 
-Working core (M1–M6 + multi-agent porcelain): log + grades, boot, whoami,
-packet/inbox/next, checkpoint/recall, resume-context, recheck, hooks for
-Claude Code, Codex, and Grok, import, spitball driver, tmux viewport.
-Roadmap: config.toml, mid-turn interjection routing. Expect sharp edges.
+Working **core** (log + grades, boot, whoami, packet/inbox/next, checkpoint,
+recall, recheck, lint, hooks, import). Optional **spitball** companion
+(multi-model deliberation over Claude/Codex/Grok CLIs). Roadmap: config.toml,
+stronger verification binding. Expect sharp edges.
 
 ## License
 
-[GPL-3.0](LICENSE).
+[MIT](LICENSE).
