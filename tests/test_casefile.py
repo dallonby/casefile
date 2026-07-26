@@ -1362,5 +1362,51 @@ class UnitPorcelainHelpers(unittest.TestCase):
         self.assertFalse(st["present"])
 
 
+class AuthorIdentityCoherenceTests(CliBase):
+    """Skeptic: aliases must apply at write boundary and peer detection."""
+
+    def test_add_normalizes_fable_to_claude_on_write(self):
+        hid = self.add("-t", "hypothesis", "-a", "fable", "alias identity")
+        e = next(x for x in self.log_entries() if x["id"] == hid)
+        self.assertEqual(e["author"], "claude")
+
+    def test_fable_cannot_self_endorse_as_claude(self):
+        # hyp filed as fable is stored as claude; endorse -a claude is self
+        hid = self.add("-t", "hypothesis", "-a", "fable", "same person")
+        r = self.cli("endorse", hid, "-a", "claude")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("self-endorsement", r.err)
+        # also endorse -a fable (normalized) rejected
+        r2 = self.cli("endorse", hid, "-a", "fable")
+        self.assertNotEqual(r2.rc, 0)
+        # foreign author still works
+        self.cli("endorse", hid, "-a", "codex", expect=0)
+        grades = cf.compute_grades(self.log_entries())
+        self.assertEqual(grades[hid], "consensus")
+
+    def test_legacy_fable_hyp_endorsed_by_claude_not_consensus(self):
+        # Pre-normalization log row still compares via normalize_author
+        es = [
+            E("h1", "hypothesis", author="fable", body="old row"),
+            E("e1", "endorsement", author="claude", refs=["h1"], body="x"),
+        ]
+        self.assertEqual(cf.compute_grades(es)["h1"], "hypothesis")
+        # true foreign still promotes
+        es2 = es + [E("e2", "endorsement", author="codex", refs=["h1"], body="y")]
+        self.assertEqual(cf.compute_grades(es2)["h1"], "consensus")
+
+    def test_next_does_not_packet_to_own_alias(self):
+        self.add("-t", "hypothesis", "-a", "fable", "only my claim")
+        # session author claude (canonical of fable) — only self in log
+        r = self.cli("next", "-a", "claude", expect=0)
+        self.assertNotIn("packet --to fable", r.out)
+        self.assertNotIn("packet --to claude", r.out)
+        # with a real peer present, packet targets the peer not self
+        self.add("-t", "hypothesis", "-a", "codex", "peer claim")
+        r2 = self.cli("next", "-a", "fable", expect=0)  # resolves session via -a
+        self.assertIn("packet --to codex", r2.out)
+        self.assertNotIn("packet --to fable", r2.out)
+
+
 if __name__ == "__main__":
     unittest.main()

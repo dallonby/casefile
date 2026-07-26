@@ -337,9 +337,11 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
         if e["type"] == "endorsement":
             for r in e.get("refs", []):
                 t = by_id.get(r)
-                # casefold: pre-normalization logs may hold 'Codex' and 'codex'
-                if t and e["author"].casefold() != t["author"].casefold():
-                    endorsements.setdefault(r, set()).add(e["author"].casefold())
+                # Aliases (fable→claude) + casefold so 'Codex'/'codex' match
+                if t and normalize_author(e["author"]).casefold() != \
+                        normalize_author(t["author"]).casefold():
+                    endorsements.setdefault(r, set()).add(
+                        normalize_author(e["author"]).casefold())
 
     grades: dict[str, str] = {}
     for e in entries:
@@ -363,7 +365,7 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
                 grades[eid] = "revoked"
             elif eid in fulfilled:
                 grades[eid] = "fulfilled"
-            elif e["author"] == "user":
+            elif normalize_author(e["author"]) == "user":
                 grades[eid] = "stated"
             else:
                 grades[eid] = "asserted"
@@ -615,7 +617,7 @@ def _target(entries, eid):
 def cmd_endorse(args):
     root, entries, meta = require_root()
     t = _target(entries, args.entry)
-    if t["author"] == args.author:
+    if normalize_author(t["author"]) == normalize_author(args.author):
         die("self-endorsement carries no weight; get another author")
     e = make_entry(entries, t["case"], "endorsement", args.author,
                    args.comment or f"endorses {args.entry}", refs=[args.entry])
@@ -1802,14 +1804,19 @@ def suggest_next_actions(entries: list[dict], meta: dict, case: str,
                     f"casefile verify {h['id']} <obs> -a {author}")
             if len(actions) >= 12:
                 break
-    # peer packet opportunity
-    others = sorted({e["author"] for e in ce
-                     if e["author"] not in (author, "user", "system")})
-    if others and not any(e["type"] == "note" and e.get("to") in others
-                          and e["author"] == author
-                          for e in ce[-30:]):
+    # peer packet opportunity — compare canonical authors so fable≠peer of claude
+    session = normalize_author(author)
+    others = sorted({
+        normalize_author(e["author"]) for e in ce
+        if normalize_author(e["author"]) not in (session, "user", "system")
+    })
+    if others and not any(
+            e["type"] == "note"
+            and normalize_author(str(e.get("to") or "")) in others
+            and normalize_author(e["author"]) == session
+            for e in ce[-30:]):
         actions.append(
-            f"casefile packet --to {others[0]} -a {author}   "
+            f"casefile packet --to {others[0]} -a {session}   "
             f"# hand off brief+open claims via the log")
     if not actions:
         actions.append(
@@ -2006,21 +2013,22 @@ def build_packet(entries: list[dict], meta: dict, case: str,
         lines.append(f"(no abstract) {freshness['reason']}")
     lines += ["", "OPEN CLAIMS (need your eyes):"]
     any_claim = False
+    peer_n = normalize_author(peer)
     for e in ce:
         if e["type"] != "hypothesis":
             continue
         g = grades.get(e["id"], "hypothesis")
         if g in ("refuted",):
             continue
-        if e["author"] == peer:
+        if normalize_author(e["author"]) == peer_n:
             continue
         any_claim = True
         lines.append(
             f"- `{e['id']}` [{PHRASE.get(g, g)}] ({e['author']}) {e['body'][:160]}")
-        if g in ("hypothesis", "consensus") and e["author"] != peer:
+        if g in ("hypothesis", "consensus"):
             lines.append(
-                f"    → consider: casefile endorse {e['id']} -a {peer}  "
-                f"OR casefile dispute {e['id']} -a {peer} --reason '…'")
+                f"    → consider: casefile endorse {e['id']} -a {peer_n}  "
+                f"OR casefile dispute {e['id']} -a {peer_n} --reason '…'")
     if not any_claim:
         lines.append("- (none)")
     lines += ["", "MAILBOX / QUESTIONS for you:"]
