@@ -26,10 +26,11 @@ resets, session crashes, and model swaps.
 
 ## Installation
 
-casefile requires **Git** and **Python 3.10 or newer**. Core is stdlib-only;
-optional shared **Postgres** multi-writer needs `psycopg2`. Clone the CLI once
-somewhere permanent, then run `init` from every project that should keep a
-casefile.
+casefile requires **Git** and **Python 3.10 or newer**. Core is stdlib-only.
+Optional shared **Postgres** multi-writer needs `psycopg2`; `casefile init`
+and `casefile upgrade` install `psycopg2-binary` automatically when missing.
+Clone the CLI once somewhere permanent, then run `init` from every project
+that should keep a casefile.
 
 ### Identity (no `export` required)
 

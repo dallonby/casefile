@@ -305,6 +305,35 @@ def pg_namespace(root: Path) -> str:
     return name
 
 
+def ensure_psycopg2_installed() -> str:
+    """Make sure ``psycopg2`` is importable; install ``psycopg2-binary`` if not.
+
+    Called from ``init`` / ``upgrade`` so postgres persistence works without a
+    manual pip step. Returns ``ok``, ``installed``, or ``failed:…``.
+    """
+    try:
+        import psycopg2  # type: ignore  # noqa: F401
+        return "ok"
+    except ImportError:
+        pass
+    cmd = [sys.executable, "-m", "pip", "install", "psycopg2-binary"]
+    try:
+        p = subprocess.run(
+            cmd, capture_output=True, text=True, check=False,
+        )
+    except OSError as ex:
+        return f"failed: could not run pip ({ex})"
+    if p.returncode != 0:
+        err = (p.stderr or p.stdout or "").strip().splitlines()
+        tail = err[-1] if err else f"pip exit {p.returncode}"
+        return f"failed: {tail}"
+    try:
+        import psycopg2  # type: ignore  # noqa: F401
+        return "installed"
+    except ImportError:
+        return "failed: pip reported success but import still fails"
+
+
 def _pg_connect():
     ensure_dotenv_loaded()
     url = (os.environ.get(ENV_POSTGRES_URL) or "").strip()
@@ -313,8 +342,12 @@ def _pg_connect():
     try:
         import psycopg2  # type: ignore
     except ImportError:
-        die("psycopg2 is required for postgres persistence "
-            "(pip install psycopg2-binary)")
+        # Last chance: init/upgrade should already have installed this.
+        status = ensure_psycopg2_installed()
+        if status.startswith("failed"):
+            die("psycopg2 is required for postgres persistence — "
+                f"run `casefile upgrade` or `casefile init` ({status})")
+        import psycopg2  # type: ignore
     try:
         return psycopg2.connect(url)
     except Exception as ex:
@@ -999,6 +1032,14 @@ def cmd_init(args):
         raise
     except Exception as ex:
         print(f"cli: symlink skipped ({ex})")
+    dep = ensure_psycopg2_installed()
+    if dep == "ok":
+        print("deps: psycopg2 already available (postgres persistence)")
+    elif dep == "installed":
+        print("deps: installed psycopg2-binary (postgres persistence)")
+    else:
+        print(f"deps: psycopg2-binary not installed ({dep}); "
+              "postgres mode will fail until fixed", file=sys.stderr)
 
 
 def open_case(root: Path, meta: dict, title: str, goal: str | None) -> str:
@@ -3960,6 +4001,16 @@ def cmd_upgrade(args):
     print(f"cli: {link['action']} {link['path']} → {link['target']}")
     print(f"cli: ensure PATH includes {link['bin_dir']} "
           f"(e.g. export PATH=\"{link['bin_dir']}:$PATH\")")
+
+    dep = ensure_psycopg2_installed()
+    report["psycopg2"] = dep
+    if dep == "ok":
+        print("deps: psycopg2 already available (postgres persistence)")
+    elif dep == "installed":
+        print("deps: installed psycopg2-binary (postgres persistence)")
+    else:
+        print(f"deps: psycopg2-binary not installed ({dep}); "
+              "postgres mode will fail until fixed", file=sys.stderr)
 
     root = find_root()
     if root is None:
