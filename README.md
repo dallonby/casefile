@@ -9,6 +9,87 @@ that yesterday" evaporates. casefile is a tiny, stdlib-only tool that gives
 an investigation a durable, structured memory — one that survives context
 resets, session crashes, and model swaps.
 
+## Installation
+
+casefile requires **Git** and **Python 3.10 or newer**. It has no third-party
+Python dependencies. Clone the CLI once somewhere permanent, then run `init`
+from every project that should keep a casefile.
+
+### macOS
+
+In Terminal:
+
+```bash
+mkdir -p "$HOME/.local/share"
+git clone https://github.com/dallonby/casefile.git \
+  "$HOME/.local/share/casefile"
+cd /path/to/your-project
+python3 "$HOME/.local/share/casefile/casefile.py" init
+
+export PATH="$HOME/.local/bin:$PATH"
+export CASEFILE_AUTHOR=codex  # use claude or grok when running those agents
+casefile boot
+```
+
+Add the `PATH` export to `~/.zshrc` (or your shell's startup file) to make
+the launcher available in future terminals.
+
+### Linux
+
+In a shell:
+
+```bash
+mkdir -p "$HOME/.local/share"
+git clone https://github.com/dallonby/casefile.git \
+  "$HOME/.local/share/casefile"
+cd /path/to/your-project
+python3 "$HOME/.local/share/casefile/casefile.py" init
+
+export PATH="$HOME/.local/bin:$PATH"
+export CASEFILE_AUTHOR=codex  # use claude or grok when running those agents
+casefile boot
+```
+
+Add the `PATH` export to `~/.bashrc`, `~/.zshrc`, or the startup file for
+your shell.
+
+### Windows
+
+Use **WSL** for the complete CLI and hook integration. If WSL is not
+installed, run `wsl --install` once from an Administrator PowerShell,
+restart if prompted, then run these commands inside the WSL terminal:
+
+```bash
+sudo apt update
+sudo apt install -y git python3
+mkdir -p "$HOME/.local/share"
+git clone https://github.com/dallonby/casefile.git \
+  "$HOME/.local/share/casefile"
+cd /mnt/c/path/to/your-project
+python3 "$HOME/.local/share/casefile/casefile.py" init
+
+export PATH="$HOME/.local/bin:$PATH"
+export CASEFILE_AUTHOR=codex  # use claude or grok when running those agents
+casefile boot
+```
+
+Add the `PATH` export to `~/.bashrc` inside WSL. Native PowerShell can run
+the core Python CLI, but WSL is currently required for the generated
+Claude Code, Codex, and Grok-compatible shell hooks.
+
+`init` creates the local, gitignored `.casefile/` store and a default case;
+installs agent instructions and hooks; and creates a `casefile` launcher in
+`~/.local/bin`. Restart the agent after initialization so it loads the new
+hooks. Codex asks you to trust them through `/hooks`; Grok uses
+`/hooks-trust`.
+
+Set `CASEFILE_AUTHOR` in every agent's launch environment: `claude`,
+`codex`, or `grok`. On a brand-new empty case, `casefile boot` may exit with
+status 30 to signal that no rolling checkpoint exists yet; that is not an
+installation failure.
+
+## What a boot looks like
+
 ```
 $ export CASEFILE_AUTHOR=claude
 $ casefile boot
@@ -143,20 +224,13 @@ the positional swallowing ambiguity of their legacy variadic counterparts.
 Constraints can be corrected by the same authority with `--supersede` plus a
 reason; decisions still use explicit revoke/replace semantics.
 
-## Install
+## Upgrade and maintenance
 
-Python ≥ 3.10, zero dependencies.
+Run this later from any initialized project:
 
+```bash
+casefile upgrade
 ```
-git clone https://github.com/dallonby/casefile
-cd your-project
-python3 /path/to/casefile/casefile.py init
-# or, after the first install:
-casefile upgrade    # pull + PATH symlink + refresh skill/hooks in this project
-```
-
-`init` onboards a project: default case, hooks for **Claude Code and Codex**,
-and a best-effort `casefile` symlink under `~/.local/bin` or `~/bin`.
 
 **`casefile upgrade`** (run from a project with `.casefile/`, or set
 `CASEFILE_ROOT`) is the cross-machine / launcher command:
@@ -181,8 +255,8 @@ authoritative design document.
 
 Working core (M1–M6 + multi-agent porcelain): log + grades, boot, whoami,
 packet/inbox/next, checkpoint/recall, resume-context, recheck, hooks for
-Claude Code and Codex, import, spitball driver, tmux viewport. Roadmap:
-config.toml, mid-turn interjection routing. Expect sharp edges.
+Claude Code, Codex, and Grok, import, spitball driver, tmux viewport.
+Roadmap: config.toml, mid-turn interjection routing. Expect sharp edges.
 
 ## License
 
