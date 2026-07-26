@@ -9,7 +9,7 @@ This project keeps its investigation state in an append-only casefile log.
   this in agent launch scripts so every session starts on current porcelain.
 - **REQUIRED every session:** `export CASEFILE_AUTHOR=<your-id>` then
   `python3 casefile.py boot`. Pick a durable id for *this* agent (e.g.
-  `claude`, `codex`, `grok45`; `fable`→claude). If `whoami` shows author
+  `claude`, `codex`, `grok`; `fable`→claude, `grok45`→grok). If `whoami` shows author
   `agent` / `from default`, stop and export first (boot exit 40). Never file
   as anonymous `agent`.
 - Handoff via the log: `python3 casefile.py packet --to <peer>`,

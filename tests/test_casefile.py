@@ -1222,8 +1222,10 @@ class IdentityAndDiscoveryTests(CliBase):
         self.assertEqual(cf.normalize_author("anthropic"), "claude")
         self.assertEqual(cf.normalize_author("fable"), "claude")  # Anthropic model, not a persona
         self.assertEqual(cf.normalize_author("sonnet"), "claude")
-        self.assertEqual(cf.normalize_author("xai"), "grok45")
-        self.assertEqual(cf.normalize_author("grok45"), "grok45")
+        self.assertEqual(cf.normalize_author("xai"), "grok")
+        self.assertEqual(cf.normalize_author("grok45"), "grok")
+        self.assertEqual(cf.normalize_author("grok"), "grok")
+        self.assertEqual(cf.normalize_author("grok47"), "grok")  # future versions
         self.assertEqual(cf.normalize_author("claude"), "claude")
 
 

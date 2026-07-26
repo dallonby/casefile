@@ -27,7 +27,7 @@ in agent launch scripts so SKILL.md never drifts from the CLI.
 ```bash
 export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias here)
 # export CASEFILE_AUTHOR=codex   # OpenAI / Codex
-# export CASEFILE_AUTHOR=grok45  # xAI / Grok
+# export CASEFILE_AUTHOR=grok    # xAI (grok45/grok4/… alias here)
 ```
 
 - Run `python3 casefile.py whoami` — if it says `from default` / author `agent`,

@@ -59,12 +59,13 @@ AUTHOR_ALIASES = {
     "opus": "claude",
     "haiku": "claude",
     "fable": "claude",
-    # xAI models → "grok45"
-    "grok-4": "grok45",
-    "grok4": "grok45",
-    "grok-4.5": "grok45",
-    "grok": "grok45",
-    "xai": "grok45",
+    # xAI models → family author "grok" (not a version pin like grok45)
+    "xai": "grok",
+    "grok-4": "grok",
+    "grok4": "grok",
+    "grok-4.5": "grok",
+    "grok45": "grok",
+    "grok-45": "grok",
 }
 
 ENTRY_TYPES = {
@@ -119,10 +120,20 @@ def die(msg: str, code: int = 1):
 
 
 def normalize_author(author: str) -> str:
+    """Map model/vendor nicknames to a stable family author id.
+
+    xAI versions (grok45, grok-47, …) all collapse to ``grok`` so a future
+    model is not pinned under an older version name.
+    """
     a = (author or "").strip().lower()
     if not a:
         return a
-    return AUTHOR_ALIASES.get(a, a)
+    if a in AUTHOR_ALIASES:
+        return AUTHOR_ALIASES[a]
+    # unlisted versioned xAI ids: grok47, grok-5, grok5.2 → grok
+    if a.startswith("grok") and a != "grok":
+        return "grok"
+    return a
 
 
 def resolve_author(explicit: str | None = None) -> tuple[str, str]:
@@ -426,8 +437,8 @@ def identity_mandate(author: str | None = None, source: str | None = None) -> li
     lines = [
         f"REQUIRED: export {ENV_AUTHOR}=<your-identity> before filing claims.",
         f"  Examples: {ENV_AUTHOR}=claude  |  {ENV_AUTHOR}=codex  |  "
-        f"{ENV_AUTHOR}=grok45  |  {ENV_AUTHOR}=fable",
-        f"  (aliases: fable/sonnet/opus→claude, grok/xai→grok45, gpt→codex)",
+        f"{ENV_AUTHOR}=grok  |  {ENV_AUTHOR}=fable",
+        f"  (aliases: fable/sonnet/opus→claude, grok45/xai→grok, gpt→codex)",
         f"  Then: casefile boot   OR pass -a {claimed} on every write.",
         "  User words only with -a user. Never leave identity as default `agent`.",
     ]
@@ -1978,7 +1989,7 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
         entries, meta, case, author, freshness, drift=recheck["drifted"])
     if author_source == "default":
         next_actions = [
-            f"export {ENV_AUTHOR}=claude|codex|grok45|fable   "
+            f"export {ENV_AUTHOR}=claude|codex|grok|fable   "
             f"# REQUIRED before any add/endorse/packet",
             f"casefile whoami   # confirm author is not default `agent`",
         ] + next_actions
@@ -2499,7 +2510,7 @@ def main():
         id_line = f"CASEFILE_AUTHOR={author} (ok)"
     else:
         id_line = ("CASEFILE_AUTHOR unset — export CASEFILE_AUTHOR="
-                   "claude|codex|grok45|fable before filing "
+                   "claude|codex|grok|fable before filing "
                    "(run: casefile whoami && casefile boot)")
     print(json.dumps({"systemMessage":
                       f"casefile: {active} — {len(parsed)} entries, "
@@ -2543,7 +2554,7 @@ in agent launch scripts so SKILL.md never drifts from the CLI.
 ```bash
 export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias here)
 # export CASEFILE_AUTHOR=codex   # OpenAI / Codex
-# export CASEFILE_AUTHOR=grok45  # xAI / Grok
+# export CASEFILE_AUTHOR=grok    # xAI (grok45/grok4/… alias here)
 ```
 
 - Run `python3 casefile.py whoami` — if it says `from default` / author `agent`,
@@ -2714,7 +2725,7 @@ This project keeps its investigation state in an append-only casefile log.
   this in agent launch scripts so every session starts on current porcelain.
 - **REQUIRED every session:** `export CASEFILE_AUTHOR=<your-id>` then
   `python3 casefile.py boot`. Pick a durable id for *this* agent (e.g.
-  `claude`, `codex`, `grok45`; `fable`→claude). If `whoami` shows author
+  `claude`, `codex`, `grok`; `fable`→claude, `grok45`→grok). If `whoami` shows author
   `agent` / `from default`, stop and export first (boot exit 40). Never file
   as anonymous `agent`.
 - Handoff via the log: `python3 casefile.py packet --to <peer>`,
@@ -3022,7 +3033,7 @@ def cmd_upgrade(args):
     for line in identity_mandate(author, asource):
         print(line)
     if asource == "default":
-        print(f"hint: export {ENV_AUTHOR}=claude|codex|grok45|fable before boot")
+        print(f"hint: export {ENV_AUTHOR}=claude|codex|grok|fable before boot")
 
     if getattr(args, "json", False):
         print(json.dumps(report, indent=2))
