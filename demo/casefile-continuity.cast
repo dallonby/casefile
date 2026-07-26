@@ -1,4 +1,4 @@
-{"version": 2, "width": 100, "height": 30, "timestamp": 1785091552, "env": {"TERM": "xterm-256color", "SHELL": "/bin/bash"}, "title": "casefile \u2014 codex files \u00b7 grok resumes after context reset", "idle_time_limit": 12.0}
+{"version": 2, "width": 100, "height": 30, "timestamp": 1785091868, "env": {"TERM": "xterm-256color", "SHELL": "/bin/bash"}, "title": "casefile \u2014 codex files \u00b7 grok resumes after context reset", "idle_time_limit": 17.0}
 [0.2729, "o", "\u001b[2J\u001b[H"]
 [0.3865, "o", "\u001b[1m\u001b[36m\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u001b[0m\r\n"]
 [0.523, "o", "\u001b[1m\u001b[36m  casefile \u2014 multi-model continuity\u001b[0m\r\n"]
@@ -219,4 +219,4 @@
 [44.3847, "o", "    I didn't re-run the tests; the casefile already has the answer.\r\n"]
 [47.909, "o", "\r\n"]
 [48.0, "o", "\u001b[1m\u001b[36m  \u2713 survived the reset\u001b[0m\u001b[2m  \u2014 grades + abstract + packet; no shared chat required\u001b[0m\r\n"]
-[58.0, "o", "\u001b[0m"]
+[63.0, "o", "\u001b[0m"]

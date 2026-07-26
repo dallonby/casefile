@@ -18,17 +18,17 @@ entry ids in the GIF match the committed `demo/fixture/.casefile/log.jsonl`.
 ## Play / regenerate
 
 ```bash
-# rebuild cast from scenes.json (fast user prompts + ≥10s end hold)
-python3 demo/build_cast.py
-
-# render frontpage GIF — idle-time-limit must exceed the 10s loop hold
-# (agg defaults to 5s and would clamp the pause otherwise)
-agg --cols 100 --rows 30 --font-size 14 --idle-time-limit 15 \
-  demo/casefile-continuity.cast demo/casefile-continuity.gif
+# one-shot: cast + GIF + last-frame pad (15s loop hold)
+bash demo/render.sh
 
 # optional: play the cast
 asciinema play demo/casefile-continuity.cast
 ```
+
+`agg` clamps long idle gaps (~3s even with a high `--idle-time-limit`), so
+`render.sh` patches the **last GIF frame delay** to 15s after render. That is
+what actually parks the README loop on the punchline.
+
 
 ## Re-run the live agents (optional)
 

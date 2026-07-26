@@ -10,18 +10,22 @@ Story (agents run casefile — the user never types it):
   5. Grok casefile boots and already knows the verified root cause.
 
 Timings: quick user prompts, brief agent tools, a long beat on the model
-switch, and ≥10s hold on the final frame so the GIF loop can be read.
+switch, and a long hold on the final frame so the GIF loop can be read.
 Scene text is from a real `codex exec` + `grok -p` run on demo/fixture/
 (see demo/scenes.json).
 
+  bash demo/render.sh
+  # or manually:
   python3 demo/build_cast.py
-  # idle-time-limit must exceed END_HOLD_S or agg clamps the loop pause
-  agg --cols 100 --rows 30 --font-size 14 --idle-time-limit 15 \\
+  agg --cols 100 --rows 30 --font-size 14 --idle-time-limit 30 \\
     demo/casefile-continuity.cast demo/casefile-continuity.gif
+  python3 demo/build_cast.py --pad-gif   # GIF hack: force last-frame delay
 """
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -29,8 +33,11 @@ OUT_DIR = Path(__file__).resolve().parent
 WIDTH, HEIGHT = 100, 30
 # Content target (before the final loop-hold). Keep readable, not draggy.
 CONTENT_S = 48.0
-# Hold the last frame so readers finish the punchline before loop restarts.
-END_HOLD_S = 10.0
+# Desired park time on the punchline before the GIF loops.
+# agg clamps long idle gaps (~3s in practice), so the cast hold alone is not
+# enough — pad_gif_last_frame() rewrites the last frame's Graphic Control
+# Extension delay after render.
+END_HOLD_S = 15.0
 # User prompt typing speed (chars/sec). High on purpose: content is later
 # scaled to CONTENT_S, which would otherwise stretch a "natural" type rate.
 USER_CPS = 90.0
@@ -277,8 +284,55 @@ def build() -> None:
     )
 
 
+def pad_gif_last_frame(gif_path: Path, hold_s: float = END_HOLD_S) -> None:
+    """Force the last GIF frame to display for hold_s seconds.
+
+    asciinema/agg drops long idle gaps (often to ~3s even with a high
+    --idle-time-limit), so the cast-level END_HOLD_S never makes it into
+    the GIF. Patching the last Graphic Control Extension delay is the
+    reliable loop-pause hack for GitHub README embeds.
+    """
+    data = bytearray(gif_path.read_bytes())
+    # GCE: 21 F9 04 <packed> <delay_lo> <delay_hi> <trans> 00
+    positions: list[int] = []
+    i = 0
+    while True:
+        j = data.find(b"\x21\xf9\x04", i)
+        if j < 0:
+            break
+        positions.append(j)
+        i = j + 1
+    if not positions:
+        raise SystemExit(f"no GIF Graphic Control Extensions in {gif_path}")
+    delay_cs = max(1, min(int(round(hold_s * 100)), 65535))
+    j = positions[-1]
+    old = data[j + 4] | (data[j + 5] << 8)
+    data[j + 4] = delay_cs & 0xFF
+    data[j + 5] = (delay_cs >> 8) & 0xFF
+    gif_path.write_bytes(data)
+    print(
+        f"padded {gif_path.name}: last-frame delay "
+        f"{old / 100:.2f}s → {delay_cs / 100:.2f}s"
+    )
+
+
 if __name__ == "__main__":
-    # ensure scenes.json exists (seed from DEFAULT if missing)
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument(
+        "--pad-gif",
+        action="store_true",
+        help=f"only pad last frame of casefile-continuity.gif to {END_HOLD_S:.0f}s",
+    )
+    ap.add_argument(
+        "--hold",
+        type=float,
+        default=END_HOLD_S,
+        help=f"seconds to park on final GIF frame (default {END_HOLD_S})",
+    )
+    args = ap.parse_args()
+    if args.pad_gif:
+        pad_gif_last_frame(OUT_DIR / "casefile-continuity.gif", hold_s=args.hold)
+        sys.exit(0)
     scenes_path = OUT_DIR / "scenes.json"
     if not scenes_path.exists():
         scenes_path.write_text(json.dumps(DEFAULT_SCENES, indent=2) + "\n")
