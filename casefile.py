@@ -2529,12 +2529,12 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 
 ```bash
 # in the project that owns .casefile/  (or set CASEFILE_ROOT)
-casefile upgrade
+python3 casefile.py upgrade
 # = git pull this CLI + symlink onto PATH + hooks install (SKILL.md, AGENTS, hooks)
 ```
 
-Put `casefile upgrade` (or `python3 /path/to/casefile.py upgrade`) in agent
-launch scripts so SKILL.md never drifts from the CLI.
+After upgrade, `casefile` on PATH works too. Put `python3 casefile.py upgrade`
+in agent launch scripts so SKILL.md never drifts from the CLI.
 
 ## Identity (do this first — every session, every agent)
 
@@ -2546,24 +2546,27 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 # export CASEFILE_AUTHOR=grok45  # xAI / Grok
 ```
 
-- Run `casefile whoami` — if it says `from default` / author `agent`, **stop and export**.
+- Run `python3 casefile.py whoami` — if it says `from default` / author `agent`,
+  **stop and export**.
 - Boot exit code **40** means identity unset. Grades, endorse/dispute, and packets
   depend on a real author; anonymous `agent` is not multi-agent safe.
 - Always pass the same identity via `-a $CASEFILE_AUTHOR` on writes if env cannot stick.
 
 ## Session start
 
-1. `export CASEFILE_AUTHOR=…` (see Identity above). Prefer `casefile upgrade` at launch.
-2. **Prefer one command:** `casefile boot`
+1. `export CASEFILE_AUTHOR=…` (see Identity above). Prefer
+   `python3 casefile.py upgrade` at launch.
+2. **Prefer one command:** `python3 casefile.py boot`
    (discovers the store, stamps author, runs `recheck --startup`, prints
    WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD).
    Exit codes: 0 ok, 10 mailbox, 20 drift, 30 abstract stale, **40 identity unset**.
    Act on NEXT; surface mailbox once, don't block.
 3. Legacy equivalent: `resume-context` then `recheck --startup` then `status`.
    Ground truth beats the notes where they conflict.
-4. Multi-agent handoff (no shared chat): `packet --to <peer>`, peer runs
-   `inbox --for <self>` + `boot`. Checkpoint with `checkpoint` before long
-   gaps so `recall` sees the distilled problem.
+4. Multi-agent handoff (no shared chat): `python3 casefile.py packet --to <peer>`,
+   peer runs `inbox --for <self>` + `boot`. Checkpoint with
+   `python3 casefile.py checkpoint` before long gaps so `recall` sees the
+   distilled problem.
 
 ## Filing conventions (types and authors matter — grades are computed from them)
 
@@ -2706,21 +2709,24 @@ AGENTS_SNIPPET = """\
 This project keeps its investigation state in an append-only casefile log.
 
 - **Upgrade / keep skill current:** from the project root run
-  `casefile upgrade` (git-pulls the casefile checkout, installs a `casefile`
-  symlink on PATH, rewrites SKILL.md + hooks from that CLI). Put this in
-  agent launch scripts so every session starts on current porcelain.
+  `python3 casefile.py upgrade` (git-pulls the casefile checkout, installs a
+  `casefile` symlink on PATH, rewrites SKILL.md + hooks from that CLI). Put
+  this in agent launch scripts so every session starts on current porcelain.
 - **REQUIRED every session:** `export CASEFILE_AUTHOR=<your-id>` then
-  `casefile boot`. Pick a durable id for *this* agent (e.g. `claude`,
-  `codex`, `grok45`; `fable`→claude). If `whoami` shows author `agent` /
-  `from default`, stop and export first (boot exit 40). Never file as
-  anonymous `agent`.
-- Handoff via the log: `packet --to <peer>`, `inbox --for <you>`, `next`.
-- Checkpoint abstracts: `checkpoint` then `recall` for compost search.
-- **After any context compaction or summarization**, re-run `casefile boot`
-  (or `resume-context`) before acting. The log outranks compacted summary.
+  `python3 casefile.py boot`. Pick a durable id for *this* agent (e.g.
+  `claude`, `codex`, `grok45`; `fable`→claude). If `whoami` shows author
+  `agent` / `from default`, stop and export first (boot exit 40). Never file
+  as anonymous `agent`.
+- Handoff via the log: `python3 casefile.py packet --to <peer>`,
+  `inbox --for <you>`, `next`.
+- Checkpoint abstracts: `python3 casefile.py checkpoint` then `recall`.
+- **After any context compaction or summarization**, re-run
+  `python3 casefile.py boot` (or `resume-context`) before acting. The log
+  outranks compacted summary.
 - **Before filing a decision or changing an agreed plan**, run
-  `casefile dig "<topic>"` (and `recall`) and cite what you find in `--refs`.
-  Decisions carry `--rationale` and `--rejected` for losing options.
+  `python3 casefile.py dig "<topic>"` (and `recall`) and cite what you find
+  in `--refs`. Decisions carry `--rationale` and `--rejected` for losing
+  options.
 - **Echo every entry you file** as one line in your visible reply —
   `recorded: decision "…" (user)` — your own filings included.
 - File hypotheses, decisions, observations, and questions as you work —

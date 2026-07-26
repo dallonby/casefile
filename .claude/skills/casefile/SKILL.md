@@ -13,12 +13,12 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 
 ```bash
 # in the project that owns .casefile/  (or set CASEFILE_ROOT)
-casefile upgrade
+python3 casefile.py upgrade
 # = git pull this CLI + symlink onto PATH + hooks install (SKILL.md, AGENTS, hooks)
 ```
 
-Put `casefile upgrade` (or `python3 /path/to/casefile.py upgrade`) in agent
-launch scripts so SKILL.md never drifts from the CLI.
+After upgrade, `casefile` on PATH works too. Put `python3 casefile.py upgrade`
+in agent launch scripts so SKILL.md never drifts from the CLI.
 
 ## Identity (do this first — every session, every agent)
 
@@ -30,24 +30,27 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 # export CASEFILE_AUTHOR=grok45  # xAI / Grok
 ```
 
-- Run `casefile whoami` — if it says `from default` / author `agent`, **stop and export**.
+- Run `python3 casefile.py whoami` — if it says `from default` / author `agent`,
+  **stop and export**.
 - Boot exit code **40** means identity unset. Grades, endorse/dispute, and packets
   depend on a real author; anonymous `agent` is not multi-agent safe.
 - Always pass the same identity via `-a $CASEFILE_AUTHOR` on writes if env cannot stick.
 
 ## Session start
 
-1. `export CASEFILE_AUTHOR=…` (see Identity above). Prefer `casefile upgrade` at launch.
-2. **Prefer one command:** `casefile boot`
+1. `export CASEFILE_AUTHOR=…` (see Identity above). Prefer
+   `python3 casefile.py upgrade` at launch.
+2. **Prefer one command:** `python3 casefile.py boot`
    (discovers the store, stamps author, runs `recheck --startup`, prints
    WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD).
    Exit codes: 0 ok, 10 mailbox, 20 drift, 30 abstract stale, **40 identity unset**.
    Act on NEXT; surface mailbox once, don't block.
 3. Legacy equivalent: `resume-context` then `recheck --startup` then `status`.
    Ground truth beats the notes where they conflict.
-4. Multi-agent handoff (no shared chat): `packet --to <peer>`, peer runs
-   `inbox --for <self>` + `boot`. Checkpoint with `checkpoint` before long
-   gaps so `recall` sees the distilled problem.
+4. Multi-agent handoff (no shared chat): `python3 casefile.py packet --to <peer>`,
+   peer runs `inbox --for <self>` + `boot`. Checkpoint with
+   `python3 casefile.py checkpoint` before long gaps so `recall` sees the
+   distilled problem.
 
 ## Filing conventions (types and authors matter — grades are computed from them)
 
