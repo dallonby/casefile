@@ -2,12 +2,23 @@
 
 Duration target: **15s**. Generated from real CLI output.
 
+Frontpage embed: `demo/casefile-continuity.gif` (rendered with
+[agg](https://github.com/asciinema/agg) from the cast).
+
 ## Play
 
 ```bash
 asciinema play demo/casefile-continuity.cast
 # or upload:
 asciinema upload demo/casefile-continuity.cast
+```
+
+Regenerate GIF after rebuilding the cast:
+
+```bash
+python3 demo/build_cast.py
+agg --cols 100 --rows 28 --font-size 14 \
+  demo/casefile-continuity.cast demo/casefile-continuity.gif
 ```
 
 ## Storyboard

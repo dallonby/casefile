@@ -9,6 +9,20 @@ that yesterday" evaporates. casefile is a tiny, stdlib-only tool that gives
 an investigation a durable, structured memory — one that survives context
 resets, session crashes, and model swaps.
 
+<p align="center">
+  <img
+    src="demo/casefile-continuity.gif"
+    alt="15s demo: codex hands off via casefile packet; after a context reset, grok boots from the log and continues"
+    width="860"
+  />
+  <br />
+  <sub>
+    ~15s multi-model handoff: codex → packet → context reset → grok boot.
+    Cast source: <a href="demo/casefile-continuity.cast"><code>demo/casefile-continuity.cast</code></a>
+    (<code>asciinema play</code>).
+  </sub>
+</p>
+
 ## Installation
 
 casefile requires **Git** and **Python 3.10 or newer**. It has no third-party
