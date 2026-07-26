@@ -9,12 +9,22 @@ an investigation a durable, structured memory — one that survives context
 resets, session crashes, and model swaps.
 
 ```
-$ casefile resume-context
-You are resuming an in-progress task. Trust ground truth over these notes...
-
-TASK: payment-service intermittent 502s
-STATUS: leading theory is connection-pool exhaustion (verified against
-observation 8f31c2aa); TLS-renegotiation theory ruled out — do not re-propose.
+$ export CASEFILE_AUTHOR=claude
+$ casefile boot
+=== WHERE ===
+store: /path/to/project
+active case: payment-service — intermittent 502s
+...
+=== YOU ARE ===
+author: claude (from env)
+...
+=== BRIEF ===
+rolling abstract:
+PROBLEM: payment-service — find the cause
+STATUS: leading theory is connection-pool exhaustion (verified against ground truth)
+...
+=== NEXT ===
+1. casefile packet --to codex -a claude
 ```
 
 ## How it works
@@ -38,9 +48,17 @@ tamper-evident by construction.
 
 ## The parts
 
-- **`casefile resume-context`** — one command that tells a fresh session
-  (human or model) exactly where the investigation stands: rolling
-  abstract, live decisions, ruled-out theories, open questions.
+- **`casefile boot`** — single cold-start ritual for any model: store
+  discovery (`CASEFILE_ROOT` / walk-up / `.casefile-pointer`), author
+  identity (`CASEFILE_AUTHOR`), startup recheck, and a structured brief
+  (WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD). Exit
+  codes for orchestrators: 0 ok, 10 mailbox, 20 drift, 30 abstract stale.
+- **`casefile packet` / `inbox` / `next`** — log-only multi-agent handoff.
+  One author emits a peer packet; the peer lists inbox items and concrete
+  next CLI actions without a shared chat transcript.
+- **`casefile checkpoint`** — refresh the rolling abstract and rebuild the
+  FTS compost index so `recall` works after context resets.
+- **`casefile resume-context`** — compact briefing (also embedded in boot).
 - **`casefile recheck`** — re-runs every recorded check recipe and reports
   *drift*: which claims still hold versus held-three-days-ago. Timeouts
   record `UNKNOWN`, never false failure. `--startup` keeps session start
@@ -83,7 +101,8 @@ authoritative design document.
 
 ## Status
 
-Working core (M1–M6): log + grades, resume-context, recheck, hooks for
+Working core (M1–M6 + multi-agent porcelain): log + grades, boot, whoami,
+packet/inbox/next, checkpoint/recall, resume-context, recheck, hooks for
 Claude Code and Codex, import, spitball driver, tmux viewport. Roadmap:
 config.toml, mid-turn interjection routing. Expect sharp edges.
 

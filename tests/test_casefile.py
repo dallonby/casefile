@@ -1177,5 +1177,190 @@ class CliLintTests(CliBase):
         self.assertNotIn("CONTRADICTION", r.out)
 
 
+# ------------------------------------- multi-agent porcelain (boot/handoff)
+
+class IdentityAndDiscoveryTests(CliBase):
+    def test_whoami_default_and_env(self):
+        r = self.cli("whoami", expect=0)
+        self.assertIn("author: agent", r.out)
+        self.assertIn("from default", r.out)
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home"),
+               "CASEFILE_AUTHOR": "GPT"}
+        p = subprocess.run([sys.executable, str(CASEFILE), "whoami"],
+                           cwd=self.dir, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0)
+        self.assertIn("author: codex", p.stdout)  # alias GPT → codex
+        self.assertIn("from env", p.stdout)
+
+    def test_find_root_via_env(self):
+        # cwd outside the store; CASEFILE_ROOT still locates it
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(other, ignore_errors=True))
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home"),
+               "CASEFILE_ROOT": str(self.dir), "CASEFILE_AUTHOR": "claude"}
+        p = subprocess.run([sys.executable, str(CASEFILE), "whoami", "--json"],
+                           cwd=other, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        self.assertEqual(Path(data["root"]).resolve(), self.dir.resolve())
+
+    def test_find_root_via_pointer_file(self):
+        other = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(other, ignore_errors=True))
+        (other / ".casefile-pointer").write_text(str(self.dir) + "\n")
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home")}
+        p = subprocess.run([sys.executable, str(CASEFILE), "whoami", "--json"],
+                           cwd=other, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        data = json.loads(p.stdout)
+        self.assertEqual(Path(data["root"]).resolve(), self.dir.resolve())
+
+    def test_normalize_author_aliases(self):
+        self.assertEqual(cf.normalize_author("anthropic"), "claude")
+        self.assertEqual(cf.normalize_author("fable"), "claude")  # Anthropic model, not a persona
+        self.assertEqual(cf.normalize_author("sonnet"), "claude")
+        self.assertEqual(cf.normalize_author("xai"), "grok45")
+        self.assertEqual(cf.normalize_author("grok45"), "grok45")
+        self.assertEqual(cf.normalize_author("claude"), "claude")
+
+
+class BootTests(CliBase):
+    REQUIRED = ("=== WHERE ===", "=== YOU ARE ===", "=== WORLD vs LOG ===",
+                "=== BRIEF ===", "=== DO NOT ===", "=== NEXT ===", "=== CARD ===")
+
+    def test_boot_twice_stable_sections(self):
+        self.add("-t", "constraint", "-a", "user", "do not rewrite history")
+        self.add("-t", "hypothesis", "-a", "claude",
+                 "pool exhaustion causes 502s")
+        r1 = self.cli("boot", "-a", "claude", "--skip-recheck", expect=None)
+        # missing abstract → exit 30
+        self.assertEqual(r1.rc, cf.EXIT_ABSTRACT_STALE, r1.out + r1.err)
+        r2 = self.cli("boot", "-a", "claude", "--skip-recheck", expect=None)
+        self.assertEqual(r2.rc, cf.EXIT_ABSTRACT_STALE)
+        for label in self.REQUIRED:
+            self.assertIn(label, r1.out)
+            self.assertIn(label, r2.out)
+        # non-empty WHERE / YOU ARE / BRIEF bodies (not just headers)
+        def section_body(text, header):
+            lines = text.splitlines()
+            i = lines.index(header)
+            body = []
+            for ln in lines[i + 1:]:
+                if ln.startswith("==="):
+                    break
+                body.append(ln)
+            return "\n".join(body).strip()
+        self.assertTrue(section_body(r1.out, "=== WHERE ==="))
+        self.assertTrue(section_body(r1.out, "=== YOU ARE ==="))
+        self.assertIn("author: claude", section_body(r1.out, "=== YOU ARE ==="))
+        self.assertTrue(section_body(r1.out, "=== BRIEF ==="))
+        self.assertIn(str(self.dir), section_body(r1.out, "=== WHERE ==="))
+
+    def test_boot_mailbox_exit_after_checkpoint(self):
+        self.add("-t", "question", "-a", "claude", "ship it?", "--to", "user")
+        self.cli("checkpoint", "-a", "claude", expect=0)
+        r = self.cli("boot", "-a", "claude", "--skip-recheck", expect=None)
+        self.assertEqual(r.rc, cf.EXIT_MAILBOX)
+        self.assertIn("mailbox", r.out.lower())
+
+    def test_boot_ok_after_checkpoint_no_mailbox(self):
+        self.add("-t", "hypothesis", "-a", "claude", "theory A")
+        self.cli("checkpoint", "-a", "claude", expect=0)
+        r = self.cli("boot", "-a", "claude", "--skip-recheck", expect=0)
+        for label in self.REQUIRED:
+            self.assertIn(label, r.out)
+
+
+class HandoffTests(CliBase):
+    def test_packet_inbox_next_across_authors(self):
+        h = self.add("-t", "hypothesis", "-a", "claude",
+                     "connection pool exhaustion")
+        self.add("-t", "question", "-a", "claude",
+                 "does the pool metric spike?", "--to", "codex")
+        self.cli("checkpoint", "-a", "claude", expect=0)
+        r = self.cli("packet", "--to", "codex", "-a", "claude", expect=0)
+        self.assertIn("PACKET for codex", r.out)
+        self.assertIn("connection pool exhaustion", r.out)
+        self.assertIn("FORBIDDEN RE-PROPOSALS", r.out)
+        self.assertIn("recorded: packet note", r.out)
+        # peer reads inbox without shared chat
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home"),
+               "CASEFILE_AUTHOR": "codex"}
+        p = subprocess.run([sys.executable, str(CASEFILE), "inbox", "--for", "codex"],
+                           cwd=self.dir, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("inbox for codex", p.stdout)
+        self.assertGreaterEqual(p.stdout.count("`"), 1)
+        self.assertTrue(
+            "pool metric" in p.stdout or "PACKET for codex" in p.stdout
+            or "connection pool" in p.stdout)
+        n = self.cli("next", "-a", "codex", expect=0)
+        self.assertIn("next actions for codex", n.out)
+        self.assertRegex(n.out, r"\d+\. ")
+        # foreign endorse still works (existing epistemic rule)
+        self.cli("endorse", h, "-a", "codex", expect=0)
+
+    def test_packet_rejects_self(self):
+        r = self.cli("packet", "--to", "claude", "-a", "claude")
+        self.assertNotEqual(r.rc, 0)
+
+
+class CheckpointRecallTests(CliBase):
+    def test_checkpoint_enables_recall(self):
+        self.add("-t", "hypothesis", "-a", "claude",
+                 "TLS renegotiation causes intermittent 502s")
+        self.add("-t", "constraint", "-a", "user",
+                 "do not restart the load balancer mid-flight")
+        r0 = self.cli("recall", "renegotiation")
+        # may be empty before compost exists
+        self.cli("checkpoint", "-a", "claude", expect=0)
+        # abstract body must include problem keywords for compost search
+        r = self.cli("recall", "502s", expect=0)
+        self.assertNotIn("no matches", r.out)
+        self.assertTrue(r.out.strip())
+        # append-only: log still has original hypothesis + new abstract digest
+        types = [e["type"] for e in self.log_entries()]
+        self.assertIn("hypothesis", types)
+        self.assertIn("digest", types)
+        abstracts = [e for e in self.log_entries()
+                     if e["type"] == "digest" and e.get("kind") == "abstract"]
+        self.assertTrue(abstracts)
+        self.assertIn("502s", abstracts[-1]["body"])
+
+    def test_second_checkpoint_supersedes_prior_abstract(self):
+        self.cli("checkpoint", "-a", "claude", "first abstract about widgets", expect=0)
+        self.add("-t", "note", "-a", "claude", "more work")
+        self.cli("checkpoint", "-a", "claude", "second abstract about gadgets", expect=0)
+        r = self.cli("resume-context", expect=0)
+        self.assertIn("second abstract about gadgets", r.out)
+        self.assertNotIn("first abstract about widgets", r.out)
+
+
+class EpistemicRefusalSamples(CliBase):
+    def test_self_endorsement_and_verify_without_obs(self):
+        h = self.add("-t", "hypothesis", "-a", "claude", "theory X")
+        r1 = self.cli("endorse", h, "-a", "claude")
+        self.assertNotEqual(r1.rc, 0)
+        self.assertIn("self-endorsement", r1.err)
+        h2 = self.add("-t", "hypothesis", "-a", "claude", "theory Y")
+        r2 = self.cli("verify", h, h2, "-a", "codex")
+        self.assertNotEqual(r2.rc, 0)
+        self.assertIn("observation", r2.err)
+
+
+class UnitPorcelainHelpers(unittest.TestCase):
+    def test_synthesize_abstract_mentions_title(self):
+        es = [E("h1", "hypothesis", body="pool exhaustion", case="c")]
+        meta = {"cases": {"c": {"title": "payment 502s", "goal": "find cause"}}}
+        body = cf.synthesize_abstract(es, meta, "c")
+        self.assertIn("payment 502s", body)
+        self.assertIn("pool exhaustion", body)
+
+    def test_abstract_freshness_missing(self):
+        st = cf.abstract_freshness([], "c")
+        self.assertTrue(st["stale"])
+        self.assertFalse(st["present"])
+
+
 if __name__ == "__main__":
     unittest.main()

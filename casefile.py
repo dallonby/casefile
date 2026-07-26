@@ -23,6 +23,48 @@ META = "meta.json"
 ACTIVE = "active"  # untracked: the active-case pointer is per-clone local state
 LOCK = "log.lock"
 STALE_LOCK_S = 60
+POINTER = ".casefile-pointer"  # optional committed path to the canonical store root
+ENV_ROOT = "CASEFILE_ROOT"
+ENV_AUTHOR = "CASEFILE_AUTHOR"
+
+# Orchestrator-friendly boot exit codes (lint remains 0/1).
+EXIT_OK = 0
+EXIT_MAILBOX = 10
+EXIT_DRIFT = 20
+EXIT_ABSTRACT_STALE = 30
+
+# Rolling abstract is stale when this many entries land after it with no refresh.
+ABSTRACT_STALE_ENTRIES = 25
+
+# Stable boot section labels (contract for agents and tests).
+BOOT_SECTIONS = (
+    "WHERE",
+    "YOU ARE",
+    "WORLD vs LOG",
+    "BRIEF",
+    "DO NOT",
+    "NEXT",
+    "CARD",
+)
+
+AUTHOR_ALIASES = {
+    "gpt": "codex",
+    "openai": "codex",
+    "o1": "codex",
+    "o3": "codex",
+    # Anthropic models (including fable) → vendor author "claude"
+    "anthropic": "claude",
+    "sonnet": "claude",
+    "opus": "claude",
+    "haiku": "claude",
+    "fable": "claude",
+    # xAI models → "grok45"
+    "grok-4": "grok45",
+    "grok4": "grok45",
+    "grok-4.5": "grok45",
+    "grok": "grok45",
+    "xai": "grok45",
+}
 
 ENTRY_TYPES = {
     "hypothesis", "decision", "observation", "constraint", "question",
@@ -34,16 +76,62 @@ DIGEST_KINDS = {"mechanical", "judgment", "abstract"}
 # ------------------------------------------------------------------ storage
 
 def find_root(start: Path | None = None) -> Path | None:
+    """Locate the project root that owns `.casefile/`.
+
+    Search order (first hit wins):
+      1. CASEFILE_ROOT env (absolute or relative path to store root)
+      2. walk-up from start/cwd for a `.casefile/` directory
+      3. walk-up for a `.casefile-pointer` file whose contents name the root
+    """
+    env = os.environ.get(ENV_ROOT, "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        if (p / DIR).is_dir():
+            return p
+        if p.name == DIR and p.is_dir():
+            return p.parent
+        return None
+
     p = (start or Path.cwd()).resolve()
     for c in [p, *p.parents]:
         if (c / DIR).is_dir():
             return c
+    for c in [p, *p.parents]:
+        ptr = c / POINTER
+        if ptr.is_file():
+            try:
+                target = Path(ptr.read_text().strip()).expanduser()
+                if not target.is_absolute():
+                    target = (c / target).resolve()
+                else:
+                    target = target.resolve()
+                if (target / DIR).is_dir():
+                    return target
+            except OSError:
+                continue
     return None
 
 
 def die(msg: str, code: int = 1):
     print(f"error: {msg}", file=sys.stderr)
     sys.exit(code)
+
+
+def normalize_author(author: str) -> str:
+    a = (author or "").strip().lower()
+    if not a:
+        return a
+    return AUTHOR_ALIASES.get(a, a)
+
+
+def resolve_author(explicit: str | None = None) -> tuple[str, str]:
+    """Return (author, source) where source is 'flag' | 'env' | 'default'."""
+    if explicit and str(explicit).strip():
+        return normalize_author(str(explicit)), "flag"
+    env = os.environ.get(ENV_AUTHOR, "").strip()
+    if env:
+        return normalize_author(env), "env"
+    return "agent", "default"
 
 
 def load_meta(root: Path) -> dict:
@@ -320,11 +408,33 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
 
 # --------------------------------------------------------------- case logic
 
-def require_root():
-    root = find_root()
+def require_root(start: Path | None = None):
+    root = find_root(start)
     if root is None:
-        die("no .casefile found here or in any parent (run `casefile init`)")
+        die("no .casefile found here or in any parent "
+            f"(run `casefile init`, or set {ENV_ROOT})")
     return root, read_entries(root), load_meta(root)
+
+
+def cmd_whoami(args):
+    author, source = resolve_author(getattr(args, "author", None))
+    root = find_root()
+    out = {
+        "author": author,
+        "source": source,
+        "env": ENV_AUTHOR,
+        "root": str(root) if root else None,
+        "cwd": str(Path.cwd().resolve()),
+    }
+    if getattr(args, "json", False):
+        print(json.dumps(out, indent=2))
+        return
+    print(f"author: {author} (from {source})")
+    if source == "default":
+        print(f"hint: export {ENV_AUTHOR}=claude|codex|grok|… so grades and "
+              f"packets attribute correctly")
+    print(f"store: {root if root else '(none — run casefile init)'}")
+    print(f"cwd:   {out['cwd']}")
 
 
 def resolve_case(root: Path, meta: dict, explicit: str | None) -> str:
@@ -359,7 +469,8 @@ def canonical_author(entries, author: str) -> str:
 
 def make_entry(entries, case, type_, author, body, refs=None, **extra):
     ids = {e["id"] for e in entries}
-    author = canonical_author(entries, author)
+    # Aliases first (fable→claude), then first-seen casing for the case log.
+    author = canonical_author(entries, normalize_author(author))
     refs = refs or []
     by_id = {e["id"]: e for e in entries}
     missing = [r for r in refs if r not in ids]
@@ -369,6 +480,8 @@ def make_entry(entries, case, type_, author, body, refs=None, **extra):
         cross = [r for r in refs if by_id[r]["case"] != case]
         if cross:
             die(f"ref(s) in another case: {', '.join(cross)}")
+    if "to" in extra and extra["to"] not in (None, "", "user", "any"):
+        extra = {**extra, "to": normalize_author(extra["to"])}
     e = {"id": new_id(ids, body),
          "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
          "case": case, "type": type_, "author": author, "body": body,
@@ -473,8 +586,9 @@ def cmd_add(args):
                 die(f"{t} is verified against ground truth — dispute it "
                     "rather than silently replacing it")
         extra["supersedes"] = args.supersedes
-    if args.type == "question" and args.to:
-        extra["to"] = args.to
+    if args.type in ("question", "note") and args.to:
+        extra["to"] = normalize_author(args.to) if args.to not in ("user", "any") \
+            else args.to
     e = make_entry(entries, case, args.type, args.author, args.body,
                    refs=args.refs, **extra)
     append_entry(root, e)
@@ -1493,11 +1607,17 @@ def _last_spitball_spend(root: Path):
 def cmd_status(args):
     root, entries, meta = require_root()
     st = compute_status(root, entries, meta)
+    author, asource = resolve_author(getattr(args, "author", None))
+    st["author"] = author
+    st["author_source"] = asource
+    st["root"] = str(root)
     if args.json:
         print(json.dumps(st, indent=2))
         return
     ac = st["active_case"]
     print(f"active case: {ac or '(none)'}")
+    print(f"store: {root}")
+    print(f"author: {author} (from {asource})")
     for cid, c in st["cases"].items():
         mark = "*" if cid == ac else " "
         print(f" {mark} {cid}: {c['title']} — {c['entries']} entries, "
@@ -1513,6 +1633,528 @@ def cmd_status(args):
               f"({'; '.join(c['signals'])}) — anything left, or shall I file it?")
     if st["lint"]:
         print(f"lint: {st['lint']} finding(s) — run `casefile lint`")
+
+
+# -------- multi-agent porcelain: boot / packet / inbox / next / checkpoint
+
+def latest_abstract_entry(entries: list[dict], case: str) -> dict | None:
+    live = None
+    for e in entries:
+        if e["type"] == "digest" and e.get("kind") == "abstract" and e["case"] == case:
+            live = e
+    return live
+
+
+def abstract_freshness(entries: list[dict], case: str,
+                       stale_after: int = ABSTRACT_STALE_ENTRIES) -> dict:
+    """Whether the rolling abstract is missing or behind the log tip."""
+    abs_e = latest_abstract_entry(entries, case)
+    if abs_e is None:
+        return {"present": False, "stale": True, "id": None, "entries_since": None,
+                "reason": "no rolling abstract — run `casefile checkpoint`"}
+    # count case entries strictly after the abstract's id in log order
+    seen = False
+    since = 0
+    for e in entries:
+        if e["id"] == abs_e["id"]:
+            seen = True
+            continue
+        if seen and e["case"] == case:
+            since += 1
+    stale = since >= stale_after
+    reason = (f"abstract `{abs_e['id']}` is {since} entries behind "
+              f"(threshold {stale_after})" if stale
+              else f"abstract `{abs_e['id']}` current ({since} entries since)")
+    return {"present": True, "stale": stale, "id": abs_e["id"],
+            "entries_since": since, "reason": reason, "body": abs_e["body"]}
+
+
+def synthesize_abstract(entries: list[dict], meta: dict, case: str) -> str:
+    """Deterministic abstract body from live case state (append-only checkpoint)."""
+    ce, grades = case_view(entries, meta, case)
+    info = meta["cases"][case]
+    by_type: dict[str, list] = {}
+    for e in ce:
+        by_type.setdefault(e["type"], []).append(e)
+    qs, ds = open_items(ce)
+    lines = [
+        f"PROBLEM: {info['title']}"
+        + (f" — {info['goal']}" if info.get("goal") else ""),
+    ]
+    hyps = [h for h in by_type.get("hypothesis", []) if grades.get(h["id"]) != "refuted"]
+    if hyps:
+        # lead with strongest grade
+        for g in GRADE_ORDER:
+            group = [h for h in hyps if grades[h["id"]] == g]
+            if group:
+                h = group[0]
+                lines.append(
+                    f"STATUS: leading theory is {h['body'][:200]} "
+                    f"({PHRASE.get(g, g)}; id {h['id']})")
+                break
+    else:
+        lines.append("STATUS: no live hypotheses on the differential")
+    ruled = [h for h in by_type.get("hypothesis", []) if grades.get(h["id"]) == "refuted"]
+    if ruled:
+        lines.append("RULED OUT: " + "; ".join(
+            f"{h['body'][:80]} ({h['id']})" for h in ruled[:6]))
+    cons = [e for e in by_type.get("constraint", [])
+            if grades.get(e["id"]) != "revoked"]
+    if cons:
+        lines.append("CONSTRAINTS: " + "; ".join(
+            f"{c['body'][:80]} ({c['id']})" for c in cons[:5]))
+    decs = [e for e in by_type.get("decision", [])
+            if grades.get(e["id"]) not in ("revoked",)]
+    if decs:
+        lines.append("KEY DECISIONS: " + "; ".join(
+            f"{d['body'][:80]} ({d['id']})" for d in decs[:5]))
+    open_bits = []
+    if qs:
+        open_bits.append(f"{len(qs)} open question(s)")
+    if ds:
+        open_bits.append(f"{len(ds)} open dispute(s)")
+    mailbox = [q for q in qs if q.get("to") == "user"]
+    if mailbox:
+        open_bits.append(f"{len(mailbox)} mailbox item(s) → user")
+    if open_bits:
+        lines.append("OPEN: " + ", ".join(open_bits))
+    else:
+        lines.append("OPEN: none")
+    return "\n".join(lines)
+
+
+def _capture_startup_recheck(root: Path, case: str | None) -> dict:
+    """Run `recheck --startup` and return text + drift/held counts.
+
+    Subprocess keeps recheck side-effects (observations) on the real code path
+    without threading stdout redirects through cmd_recheck.
+    """
+    cmd = [sys.executable, str(Path(__file__).resolve()), "recheck", "--startup"]
+    if case:
+        cmd += ["--case", case]
+    env = {**os.environ, ENV_ROOT: str(root)}
+    p = subprocess.run(cmd, cwd=root, capture_output=True, text=True, env=env)
+    text = (p.stdout or "").strip()
+    drifted = 0
+    held = 0
+    total = 0
+    for line in text.splitlines():
+        if "<- DRIFT" in line:
+            drifted += 1
+        if line.startswith("ok   ") or line.startswith("ok  "):
+            held += 1
+        if line.startswith(("ok  ", "ok   ", "FAIL", "??? ")):
+            total += 1
+    # summary line: "N/M hold; K drifted..."
+    m = re.search(r"(\d+)/(\d+) hold", text)
+    if m:
+        held, total = int(m.group(1)), int(m.group(2))
+    m2 = re.search(r"(\d+) drifted", text)
+    if m2:
+        drifted = int(m2.group(1))
+    return {"text": text or "(no live checks)", "held": held, "total": total,
+            "drifted": drifted, "rc": p.returncode}
+
+
+def suggest_next_actions(entries: list[dict], meta: dict, case: str,
+                         author: str, freshness: dict,
+                         drift: int = 0) -> list[str]:
+    """Concrete CLI actions a cold agent can run next (log-derived only)."""
+    ce, grades = case_view(entries, meta, case)
+    qs, ds = open_items(ce)
+    actions: list[str] = []
+    if freshness.get("stale"):
+        actions.append(
+            "casefile checkpoint -a " + author
+            + "   # refresh rolling abstract + FTS index")
+    if drift:
+        actions.append(
+            "casefile recheck   # full pass — startup reported "
+            f"{drift} drifted claim(s)")
+    mailbox = [q for q in qs if q.get("to") == "user"]
+    if mailbox:
+        actions.append(
+            f"surface mailbox to user ({len(mailbox)} waiting) — "
+            f"do not block: `{mailbox[0]['id']}` {mailbox[0]['body'][:80]}")
+    peer_q = [q for q in qs
+              if q.get("to") and q.get("to") not in ("user", "any")
+              and normalize_author(q["to"]) == author]
+    for q in peer_q[:3]:
+        actions.append(
+            f"answer peer question `{q['id']}` from {q['author']}: {q['body'][:80]} "
+            f"→ casefile resolve {q['id']} -a {author} --outcome answered --reason '…'")
+    for d in ds[:3]:
+        actions.append(
+            f"open dispute `{d['id']}` on `{d['refs'][0]}` — "
+            f"casefile resolve {d['id']} -a {author} --outcome upheld|withdrawn --reason '…'")
+    # unverified live hyps that still need evidence
+    for h in ce:
+        if h["type"] != "hypothesis":
+            continue
+        g = grades.get(h["id"])
+        if g in ("hypothesis", "consensus"):
+            if h.get("check"):
+                actions.append(
+                    f"recheck/verify `{h['id']}` [{g}]: {h['body'][:70]}")
+            else:
+                actions.append(
+                    f"gather observation for `{h['id']}` [{g}] then "
+                    f"casefile verify {h['id']} <obs> -a {author}")
+            if len(actions) >= 12:
+                break
+    # peer packet opportunity
+    others = sorted({e["author"] for e in ce
+                     if e["author"] not in (author, "user", "system")})
+    if others and not any(e["type"] == "note" and e.get("to") in others
+                          and e["author"] == author
+                          for e in ce[-30:]):
+        actions.append(
+            f"casefile packet --to {others[0]} -a {author}   "
+            f"# hand off brief+open claims via the log")
+    if not actions:
+        actions.append(
+            "casefile status && casefile show   # differential is quiet; "
+            "file a hypothesis or close the case")
+    return actions[:12]
+
+
+def agent_card(author: str) -> str:
+    return "\n".join([
+        f"You are author `{author}`. Grades are computed from type+author+refs.",
+        "Never edit .casefile/log.jsonl by hand — corrections are new entries.",
+        "Session boot: casefile boot   (or: whoami → recheck --startup → status)",
+        "File: casefile add -t hypothesis|decision|observation|constraint|question|note "
+        f"-a {author} \"…\"",
+        "User decisions ONLY with -a user. Your proposals use your author id.",
+        "Verify needs an observation: casefile verify <hyp> <obs> -a " + author,
+        "Self-endorsement is rejected; get a foreign author or ground truth.",
+        "Handoff: casefile packet --to <peer> | casefile inbox --for " + author,
+        "Checkpoint: casefile checkpoint -a " + author + "  # abstract + reindex",
+        "Recall: casefile recall \"problem keywords\"   Dig: casefile dig \"…\"",
+        "Boot exit codes: 0 ok | 10 mailbox | 20 drift | 30 abstract stale",
+    ])
+
+
+def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
+                      author: str, author_source: str,
+                      recheck: dict, budget: int = 2000) -> tuple[str, int]:
+    """Assemble the cold-start briefing. Returns (text, exit_code)."""
+    info = meta["cases"][case]
+    freshness = abstract_freshness(entries, case)
+    ce, grades = case_view(entries, meta, case)
+    by_type: dict[str, list] = {}
+    for e in ce:
+        by_type.setdefault(e["type"], []).append(e)
+    qs, ds = open_items(ce)
+    mailbox = [q for q in qs if q.get("to") == "user"]
+    ruled = [h for h in by_type.get("hypothesis", [])
+             if grades.get(h["id"]) == "refuted"]
+    livehyps = [h for h in by_type.get("hypothesis", [])
+                if grades.get(h["id"]) != "refuted"]
+
+    where = [
+        f"store: {root}",
+        f"active case: {case} — {info['title']}",
+    ]
+    if info.get("goal"):
+        where.append(f"goal: {info['goal']}")
+    where.append(f"entries: {sum(1 for e in entries if e['case'] == case)}")
+
+    you = [
+        f"author: {author} (from {author_source})",
+        f"set {ENV_AUTHOR} or pass -a to attribute claims correctly",
+    ]
+
+    world = [
+        f"startup recheck: {recheck['held']}/{recheck['total']} hold; "
+        f"{recheck['drifted']} drifted",
+    ]
+    if recheck["text"] and recheck["text"] != "(no live checks)":
+        # keep recheck short in boot
+        tail = recheck["text"].splitlines()
+        world.append("detail:")
+        world.extend("  " + ln for ln in tail[:20])
+        if len(tail) > 20:
+            world.append(f"  … {len(tail) - 20} more line(s); run `casefile recheck`")
+    world.append("Ground truth beats these notes where they conflict.")
+
+    brief_lines: list[str] = []
+    if freshness.get("present"):
+        brief_lines.append("rolling abstract:")
+        brief_lines.append(freshness["body"])
+        brief_lines.append(f"({freshness['reason']})")
+    else:
+        brief_lines.append(f"STALE/MISSING ABSTRACT: {freshness['reason']}")
+    cons = [e for e in by_type.get("constraint", [])
+            if grades.get(e["id"]) != "revoked"]
+    if cons:
+        brief_lines.append("constraints:")
+        for e in cons[:8]:
+            brief_lines.append(
+                f"- `{e['id']}` ({PHRASE.get(grades[e['id']], grades[e['id']])}) "
+                f"{e['body'][:160]}")
+    if livehyps:
+        brief_lines.append("differential:")
+        for g in GRADE_ORDER:
+            for e in livehyps:
+                if grades[e["id"]] == g:
+                    brief_lines.append(
+                        f"- `{e['id']}` [{PHRASE[g]}] ({e['author']}) {e['body'][:140]}")
+    if qs:
+        brief_lines.append("open questions:")
+        for e in qs[:8]:
+            dest = f" → {e['to']}" if e.get("to") else ""
+            brief_lines.append(f"- `{e['id']}` ({e['author']}{dest}) {e['body'][:140]}")
+    if ds:
+        brief_lines.append("open disputes:")
+        for e in ds[:6]:
+            brief_lines.append(
+                f"- `{e['id']}` ({e['author']}) on `{e['refs'][0]}`: {e['body'][:120]}")
+    if mailbox:
+        brief_lines.append(f"mailbox → user ({len(mailbox)}):")
+        for e in mailbox[:5]:
+            brief_lines.append(f"- `{e['id']}` {e['body'][:140]}")
+
+    # budget brief roughly like resume-context
+    budget_chars = budget * 4
+    brief_text = "\n".join(brief_lines)
+    if len(brief_text) > budget_chars:
+        brief_text = brief_text[:budget_chars] + "\n… [BRIEF truncated — casefile show]"
+
+    do_not: list[str] = []
+    for e in ruled[:10]:
+        do_not.append(f"- do not re-propose: {e['body'][:140]} (`{e['id']}`)")
+    for e in by_type.get("decision", []):
+        if grades.get(e["id"]) in ("stated", "asserted", "fulfilled"):
+            for r in e.get("rejected", []) or []:
+                do_not.append(
+                    f"- rejected alternative: {r.get('option','?')} — "
+                    f"{r.get('reason','')} (decision `{e['id']}`)")
+    if not do_not:
+        do_not.append("- (no ruled-out theories recorded)")
+
+    next_actions = suggest_next_actions(
+        entries, meta, case, author, freshness, drift=recheck["drifted"])
+
+    parts = [
+        "=== WHERE ===",
+        *where,
+        "",
+        "=== YOU ARE ===",
+        *you,
+        "",
+        "=== WORLD vs LOG ===",
+        *world,
+        "",
+        "=== BRIEF ===",
+        brief_text,
+        "",
+        "=== DO NOT ===",
+        *do_not,
+        "",
+        "=== NEXT ===",
+        *[f"{i}. {a}" for i, a in enumerate(next_actions, 1)],
+        "",
+        "=== CARD ===",
+        agent_card(author),
+    ]
+    text = "\n".join(parts)
+
+    code = EXIT_OK
+    if freshness.get("stale"):
+        code = EXIT_ABSTRACT_STALE
+    elif recheck["drifted"]:
+        code = EXIT_DRIFT
+    elif mailbox:
+        code = EXIT_MAILBOX
+    return text, code
+
+
+def cmd_boot(args):
+    root, entries, meta = require_root()
+    case = resolve_case(root, meta, getattr(args, "case", None))
+    author, asource = resolve_author(getattr(args, "author", None))
+    # re-read after recheck may append observations
+    recheck = {"text": "(skipped)", "held": 0, "total": 0, "drifted": 0, "rc": 0}
+    if not getattr(args, "skip_recheck", False):
+        recheck = _capture_startup_recheck(root, case if getattr(args, "case", None) else None)
+        entries = read_entries(root)
+    text, code = build_boot_report(
+        root, entries, meta, case, author, asource, recheck,
+        budget=getattr(args, "budget", 2000))
+    print(text)
+    if code != EXIT_OK and not getattr(args, "ok_exit", False):
+        sys.exit(code)
+
+
+def build_packet(entries: list[dict], meta: dict, case: str,
+                 author: str, peer: str) -> str:
+    peer = normalize_author(peer)
+    freshness = abstract_freshness(entries, case)
+    ce, grades = case_view(entries, meta, case)
+    info = meta["cases"][case]
+    qs, ds = open_items(ce)
+    lines = [
+        f"PACKET for {peer} from {author}",
+        f"case: {case} — {info['title']}",
+        "",
+        "BRIEF:",
+    ]
+    if freshness.get("present"):
+        lines.append(freshness["body"])
+    else:
+        lines.append(f"(no abstract) {freshness['reason']}")
+    lines += ["", "OPEN CLAIMS (need your eyes):"]
+    any_claim = False
+    for e in ce:
+        if e["type"] != "hypothesis":
+            continue
+        g = grades.get(e["id"], "hypothesis")
+        if g in ("refuted",):
+            continue
+        if e["author"] == peer:
+            continue
+        any_claim = True
+        lines.append(
+            f"- `{e['id']}` [{PHRASE.get(g, g)}] ({e['author']}) {e['body'][:160]}")
+        if g in ("hypothesis", "consensus") and e["author"] != peer:
+            lines.append(
+                f"    → consider: casefile endorse {e['id']} -a {peer}  "
+                f"OR casefile dispute {e['id']} -a {peer} --reason '…'")
+    if not any_claim:
+        lines.append("- (none)")
+    lines += ["", "MAILBOX / QUESTIONS for you:"]
+    mine = [q for q in qs
+            if normalize_author(str(q.get("to", ""))) == peer
+            or q.get("to") == "any"]
+    if mine:
+        for q in mine:
+            lines.append(f"- `{q['id']}` ({q['author']}) {q['body'][:160]}")
+    else:
+        lines.append("- (none addressed to you)")
+    if ds:
+        lines += ["", "OPEN DISPUTES:"]
+        for d in ds:
+            lines.append(
+                f"- `{d['id']}` ({d['author']}) on `{d['refs'][0]}`: {d['body'][:120]}")
+    lines += ["", "FORBIDDEN RE-PROPOSALS (ruled out):"]
+    ruled = [h for h in ce
+             if h["type"] == "hypothesis" and grades.get(h["id"]) == "refuted"]
+    if ruled:
+        for h in ruled:
+            lines.append(f"- {h['body'][:140]} (`{h['id']}`)")
+    else:
+        lines.append("- (none)")
+    lines += [
+        "",
+        "INSTRUCTIONS:",
+        f"1. export {ENV_AUTHOR}={peer}",
+        "2. casefile boot",
+        f"3. casefile inbox --for {peer}",
+        "4. file endorse/dispute/observation/verify as appropriate",
+        "5. casefile packet --to " + author + f" -a {peer}  # reply packet when done",
+    ]
+    return "\n".join(lines)
+
+
+def cmd_packet(args):
+    root, entries, meta = require_root()
+    case = resolve_case(root, meta, getattr(args, "case", None))
+    author, _ = resolve_author(getattr(args, "author", None))
+    peer = normalize_author(args.to)
+    if peer == author:
+        die("packet peer must differ from author")
+    body = build_packet(entries, meta, case, author, peer)
+    print(body)
+    if not getattr(args, "no_file", False):
+        e = make_entry(entries, case, "note", author, body, to=peer)
+        append_entry(root, e)
+        save_active(root, case)
+        print(f"\nrecorded: packet note `{e['id']}` → {peer} ({author})")
+
+
+def inbox_items(entries: list[dict], peer: str) -> list[dict]:
+    """Entries addressed to peer: questions/notes with to=peer, plus open
+    packets. Sorted log order."""
+    peer = normalize_author(peer)
+    hidden = superseded_ids(entries)
+    out = []
+    for e in entries:
+        if e["id"] in hidden:
+            continue
+        to = e.get("to")
+        if to and normalize_author(str(to)) == peer:
+            out.append(e)
+            continue
+        if e["type"] == "note" and e["body"].startswith(f"PACKET for {peer} "):
+            out.append(e)
+    return out
+
+
+def cmd_inbox(args):
+    root, entries, meta = require_root()
+    peer, source = resolve_author(getattr(args, "for_author", None)
+                                  or getattr(args, "author", None))
+    # --for takes precedence when provided as args.for_author
+    if getattr(args, "for_author", None):
+        peer = normalize_author(args.for_author)
+        source = "flag"
+    items = inbox_items(entries, peer)
+    if getattr(args, "json", False):
+        print(json.dumps([{"id": e["id"], "type": e["type"], "author": e["author"],
+                           "case": e["case"], "to": e.get("to"),
+                           "body": e["body"][:500]} for e in items], indent=2))
+        return
+    print(f"inbox for {peer} (author resolve: {source}): {len(items)} item(s)")
+    if not items:
+        print("(empty)")
+        return
+    for e in items:
+        first = e["body"].strip().splitlines()[0][:120]
+        print(f"  `{e['id']}` [{e['type']}] from {e['author']} "
+              f"case={e['case']}: {first}")
+
+
+def cmd_next(args):
+    root, entries, meta = require_root()
+    case = resolve_case(root, meta, getattr(args, "case", None))
+    author, _ = resolve_author(getattr(args, "author", None))
+    freshness = abstract_freshness(entries, case)
+    actions = suggest_next_actions(entries, meta, case, author, freshness,
+                                   drift=0)
+    print(f"next actions for {author} on case {case}:")
+    for i, a in enumerate(actions, 1):
+        print(f"{i}. {a}")
+
+
+def cmd_checkpoint(args):
+    """Refresh rolling abstract + rebuild FTS index (append-only)."""
+    root, entries, meta = require_root()
+    case = resolve_case(root, meta, getattr(args, "case", None))
+    author, _ = resolve_author(getattr(args, "author", None))
+    body = (getattr(args, "body", None) or "").strip()
+    if not body:
+        body = synthesize_abstract(entries, meta, case)
+    # abstract auto-supersedes prior abstract inside cmd_digest path
+    supersedes = []
+    prev = latest_abstract_id(entries, case)
+    if prev:
+        supersedes = [prev]
+    viol = digest_invariant_violations(entries, supersedes)
+    if viol:
+        die("checkpoint abstract blocked by evidence-chain:\n  " + "\n  ".join(viol))
+    e = make_entry(entries, case, "digest", author, body,
+                   supersedes=supersedes, kind="abstract")
+    append_entry(root, e)
+    entries.append(e)
+    save_active(root, case)
+    n = build_index(root, entries, meta)
+    print(f"checkpoint abstract `{e['id']}`")
+    print(body)
+    if n is None:
+        print("reindex: FTS5 unavailable — recall will scan compost")
+    else:
+        print(f"reindex: {n} compost entr{'y' if n == 1 else 'ies'}")
 
 
 def cmd_log(args):
@@ -1827,18 +2469,18 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 
 ## Session start
 
-1. Run `python3 casefile.py resume-context` and read it. Ground truth beats
-   the notes: where the log and the world conflict, the world wins — record
-   the discrepancy as a new observation.
-2. Run `python3 casefile.py recheck --startup` — it re-runs the recorded
-   check recipes and tells you which claims still hold versus
-   held-three-days-ago. Drift is your first lead. `--startup` keeps this
-   fast by skipping known-slow recipes (their last conclusive result is
-   reported instead); run the bare `recheck` when a skipped claim matters.
-3. Run `python3 casefile.py status`. Address open questions before
-   proceeding; questions marked `→ user` are waiting on the user — surface
-   them once, don't block on them. Act on any dormancy nudge or lint count
-   conversationally (never dump raw lint output at the user).
+1. **Prefer one command:** `python3 casefile.py boot`
+   (discovers the store, stamps author from `CASEFILE_AUTHOR` / `-a`, runs
+   `recheck --startup`, prints WHERE / YOU ARE / WORLD vs LOG / BRIEF /
+   DO NOT / NEXT / CARD). Exit codes: 0 ok, 10 mailbox, 20 drift,
+   30 abstract stale. Act on NEXT; surface mailbox once, don't block.
+2. Export `CASEFILE_AUTHOR=claude|codex|grok|…` so grades and packets
+   attribute correctly (`casefile whoami` to inspect).
+3. Legacy equivalent of boot: `resume-context` then `recheck --startup`
+   then `status`. Ground truth beats the notes where they conflict.
+4. Multi-agent handoff (no shared chat): `packet --to <peer>`, peer runs
+   `inbox --for <self>` + `boot`. Checkpoint with `checkpoint` before long
+   gaps so `recall` sees the distilled problem.
 
 ## Filing conventions (types and authors matter — grades are computed from them)
 
@@ -1864,11 +2506,13 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 
 | user says | you do |
 |---|---|
-| "where are we on X?" | `resume-context` → prose summary sized to the question |
+| "where are we on X?" | `boot` (or `resume-context`) → prose summary sized to the question |
 | "don't touch X" | `add -t constraint -a user` |
 | "I'm not convinced by X" | `dispute -a user` |
 | "why did we rule out X?" | `dig "<query>"` (searches superseded history; expands digests) |
 | "have we seen this before?" | `recall "<query>"` (searches past-case abstracts) |
+| "hand off to codex" | `packet --to codex` |
+| "what's waiting for me?" | `inbox --for $CASEFILE_AUTHOR` / `next` |
 | "what's codex saying?" / "show me the deliberation" | `channel <model>` (ui viewport → that model's live transcript) |
 | "show the case again" | `channel state` (ui viewport → live state view) |
 | "rule that out" / "let's go with X" | `resolve` / `add -t decision -a user` — **confirm first** |
@@ -1978,25 +2622,24 @@ AGENTS_SNIPPET = """\
 
 This project keeps its investigation state in an append-only casefile log.
 
-- At session start run `python3 casefile.py resume-context`, then
-  `python3 casefile.py recheck --startup`, then `python3 casefile.py status`,
-  and act on what they say.
-- **After any context compaction or summarization** (a "context compacted"
-  marker, a restored summary), re-run `python3 casefile.py resume-context`
-  before acting. The log outranks your compacted summary: your summary is
-  lossy and unreviewed; the log is the shared record.
+- **Upgrade / keep skill current:** from the project root run
+  `casefile upgrade` (git-pulls the casefile checkout, installs a `casefile`
+  symlink on PATH, rewrites SKILL.md + hooks from that CLI).
+- **REQUIRED every session:** `export CASEFILE_AUTHOR=<your-id>` then
+  `casefile boot`. If `whoami` shows author `agent` / `from default`, stop
+  and export first (boot exit 40). Never file as anonymous `agent`.
+- Handoff via the log: `packet --to <peer>`, `inbox --for <you>`, `next`.
+- Checkpoint abstracts: `checkpoint` then `recall` for compost search.
+- **After any context compaction or summarization**, re-run `casefile boot`
+  (or `resume-context`) before acting. The log outranks compacted summary.
 - **Before filing a decision or changing an agreed plan**, run
-  `python3 casefile.py dig "<topic>"` (and `recall` for past-case history)
-  and cite what you find in `--refs`. Decisions carry `--rationale` and
-  `--rejected` for the losing options — a bare decision is an unauditable
-  assertion.
+  `casefile dig "<topic>"` (and `recall`) and cite what you find in `--refs`.
+  Decisions carry `--rationale` and `--rejected` for losing options.
 - **Echo every entry you file** as one line in your visible reply —
-  `recorded: decision “…” (user)` — your own filings included, not just the
-  user's words. Silent filing is how mistranscription survives; the echo is
-  how the operator catches it in the moment.
+  `recorded: decision "…" (user)` — your own filings included.
 - File hypotheses, decisions, observations, and questions as you work —
-  the conventions in `.claude/skills/casefile/SKILL.md` apply to any agent,
-  not just Claude. Never edit `.casefile/log.jsonl` by hand."""
+  the conventions in `.claude/skills/casefile/SKILL.md` apply to any agent.
+  Never edit `.casefile/log.jsonl` by hand."""
 
 
 def codex_home() -> Path:
@@ -2322,7 +2965,8 @@ def main():
     s.add_argument("--check", help="hypothesis/constraint: shell recipe, exit 0 = still holds")
     s.add_argument("--supersedes", nargs="*", action="extend", default=[],
                    help="hypotheses: prior hypothesis id(s) this re-file corrects")
-    s.add_argument("--to", choices=["user", "any"], help="questions: mailbox routing")
+    s.add_argument("--to",
+                   help="questions/notes: route to user|any|<author> (mailbox / packet peer)")
     s.set_defaults(fn=cmd_add)
 
     for name, fn, extras in [
@@ -2447,11 +3091,61 @@ def main():
 
     s = sub.add_parser("status", help="cases, mailbox, active case")
     s.add_argument("--json", action="store_true")
+    s.add_argument("-a", "--author", help="session author override")
     s.set_defaults(fn=cmd_status)
 
     s = sub.add_parser("log", help="raw entry listing")
     s.add_argument("-n", type=int, default=30)
     s.set_defaults(fn=cmd_log)
+
+    s = sub.add_parser("whoami",
+                      help="session author identity + store discovery")
+    s.add_argument("-a", "--author", help="override author for this invocation")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_whoami)
+
+    s = sub.add_parser(
+        "boot",
+        help="cold-start briefing: discover + identity + startup recheck + next/card")
+    s.add_argument("--case")
+    s.add_argument("-a", "--author", help="session author (else CASEFILE_AUTHOR)")
+    s.add_argument("--budget", type=int, default=2000, help="approx token budget for BRIEF")
+    s.add_argument("--skip-recheck", action="store_true",
+                   help="skip startup recheck (tests / offline)")
+    s.add_argument("--ok-exit", action="store_true",
+                   help="always exit 0 (still prints signals; for shells that treat rc specially)")
+    s.set_defaults(fn=cmd_boot)
+
+    s = sub.add_parser(
+        "packet",
+        help="peer handoff packet via the log (brief + open claims + forbidden)")
+    s.add_argument("--to", required=True, help="peer author (codex, claude, grok, …)")
+    s.add_argument("-a", "--author", help="sender author")
+    s.add_argument("--case")
+    s.add_argument("--no-file", action="store_true",
+                   help="print only; do not append a note entry")
+    s.set_defaults(fn=cmd_packet)
+
+    s = sub.add_parser("inbox", help="entries addressed to an author (log-only handoff)")
+    s.add_argument("--for", dest="for_author",
+                   help="author whose inbox to list (default: session author)")
+    s.add_argument("-a", "--author", help="session author fallback")
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_inbox)
+
+    s = sub.add_parser("next", help="suggest concrete CLI actions from log state")
+    s.add_argument("--case")
+    s.add_argument("-a", "--author")
+    s.set_defaults(fn=cmd_next)
+
+    s = sub.add_parser(
+        "checkpoint",
+        help="refresh rolling abstract + reindex compost (append-only)")
+    s.add_argument("body", nargs="?", default=None,
+                   help="optional abstract body; auto-synthesized if omitted")
+    s.add_argument("-a", "--author", help="digest author")
+    s.add_argument("--case")
+    s.set_defaults(fn=cmd_checkpoint)
 
     args = p.parse_args()
     args.fn(args)

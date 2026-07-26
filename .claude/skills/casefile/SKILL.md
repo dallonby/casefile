@@ -11,18 +11,18 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 
 ## Session start
 
-1. Run `python3 casefile.py resume-context` and read it. Ground truth beats
-   the notes: where the log and the world conflict, the world wins — record
-   the discrepancy as a new observation.
-2. Run `python3 casefile.py recheck --startup` — it re-runs the recorded
-   check recipes and tells you which claims still hold versus
-   held-three-days-ago. Drift is your first lead. `--startup` keeps this
-   fast by skipping known-slow recipes (their last conclusive result is
-   reported instead); run the bare `recheck` when a skipped claim matters.
-3. Run `python3 casefile.py status`. Address open questions before
-   proceeding; questions marked `→ user` are waiting on the user — surface
-   them once, don't block on them. Act on any dormancy nudge or lint count
-   conversationally (never dump raw lint output at the user).
+1. **Prefer one command:** `python3 casefile.py boot`
+   (discovers the store, stamps author from `CASEFILE_AUTHOR` / `-a`, runs
+   `recheck --startup`, prints WHERE / YOU ARE / WORLD vs LOG / BRIEF /
+   DO NOT / NEXT / CARD). Exit codes: 0 ok, 10 mailbox, 20 drift,
+   30 abstract stale. Act on NEXT; surface mailbox once, don't block.
+2. Export `CASEFILE_AUTHOR=claude|codex|grok|…` so grades and packets
+   attribute correctly (`casefile whoami` to inspect).
+3. Legacy equivalent of boot: `resume-context` then `recheck --startup`
+   then `status`. Ground truth beats the notes where they conflict.
+4. Multi-agent handoff (no shared chat): `packet --to <peer>`, peer runs
+   `inbox --for <self>` + `boot`. Checkpoint with `checkpoint` before long
+   gaps so `recall` sees the distilled problem.
 
 ## Filing conventions (types and authors matter — grades are computed from them)
 
@@ -43,16 +43,19 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
   abstract current (`--kind abstract`; `--supersedes` is automatic for
   abstracts): problem, status with grade in words, leading theory,
   ruled-out list, key decisions, open items. Run `reindex` after.
+  Prefer `casefile checkpoint` which refreshes the abstract and reindexes.
 
 ## Recognizing casefile-directed speech
 
 | user says | you do |
 |---|---|
-| "where are we on X?" | `resume-context` → prose summary sized to the question |
+| "where are we on X?" | `boot` (or `resume-context`) → prose summary sized to the question |
 | "don't touch X" | `add -t constraint -a user` |
 | "I'm not convinced by X" | `dispute -a user` |
 | "why did we rule out X?" | `dig "<query>"` (searches superseded history; expands digests) |
 | "have we seen this before?" | `recall "<query>"` (searches past-case abstracts) |
+| "hand off to codex" | `packet --to codex` |
+| "what's waiting for me?" | `inbox --for $CASEFILE_AUTHOR` / `next` |
 | "what's codex saying?" / "show me the deliberation" | `channel <model>` (ui viewport → that model's live transcript) |
 | "show the case again" | `channel state` (ui viewport → live state view) |
 | "rule that out" / "let's go with X" | `resolve` / `add -t decision -a user` — **confirm first** |
@@ -67,10 +70,10 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 - Your own routine filing is silent by default; show it on request.
 - **Reset-readiness drill** (user-adopted 2026-07-17): periodically — after
   a digest, before ending a long session, or when the abstract feels stale —
-  simulate a context reset: read ONLY `resume-context` + `status` output and
-  ask what a fresh instance would be missing or misled by. Fix the surface
-  (abstract, mailbox, checks), not the instance. Note the drill result in
-  the sweep marker.
+  simulate a context reset: read ONLY `boot` (or `resume-context` + `status`)
+  output and ask what a fresh instance would be missing or misled by. Fix the
+  surface (abstract, mailbox, checks), not the instance. Note the drill
+  result in the sweep marker.
 
 ## Importing existing notes (§11.3)
 
