@@ -32,6 +32,7 @@ EXIT_OK = 0
 EXIT_MAILBOX = 10
 EXIT_DRIFT = 20
 EXIT_ABSTRACT_STALE = 30
+EXIT_IDENTITY = 40  # CASEFILE_AUTHOR unset — agent must claim an identity
 
 # Rolling abstract is stale when this many entries land after it with no refresh.
 ABSTRACT_STALE_ENTRIES = 25
@@ -418,6 +419,25 @@ def require_root(start: Path | None = None):
     return root, read_entries(root), load_meta(root)
 
 
+def identity_mandate(author: str | None = None, source: str | None = None) -> list[str]:
+    """Lines every agent must see: claim a durable CASEFILE_AUTHOR before filing."""
+    claimed = author if source and source != "default" and author not in (None, "agent") \
+        else "<your-identity>"
+    lines = [
+        f"REQUIRED: export {ENV_AUTHOR}=<your-identity> before filing claims.",
+        f"  Examples: {ENV_AUTHOR}=claude  |  {ENV_AUTHOR}=codex  |  "
+        f"{ENV_AUTHOR}=grok45  |  {ENV_AUTHOR}=fable",
+        f"  (aliases: fable/sonnet/opus→claude, grok/xai→grok45, gpt→codex)",
+        f"  Then: casefile boot   OR pass -a {claimed} on every write.",
+        "  User words only with -a user. Never leave identity as default `agent`.",
+    ]
+    if source == "default":
+        lines.insert(0,
+                     f"⚠ IDENTITY UNSET — you are anonymous (`agent`). "
+                     f"Other models cannot endorse/dispute you correctly.")
+    return lines
+
+
 def cmd_whoami(args):
     author, source = resolve_author(getattr(args, "author", None))
     root = find_root()
@@ -427,16 +447,18 @@ def cmd_whoami(args):
         "env": ENV_AUTHOR,
         "root": str(root) if root else None,
         "cwd": str(Path.cwd().resolve()),
+        "identity_ok": source != "default",
     }
     if getattr(args, "json", False):
         print(json.dumps(out, indent=2))
         return
     print(f"author: {author} (from {source})")
-    if source == "default":
-        print(f"hint: export {ENV_AUTHOR}=claude|codex|grok|… so grades and "
-              f"packets attribute correctly")
+    for line in identity_mandate(author, source):
+        print(line)
     print(f"store: {root if root else '(none — run casefile init)'}")
     print(f"cwd:   {out['cwd']}")
+    if source == "default":
+        sys.exit(EXIT_IDENTITY)
 
 
 def resolve_case(root: Path, meta: dict, explicit: str | None) -> str:
@@ -1825,11 +1847,13 @@ def suggest_next_actions(entries: list[dict], meta: dict, case: str,
     return actions[:12]
 
 
-def agent_card(author: str) -> str:
-    return "\n".join([
-        f"You are author `{author}`. Grades are computed from type+author+refs.",
+def agent_card(author: str, author_source: str = "env") -> str:
+    lines = identity_mandate(author, author_source)
+    lines += [
+        f"You are author `{author}` (source={author_source}). "
+        "Grades are computed from type+author+refs.",
         "Never edit .casefile/log.jsonl by hand — corrections are new entries.",
-        "Session boot: casefile boot   (or: whoami → recheck --startup → status)",
+        "Session boot: casefile boot   (after export CASEFILE_AUTHOR=…)",
         "File: casefile add -t hypothesis|decision|observation|constraint|question|note "
         f"-a {author} \"…\"",
         "User decisions ONLY with -a user. Your proposals use your author id.",
@@ -1838,8 +1862,10 @@ def agent_card(author: str) -> str:
         "Handoff: casefile packet --to <peer> | casefile inbox --for " + author,
         "Checkpoint: casefile checkpoint -a " + author + "  # abstract + reindex",
         "Recall: casefile recall \"problem keywords\"   Dig: casefile dig \"…\"",
-        "Boot exit codes: 0 ok | 10 mailbox | 20 drift | 30 abstract stale",
-    ])
+        "Boot exit codes: 0 ok | 10 mailbox | 20 drift | 30 abstract stale | "
+        "40 identity unset",
+    ]
+    return "\n".join(lines)
 
 
 def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
@@ -1869,7 +1895,7 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
 
     you = [
         f"author: {author} (from {author_source})",
-        f"set {ENV_AUTHOR} or pass -a to attribute claims correctly",
+        *identity_mandate(author, author_source),
     ]
 
     world = [
@@ -1942,6 +1968,12 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
 
     next_actions = suggest_next_actions(
         entries, meta, case, author, freshness, drift=recheck["drifted"])
+    if author_source == "default":
+        next_actions = [
+            f"export {ENV_AUTHOR}=claude|codex|grok45|fable   "
+            f"# REQUIRED before any add/endorse/packet",
+            f"casefile whoami   # confirm author is not default `agent`",
+        ] + next_actions
 
     parts = [
         "=== WHERE ===",
@@ -1963,12 +1995,15 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
         *[f"{i}. {a}" for i, a in enumerate(next_actions, 1)],
         "",
         "=== CARD ===",
-        agent_card(author),
+        agent_card(author, author_source),
     ]
     text = "\n".join(parts)
 
+    # Identity unset is highest-priority for multi-agent coherence.
     code = EXIT_OK
-    if freshness.get("stale"):
+    if author_source == "default":
+        code = EXIT_IDENTITY
+    elif freshness.get("stale"):
         code = EXIT_ABSTRACT_STALE
     elif recheck["drifted"]:
         code = EXIT_DRIFT
@@ -2451,9 +2486,16 @@ def main():
     tmp = state / f"pulse-{sid}.tmp"
     tmp.write_text(str(len(parsed)))
     os.replace(tmp, state / f"pulse-{sid}")
+    author = (os.environ.get("CASEFILE_AUTHOR") or "").strip()
+    if author:
+        id_line = f"CASEFILE_AUTHOR={author} (ok)"
+    else:
+        id_line = ("CASEFILE_AUTHOR unset — export CASEFILE_AUTHOR="
+                   "claude|codex|grok45|fable before filing "
+                   "(run: casefile whoami && casefile boot)")
     print(json.dumps({"systemMessage":
                       f"casefile: {active} — {len(parsed)} entries, "
-                      f"{open_q} open questions"}))
+                      f"{open_q} open questions. {id_line}"}))
 
 
 if __name__ == "__main__":
@@ -2475,17 +2517,31 @@ The CLI is `python3 casefile.py <cmd>` from the repo root (or `casefile` if
 installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 **never edit it by hand**; corrections are new entries.
 
+## Identity (do this first — every session, every agent)
+
+**You MUST export your own identity before filing anything:**
+
+```bash
+export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias here)
+# export CASEFILE_AUTHOR=codex   # OpenAI / Codex
+# export CASEFILE_AUTHOR=grok45  # xAI / Grok
+```
+
+- Run `casefile whoami` — if it says `from default` / author `agent`, **stop and export**.
+- Boot exit code **40** means identity unset. Grades, endorse/dispute, and packets
+  depend on a real author; anonymous `agent` is not multi-agent safe.
+- Always pass the same identity via `-a $CASEFILE_AUTHOR` on writes if env cannot stick.
+
 ## Session start
 
-1. **Prefer one command:** `python3 casefile.py boot`
-   (discovers the store, stamps author from `CASEFILE_AUTHOR` / `-a`, runs
-   `recheck --startup`, prints WHERE / YOU ARE / WORLD vs LOG / BRIEF /
-   DO NOT / NEXT / CARD). Exit codes: 0 ok, 10 mailbox, 20 drift,
-   30 abstract stale. Act on NEXT; surface mailbox once, don't block.
-2. Export `CASEFILE_AUTHOR=claude|codex|grok|…` so grades and packets
-   attribute correctly (`casefile whoami` to inspect).
-3. Legacy equivalent of boot: `resume-context` then `recheck --startup`
-   then `status`. Ground truth beats the notes where they conflict.
+1. `export CASEFILE_AUTHOR=…` (see Identity above).
+2. **Prefer one command:** `python3 casefile.py boot`
+   (discovers the store, stamps author, runs `recheck --startup`, prints
+   WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD).
+   Exit codes: 0 ok, 10 mailbox, 20 drift, 30 abstract stale, **40 identity unset**.
+   Act on NEXT; surface mailbox once, don't block.
+3. Legacy equivalent: `resume-context` then `recheck --startup` then `status`.
+   Ground truth beats the notes where they conflict.
 4. Multi-agent handoff (no shared chat): `packet --to <peer>`, peer runs
    `inbox --for <self>` + `boot`. Checkpoint with `checkpoint` before long
    gaps so `recall` sees the distilled problem.
@@ -2634,7 +2690,8 @@ This project keeps its investigation state in an append-only casefile log.
   `casefile upgrade` (git-pulls the casefile checkout, installs a `casefile`
   symlink on PATH, rewrites SKILL.md + hooks from that CLI).
 - **REQUIRED every session:** `export CASEFILE_AUTHOR=<your-id>` then
-  `casefile boot`. If `whoami` shows author `agent` / `from default`, stop
+  `casefile boot`. Pick a durable id (e.g. `claude`, `codex`, `grok45`;
+  `fable`→claude). If `whoami` shows author `agent` / `from default`, stop
   and export first (boot exit 40). Never file as anonymous `agent`.
 - Handoff via the log: `packet --to <peer>`, `inbox --for <you>`, `next`.
 - Checkpoint abstracts: `checkpoint` then `recall` for compost search.

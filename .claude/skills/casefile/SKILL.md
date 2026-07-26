@@ -9,17 +9,31 @@ The CLI is `python3 casefile.py <cmd>` from the repo root (or `casefile` if
 installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 **never edit it by hand**; corrections are new entries.
 
+## Identity (do this first — every session, every agent)
+
+**You MUST export your own identity before filing anything:**
+
+```bash
+export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias here)
+# export CASEFILE_AUTHOR=codex   # OpenAI / Codex
+# export CASEFILE_AUTHOR=grok45  # xAI / Grok
+```
+
+- Run `casefile whoami` — if it says `from default` / author `agent`, **stop and export**.
+- Boot exit code **40** means identity unset. Grades, endorse/dispute, and packets
+  depend on a real author; anonymous `agent` is not multi-agent safe.
+- Always pass the same identity via `-a $CASEFILE_AUTHOR` on writes if env cannot stick.
+
 ## Session start
 
-1. **Prefer one command:** `python3 casefile.py boot`
-   (discovers the store, stamps author from `CASEFILE_AUTHOR` / `-a`, runs
-   `recheck --startup`, prints WHERE / YOU ARE / WORLD vs LOG / BRIEF /
-   DO NOT / NEXT / CARD). Exit codes: 0 ok, 10 mailbox, 20 drift,
-   30 abstract stale. Act on NEXT; surface mailbox once, don't block.
-2. Export `CASEFILE_AUTHOR=claude|codex|grok|…` so grades and packets
-   attribute correctly (`casefile whoami` to inspect).
-3. Legacy equivalent of boot: `resume-context` then `recheck --startup`
-   then `status`. Ground truth beats the notes where they conflict.
+1. `export CASEFILE_AUTHOR=…` (see Identity above).
+2. **Prefer one command:** `python3 casefile.py boot`
+   (discovers the store, stamps author, runs `recheck --startup`, prints
+   WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD).
+   Exit codes: 0 ok, 10 mailbox, 20 drift, 30 abstract stale, **40 identity unset**.
+   Act on NEXT; surface mailbox once, don't block.
+3. Legacy equivalent: `resume-context` then `recheck --startup` then `status`.
+   Ground truth beats the notes where they conflict.
 4. Multi-agent handoff (no shared chat): `packet --to <peer>`, peer runs
    `inbox --for <self>` + `boot`. Checkpoint with `checkpoint` before long
    gaps so `recall` sees the distilled problem.
@@ -43,7 +57,6 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
   abstract current (`--kind abstract`; `--supersedes` is automatic for
   abstracts): problem, status with grade in words, leading theory,
   ruled-out list, key decisions, open items. Run `reindex` after.
-  Prefer `casefile checkpoint` which refreshes the abstract and reindexes.
 
 ## Recognizing casefile-directed speech
 
@@ -70,10 +83,10 @@ installed). The log (`.casefile/log.jsonl`) is append-only ground truth —
 - Your own routine filing is silent by default; show it on request.
 - **Reset-readiness drill** (user-adopted 2026-07-17): periodically — after
   a digest, before ending a long session, or when the abstract feels stale —
-  simulate a context reset: read ONLY `boot` (or `resume-context` + `status`)
-  output and ask what a fresh instance would be missing or misled by. Fix the
-  surface (abstract, mailbox, checks), not the instance. Note the drill
-  result in the sweep marker.
+  simulate a context reset: read ONLY `resume-context` + `status` output and
+  ask what a fresh instance would be missing or misled by. Fix the surface
+  (abstract, mailbox, checks), not the instance. Note the drill result in
+  the sweep marker.
 
 ## Importing existing notes (§11.3)
 

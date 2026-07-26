@@ -1181,9 +1181,12 @@ class CliLintTests(CliBase):
 
 class IdentityAndDiscoveryTests(CliBase):
     def test_whoami_default_and_env(self):
-        r = self.cli("whoami", expect=0)
+        r = self.cli("whoami", expect=None)
+        self.assertEqual(r.rc, cf.EXIT_IDENTITY)  # unset → 40
         self.assertIn("author: agent", r.out)
         self.assertIn("from default", r.out)
+        self.assertIn("CASEFILE_AUTHOR", r.out)
+        self.assertIn("REQUIRED", r.out)
         env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home"),
                "CASEFILE_AUTHOR": "GPT"}
         p = subprocess.run([sys.executable, str(CASEFILE), "whoami"],
@@ -1360,6 +1363,32 @@ class UnitPorcelainHelpers(unittest.TestCase):
         st = cf.abstract_freshness([], "c")
         self.assertTrue(st["stale"])
         self.assertFalse(st["present"])
+
+
+class IdentityMandateTests(CliBase):
+    """Every agent must be told to export CASEFILE_AUTHOR."""
+
+    def test_boot_without_env_exits_40_and_mandates_export(self):
+        self.add("-t", "hypothesis", "-a", "claude", "x")
+        # no CASEFILE_AUTHOR, no -a → identity unset
+        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home")}
+        env.pop("CASEFILE_AUTHOR", None)
+        p = subprocess.run(
+            [sys.executable, str(CASEFILE), "boot", "--skip-recheck"],
+            cwd=self.dir, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, cf.EXIT_IDENTITY)
+        self.assertIn("=== YOU ARE ===", p.stdout)
+        self.assertIn("IDENTITY UNSET", p.stdout)
+        self.assertIn("export CASEFILE_AUTHOR", p.stdout)
+        self.assertIn("REQUIRED", p.stdout)
+        # NEXT prioritizes identity
+        self.assertRegex(p.stdout, r"1\.\s+export CASEFILE_AUTHOR")
+
+    def test_boot_with_author_flag_not_identity_exit(self):
+        self.cli("checkpoint", "-a", "claude", expect=0)
+        r = self.cli("boot", "-a", "claude", "--skip-recheck", expect=0)
+        self.assertIn("REQUIRED: export CASEFILE_AUTHOR", r.out)
+        self.assertNotIn("IDENTITY UNSET", r.out)
 
 
 class AuthorIdentityCoherenceTests(CliBase):
