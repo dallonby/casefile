@@ -50,9 +50,11 @@ history on the VPN (e.g. ashburn2):
 ```bash
 CASEFILE_PERSISTENCE_MODE=postgres
 CASEFILE_POSTGRES_URL=postgres://rarbi:rarbi@ashburn2.a-star.io/rarbi
-# same namespace on every clone that should share one history:
-CASEFILE_PG_NAMESPACE=rarbi-q5-dynamic-fee
 ```
+
+Namespace defaults to the **store folder name** (e.g. worktree
+`…/q5-dynamic-fee` → `q5-dynamic-fee`). No extra env var if everyone uses the
+same directory basename. Override with `CASEFILE_PG_NAMESPACE` only if needed.
 
 On first use, local history is imported into Postgres; later syncs **dedupe by
 entry id** (`ON CONFLICT DO NOTHING`). Local JSONL is still mirrored for git

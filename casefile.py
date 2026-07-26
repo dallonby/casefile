@@ -29,7 +29,7 @@ ENV_AUTHOR = "CASEFILE_AUTHOR"
 # Persistence: default local FS (+ git). Opt-in shared Postgres multi-writer:
 #   CASEFILE_PERSISTENCE_MODE=local|postgres
 #   CASEFILE_POSTGRES_URL=postgres://user:pass@host/db
-#   CASEFILE_PG_NAMESPACE=shared-name   # optional; default from git remote+dir
+#   CASEFILE_PG_NAMESPACE=…   # optional override; default = store folder name
 # Local identity without `export`: CASEFILE_AUTHOR in project `.env` /
 # `.env.local`, or a one-line `.casefile/author` file (gitignored).
 ENV_PERSISTENCE_MODE = "CASEFILE_PERSISTENCE_MODE"
@@ -288,24 +288,21 @@ def persistence_mode() -> str:
 
 
 def pg_namespace(root: Path) -> str:
-    """Stable multi-clone namespace for a store.
+    """Postgres log partition for this store.
 
-    Prefer explicit ``CASEFILE_PG_NAMESPACE`` so teammates share one history
-    even when worktree paths differ. Else git origin URL + directory name.
+    Default is the **store folder name** (e.g. ``q5-dynamic-fee``) so multi-user
+    clones share history without another env var — keep the same directory
+    basename across machines. Override with ``CASEFILE_PG_NAMESPACE`` only when
+    the folder name would collide or you intentionally want a different id.
     """
     ensure_dotenv_loaded()
     env = (os.environ.get(ENV_PG_NAMESPACE) or "").strip()
     if env:
         return env
-    try:
-        url = subprocess.check_output(
-            ["git", "-C", str(root), "remote", "get-url", "origin"],
-            text=True, stderr=subprocess.DEVNULL,
-        ).strip()
-    except (OSError, subprocess.CalledProcessError):
-        url = ""
-    seed = f"{url}|{root.resolve().name}"
-    return hashlib.sha256(seed.encode()).hexdigest()[:20]
+    name = root.resolve().name.strip()
+    if not name or name in (".", "/"):
+        name = "casefile"
+    return name
 
 
 def _pg_connect():
