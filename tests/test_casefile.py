@@ -1314,7 +1314,7 @@ class LivenessPulseTests(CliBase):
         self.assertIn("Secretary sweep", d["reason"])
 
     def test_sweep_author_prefers_env_when_no_argv(self):
-        # Claude settings install has no argv; Grok should pick CASEFILE_AUTHOR.
+        # An explicit identity still wins when a no-argv hook is shared.
         env = {**os.environ, "CASEFILE_AUTHOR": "grok"}
         p = subprocess.run(
             [sys.executable, str(self.dir / ".casefile" / "hooks" / "sweep.py")],
@@ -1324,6 +1324,25 @@ class LivenessPulseTests(CliBase):
         self.assertEqual(p.returncode, 0, p.stderr)
         d = json.loads(p.stdout.strip())
         self.assertIn('-a grok', d["reason"])
+
+    def test_sweep_author_detects_plain_grok_runtime(self):
+        # Grok reserves and injects these for every hook, while a normal
+        # `grok` launch does not inject CASEFILE_AUTHOR.
+        env = dict(os.environ)
+        env.pop("CASEFILE_AUTHOR", None)
+        env.update({
+            "GROK_HOOK_EVENT": "stop",
+            "GROK_SESSION_ID": "11111111-1111-4111-8111-111111111111",
+        })
+        p = subprocess.run(
+            [sys.executable, str(self.dir / ".casefile" / "hooks" / "sweep.py")],
+            cwd=self.dir, capture_output=True, text=True,
+            input=json.dumps({"stopHookActive": False, "sessionId": "g4"}),
+            env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        d = json.loads(p.stdout.strip())
+        self.assertIn('-a grok', d["reason"])
+        self.assertNotIn('-a claude', d["reason"])
 
     def test_observe_accepts_grok_run_terminal_command_payload(self):
         payload = {

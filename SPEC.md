@@ -594,6 +594,9 @@ sends a **camelCase** envelope (`stopHookActive`, `sessionId`,
 must accept both snake_case and camelCase keys; ignoring camelCase
 re-blocks the Stop gate forever (up to the vendor continuation cap)
 because the re-fire never looks "active".
+For author attribution, an explicit hook argv or `CASEFILE_AUTHOR` wins;
+otherwise the sweep recognizes Grok's reserved, runner-injected
+`GROK_HOOK_EVENT` + `GROK_SESSION_ID` pair before defaulting to Claude.
 Conventions land in a managed `AGENTS.md` section (Codex's project
 instructions file), pointing at the shared skill. Hook trust is per-hook,
 hash-based, and granted once interactively via `/hooks`; headless runs use

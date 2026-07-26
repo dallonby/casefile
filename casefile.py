@@ -2820,12 +2820,15 @@ LEASE_FRESH_S = 10
 
 ROOT = Path(__file__).resolve().parents[2]  # <repo>/.casefile/hooks/sweep.py
 
-# installing vendor may pass author as argv[1] (codex); otherwise prefer
-# CASEFILE_AUTHOR so Grok (which loads Claude settings without argv) files
-# as itself; default stays claude for the bare claude-code install
+# Installing vendor may pass author as argv[1] (codex); otherwise prefer an
+# explicit CASEFILE_AUTHOR.  A plain Grok launch does not set that variable,
+# but its hook runner always injects both reserved GROK_* values, so use those
+# as the runtime discriminator before the bare claude-code default.
 AUTHOR = (
     (sys.argv[1] if len(sys.argv) > 1 else "").strip()
     or (os.environ.get("CASEFILE_AUTHOR") or "").strip()
+    or ("grok" if os.environ.get("GROK_HOOK_EVENT")
+        and os.environ.get("GROK_SESSION_ID") else "")
     or "claude"
 )
 
