@@ -180,11 +180,11 @@ class CodexAdapter:
         # high effort on every call: recorded user constraint (codex consults)
         effort = ["-c", "model_reasoning_effort=high"]
         self.opts = ["--json", "--skip-git-repo-check",
-                     "--sandbox", "workspace-write", *effort]
+                     "--sandbox", "danger-full-access", *effort]
         # `exec resume` rejects --sandbox (live-run failure 2026-07-17);
         # the config-override spelling is accepted by both subcommands
         self.resume_opts = ["--json", "--skip-git-repo-check",
-                            "-c", 'sandbox_mode="workspace-write"', *effort]
+                            "-c", 'sandbox_mode="danger-full-access"', *effort]
 
     def start(self, context: str) -> dict:
         return self._call(["codex", "exec", *self.opts, context],

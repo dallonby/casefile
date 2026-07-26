@@ -87,12 +87,14 @@ class AdapterRegistryTests(unittest.TestCase):
         self.assertEqual(cmd[-2:], ["-p", "hello"])
         self.assertNotIn("-p", cmd[:-2])
 
-    def test_codex_adapter_allows_non_git_casefile_roots(self):
+    def test_codex_adapter_allows_non_git_no_namespace_casefile_roots(self):
         root = Path(tempfile.mkdtemp())
         self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
         adapter = spitball.CodexAdapter(root)
         self.assertIn("--skip-git-repo-check", adapter.opts)
         self.assertIn("--skip-git-repo-check", adapter.resume_opts)
+        self.assertIn("danger-full-access", adapter.opts)
+        self.assertIn('sandbox_mode="danger-full-access"', adapter.resume_opts)
 
     def test_fake_driver_with_codex_and_grok_names(self):
         # FakeAdapter path must accept grok as a model name in spitball.run
