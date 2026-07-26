@@ -60,11 +60,12 @@ Or non-interactive:
 
 ```bash
 casefile persistence enable \
-  --url 'postgres://rarbi:rarbi@ashburn2.a-star.io/rarbi'
+  --url 'postgres://rarbi:rarbi@ashburn2.a-star.io/casefile'
 ```
 
-URL must look like `postgres://USER:PASSWORD@HOST[:PORT]/DATABASE` (or
-`postgresql://…`). The command prints format hints on bad input.
+Use the dedicated **`casefile`** database (not the app `rarbi` DB). URL shape:
+`postgres://USER:PASSWORD@HOST[:PORT]/DATABASE` (or `postgresql://…`).
+The command prints format hints on bad input.
 
 Namespace defaults to the **store folder name** (e.g. `q5-dynamic-fee`).
 Override with `CASEFILE_PG_NAMESPACE` only if needed.
