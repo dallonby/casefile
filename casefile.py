@@ -16,6 +16,7 @@ import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 DIR = ".casefile"
 LOG = "log.jsonl"
@@ -334,11 +335,91 @@ def ensure_psycopg2_installed() -> str:
         return "failed: pip reported success but import still fails"
 
 
-def _pg_connect():
+POSTGRES_URL_HINTS = """\
+Postgres URL format (libpq / SQLAlchemy style):
+
+  postgres://USER:PASSWORD@HOST:PORT/DATABASE
+  postgresql://USER:PASSWORD@HOST:PORT/DATABASE
+
+Examples:
+  postgres://rarbi:rarbi@localhost/rarbi
+  postgres://rarbi:rarbi@ashburn2.a-star.io/rarbi
+  postgresql://rarbi:s3cret@172.16.0.14:5432/rarbi
+
+Rules:
+  • scheme must be postgres:// or postgresql://
+  • USER and HOST are required
+  • DATABASE path required (e.g. /rarbi) — bare host with no db is rejected
+  • PORT optional (default 5432)
+  • special characters in PASSWORD must be URL-encoded
+    (e.g. @ → %40, / → %2F, # → %23)
+  • query options allowed: ?sslmode=require
+"""
+
+
+def redact_postgres_url(url: str) -> str:
+    """Hide password for logs: postgres://user:***@host:port/db"""
+    try:
+        p = urlparse(url.strip())
+    except Exception:
+        return "(unparseable)"
+    if not p.scheme:
+        return "(invalid)"
+    user = unquote(p.username or "")
+    host = p.hostname or ""
+    port = f":{p.port}" if p.port else ""
+    db = p.path or ""
+    auth = f"{user}:***@" if user else ""
+    return f"{p.scheme}://{auth}{host}{port}{db}"
+
+
+def validate_postgres_url(url: str) -> tuple[bool, str]:
+    """Return (ok, message). Message is a short error or a redacted summary."""
+    raw = (url or "").strip()
+    if not raw:
+        return False, "empty URL"
+    if any(c.isspace() for c in raw):
+        return False, "URL must not contain whitespace (encode spaces as %20)"
+    if "://" not in raw:
+        return False, "missing scheme — use postgres:// or postgresql://"
+    try:
+        p = urlparse(raw)
+    except Exception as ex:
+        return False, f"could not parse URL ({ex})"
+    scheme = (p.scheme or "").lower()
+    if scheme not in ("postgres", "postgresql"):
+        return False, (
+            f"scheme {scheme!r} not allowed — use postgres:// or postgresql://"
+        )
+    if not p.hostname:
+        return False, "missing host (e.g. localhost or ashburn2.a-star.io)"
+    if not p.username:
+        return False, "missing user (e.g. postgres://USER:pass@host/db)"
+    # path is /dbname — require non-empty db name
+    db = (p.path or "").lstrip("/")
+    if not db or "/" in db:
+        return False, (
+            "missing or invalid database name — path must be /DBNAME "
+            "(example: …@host/rarbi)"
+        )
+    if p.port is not None and not (1 <= p.port <= 65535):
+        return False, f"invalid port {p.port}"
+    return True, redact_postgres_url(raw)
+
+
+def print_postgres_url_hints(stream=None) -> None:
+    print(POSTGRES_URL_HINTS.rstrip(), file=stream or sys.stderr)
+
+
+def _pg_connect(url: str | None = None):
     ensure_dotenv_loaded()
-    url = (os.environ.get(ENV_POSTGRES_URL) or "").strip()
+    url = (url if url is not None else os.environ.get(ENV_POSTGRES_URL, "")).strip()
     if not url:
         die(f"{ENV_PERSISTENCE_MODE}=postgres requires {ENV_POSTGRES_URL}")
+    ok, msg = validate_postgres_url(url)
+    if not ok:
+        print_postgres_url_hints()
+        die(f"invalid {ENV_POSTGRES_URL}: {msg}")
     try:
         import psycopg2  # type: ignore
     except ImportError:
@@ -351,7 +432,98 @@ def _pg_connect():
     try:
         return psycopg2.connect(url)
     except Exception as ex:
-        die(f"postgres connect failed: {ex}")
+        die(f"postgres connect failed ({redact_postgres_url(url)}): {ex}")
+
+
+def ensure_casefile_pg_schema(conn) -> None:
+    """Create casefile tables if missing (idempotent)."""
+    ddl = """
+    CREATE TABLE IF NOT EXISTS casefile_entries (
+      namespace   text        NOT NULL,
+      id          text        NOT NULL,
+      ts          timestamptz NOT NULL,
+      case_id     text        NOT NULL,
+      type        text        NOT NULL,
+      author      text        NOT NULL,
+      body        text        NOT NULL DEFAULT '',
+      payload     jsonb       NOT NULL,
+      ingested_at timestamptz NOT NULL DEFAULT now(),
+      PRIMARY KEY (namespace, id)
+    );
+    CREATE INDEX IF NOT EXISTS casefile_entries_ns_ts_idx
+      ON casefile_entries (namespace, ts);
+    CREATE INDEX IF NOT EXISTS casefile_entries_ns_case_ts_idx
+      ON casefile_entries (namespace, case_id, ts);
+    CREATE TABLE IF NOT EXISTS casefile_meta (
+      namespace   text PRIMARY KEY,
+      payload     jsonb       NOT NULL DEFAULT '{}'::jsonb,
+      updated_at  timestamptz NOT NULL DEFAULT now()
+    );
+    """
+    with conn.cursor() as cur:
+        cur.execute(ddl)
+    conn.commit()
+
+
+def upsert_dotenv_keys(path: Path, updates: dict[str, str]) -> list[str]:
+    """Set or replace KEY=value lines in a dotenv file. Returns list of actions."""
+    path = Path(path)
+    lines: list[str] = []
+    if path.exists():
+        lines = path.read_text(encoding="utf-8").splitlines()
+    seen: set[str] = set()
+    out: list[str] = []
+    actions: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key = stripped.split("=", 1)[0].strip()
+            if key.startswith("export "):
+                key = key[7:].strip()
+            if key in updates:
+                out.append(f"{key}={updates[key]}")
+                seen.add(key)
+                actions.append(f"updated {key}")
+                continue
+        out.append(line)
+    for key, val in updates.items():
+        if key not in seen:
+            if out and out[-1].strip():
+                out.append("")
+            out.append(f"{key}={val}")
+            actions.append(f"added {key}")
+    text = "\n".join(out)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(text, encoding="utf-8")
+    return actions
+
+
+def prompt_postgres_url(default: str = "") -> str:
+    """Interactive prompt with format hints; returns a validated URL string."""
+    print_postgres_url_hints(sys.stdout)
+    if default:
+        print(f"Current / default: {redact_postgres_url(default)}")
+    print(f"Enter {ENV_POSTGRES_URL} (leave blank to cancel):")
+    try:
+        # Prefer getpass-style hidden password? Full URL often typed once;
+        # use normal input so paste works. User can re-run if logged.
+        raw = input("> ").strip()
+    except (EOFError, KeyboardInterrupt):
+        print()
+        die("cancelled")
+    if not raw:
+        if default:
+            raw = default
+        else:
+            die("cancelled — no URL provided")
+    ok, msg = validate_postgres_url(raw)
+    if not ok:
+        print(f"error: {msg}", file=sys.stderr)
+        print_postgres_url_hints()
+        die(f"invalid Postgres URL: {msg}")
+    return raw
 
 
 def _read_entries_local(root: Path) -> list[dict]:
@@ -2515,41 +2687,55 @@ def cmd_status(args):
 
 
 def cmd_persistence(args):
-    """Report or force-reconcile the storage backend."""
+    """status | reconcile | enable | disable — storage backend control."""
     root = find_root()
     if root is None:
         die(f"no casefile store found (run `casefile init`, or set {ENV_ROOT})")
+    action = getattr(args, "action", None) or "status"
+
+    if action == "enable":
+        _cmd_persistence_enable(root, args)
+        return
+    if action == "disable":
+        _cmd_persistence_disable(root, args)
+        return
+
     mode = persistence_mode()
     report = {
         "mode": mode,
         "root": str(root),
         "local_entries": len(_read_entries_local(root)),
+        "namespace": pg_namespace(root),
     }
     if mode == "postgres":
-        ns = pg_namespace(root)
-        report["namespace"] = ns
         url = (os.environ.get(ENV_POSTGRES_URL) or "").strip()
-        report["postgres_url_host"] = url.split("@")[-1] if url else None
-        if args.action == "reconcile":
+        report["postgres_url"] = redact_postgres_url(url) if url else None
+        if action == "reconcile":
             _PG_RECONCILED.discard(str(root.resolve()))
             report["reconcile"] = reconcile_postgres(root, quiet=False)
         else:
-            # status: light count without full pull noise
             conn = _pg_connect()
             try:
-                report["remote_entries"] = _pg_count(conn, ns)
+                report["remote_entries"] = _pg_count(conn, report["namespace"])
             finally:
                 conn.close()
-            report["hint"] = "run `casefile persistence reconcile` to sync"
-    if args.json:
+            report["hint"] = (
+                "run `casefile persistence reconcile` to sync; "
+                "`casefile persistence enable` to reconfigure"
+            )
+    else:
+        report["hint"] = (
+            "run `casefile persistence enable` to switch to shared Postgres"
+        )
+    if getattr(args, "json", False):
         print(json.dumps(report, indent=2))
         return
     print(f"mode: {report['mode']}")
     print(f"store: {report['root']}")
     print(f"local entries: {report['local_entries']}")
+    print(f"namespace: {report['namespace']}  (folder name by default)")
     if mode == "postgres":
-        print(f"namespace: {report['namespace']}")
-        print(f"postgres: {report.get('postgres_url_host')}")
+        print(f"postgres: {report.get('postgres_url')}")
         if "remote_entries" in report:
             print(f"remote entries: {report['remote_entries']}")
         if "reconcile" in report:
@@ -2560,6 +2746,99 @@ def cmd_persistence(args):
             )
         elif report.get("hint"):
             print(f"hint: {report['hint']}")
+    elif report.get("hint"):
+        print(f"hint: {report['hint']}")
+
+
+def _cmd_persistence_enable(root: Path, args) -> None:
+    """Prompt/accept Postgres URL, validate, write .env, ensure schema, reconcile."""
+    dep = ensure_psycopg2_installed()
+    if dep.startswith("failed"):
+        die(f"cannot enable postgres: {dep}")
+    if dep == "installed":
+        print("deps: installed psycopg2-binary")
+
+    url = (getattr(args, "url", None) or "").strip()
+    existing = (os.environ.get(ENV_POSTGRES_URL) or "").strip()
+    if not url:
+        if getattr(args, "json", False):
+            die(f"--url is required with --json "
+                f"(example: --url 'postgres://user:pass@host/db')")
+        url = prompt_postgres_url(default=existing)
+    else:
+        ok, msg = validate_postgres_url(url)
+        if not ok:
+            print_postgres_url_hints()
+            die(f"invalid Postgres URL: {msg}")
+        print(f"url: {msg}")  # redacted summary when ok
+
+    print(f"checking connection to {redact_postgres_url(url)} …")
+    conn = _pg_connect(url)
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT current_database(), current_user, version()")
+            db, user, ver = cur.fetchone()
+        print(f"ok: connected as {user} to database {db}")
+        print(f"    {str(ver).split(',')[0]}")
+        ensure_casefile_pg_schema(conn)
+        print("ok: casefile_entries / casefile_meta present")
+    finally:
+        conn.close()
+
+    env_path = root / ".env"
+    actions = upsert_dotenv_keys(env_path, {
+        ENV_PERSISTENCE_MODE: "postgres",
+        ENV_POSTGRES_URL: url,
+    })
+    for a in actions:
+        print(f".env: {a}")
+    # Make this process use postgres immediately (dotenv was already loaded).
+    os.environ[ENV_PERSISTENCE_MODE] = "postgres"
+    os.environ[ENV_POSTGRES_URL] = url
+    _PG_RECONCILED.discard(str(root.resolve()))
+
+    ns = pg_namespace(root)
+    print(f"namespace: {ns}  (store folder name; override with {ENV_PG_NAMESPACE})")
+    if not getattr(args, "no_reconcile", False):
+        print("reconciling local log ↔ postgres …")
+        r = reconcile_postgres(root, quiet=False)
+        print(
+            f"done: mode=postgres pushed={r['pushed']} pulled={r['pulled']} "
+            f"remote_was={r['remote_before']}"
+        )
+    else:
+        print("done: mode=postgres (reconcile skipped; "
+              "run `casefile persistence reconcile`)")
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "mode": "postgres",
+            "root": str(root),
+            "url": redact_postgres_url(url),
+            "namespace": ns,
+            "env_file": str(env_path),
+            "env_actions": actions,
+        }, indent=2))
+
+
+def _cmd_persistence_disable(root: Path, args) -> None:
+    """Write CASEFILE_PERSISTENCE_MODE=local to project .env."""
+    env_path = root / ".env"
+    actions = upsert_dotenv_keys(env_path, {
+        ENV_PERSISTENCE_MODE: "local",
+    })
+    os.environ[ENV_PERSISTENCE_MODE] = "local"
+    _PG_RECONCILED.discard(str(root.resolve()))
+    for a in actions:
+        print(f".env: {a}")
+    print("done: mode=local (Postgres URL left in .env for re-enable; "
+          "local JSONL is source of truth again)")
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "mode": "local",
+            "root": str(root),
+            "env_file": str(env_path),
+            "env_actions": actions,
+        }, indent=2))
 
 
 # -------- multi-agent porcelain: boot / packet / inbox / next / checkpoint
@@ -4539,10 +4818,18 @@ def main():
 
     s = sub.add_parser(
         "persistence",
-        help="show / reconcile storage backend (local JSONL or shared Postgres)")
-    s.add_argument("action", nargs="?", default="status",
-                   choices=["status", "reconcile"],
-                   help="status (default) or force reconcile")
+        help="storage backend: status | enable | disable | reconcile")
+    s.add_argument(
+        "action", nargs="?", default="status",
+        choices=["status", "reconcile", "enable", "disable"],
+        help="status (default), enable/disable postgres, or reconcile")
+    s.add_argument(
+        "--url",
+        help=f"Postgres URL for `enable` ({ENV_POSTGRES_URL}); "
+             "if omitted, prompts with format hints")
+    s.add_argument(
+        "--no-reconcile", action="store_true",
+        help="with `enable`: skip initial local↔postgres sync")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_persistence)
 

@@ -48,22 +48,34 @@ Or a one-line gitignored `.casefile/author`. Process env still wins if set.
 Default is **local** `.casefile/log.jsonl` (rides in git). For multi-user shared
 history on the VPN (e.g. ashburn2):
 
+**Interactive (recommended):**
+
 ```bash
-CASEFILE_PERSISTENCE_MODE=postgres
-CASEFILE_POSTGRES_URL=postgres://rarbi:rarbi@ashburn2.a-star.io/rarbi
+cd /path/to/project-with-.casefile
+casefile persistence enable
+# prompts for URL, validates format + connection, writes .env, reconciles
 ```
 
-Namespace defaults to the **store folder name** (e.g. worktree
-`…/q5-dynamic-fee` → `q5-dynamic-fee`). No extra env var if everyone uses the
-same directory basename. Override with `CASEFILE_PG_NAMESPACE` only if needed.
-
-On first use, local history is imported into Postgres; later syncs **dedupe by
-entry id** (`ON CONFLICT DO NOTHING`). Local JSONL is still mirrored for git
-and offline. Check / force sync:
+Or non-interactive:
 
 ```bash
-casefile persistence            # status
-casefile persistence reconcile  # push local→PG and pull PG→local missing ids
+casefile persistence enable \
+  --url 'postgres://rarbi:rarbi@ashburn2.a-star.io/rarbi'
+```
+
+URL must look like `postgres://USER:PASSWORD@HOST[:PORT]/DATABASE` (or
+`postgresql://…`). The command prints format hints on bad input.
+
+Namespace defaults to the **store folder name** (e.g. `q5-dynamic-fee`).
+Override with `CASEFILE_PG_NAMESPACE` only if needed.
+
+First enable runs a reconcile (local → PG, dedupe by id). Local JSONL stays
+mirrored for git/offline.
+
+```bash
+casefile persistence              # status
+casefile persistence reconcile    # sync again
+casefile persistence disable      # back to local-only (keeps URL in .env)
 ```
 
 ### macOS
