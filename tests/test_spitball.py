@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -72,6 +73,19 @@ class AdapterRegistryTests(unittest.TestCase):
         text = spitball.role_brief(root, "proposer", "grok45")
         self.assertIn('-a grok', text)
         self.assertNotIn('-a grok45', text)
+
+    def test_grok_adapter_places_single_immediately_before_prompt(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+        reply = subprocess.CompletedProcess(
+            [], 0,
+            stdout=json.dumps({"text": "ok", "sessionId": "sid", "usage": {}}),
+            stderr="")
+        with mock.patch.object(spitball.subprocess, "run", return_value=reply) as run:
+            spitball.GrokAdapter(root).start("hello")
+        cmd = run.call_args.args[0]
+        self.assertEqual(cmd[-2:], ["-p", "hello"])
+        self.assertNotIn("-p", cmd[:-2])
 
     def test_fake_driver_with_codex_and_grok_names(self):
         # FakeAdapter path must accept grok as a model name in spitball.run

@@ -12,6 +12,7 @@ source: manual) — re-verify on CLI upgrades, never trust memory.
 """
 
 import json
+import os
 import queue
 import subprocess
 import sys
@@ -241,7 +242,7 @@ class GrokAdapter:
         # Allow casefile CLI filings; auto-approve so deliberation is unattended.
         # Match Claude adapter's tool allowlist shape.
         self.base = [
-            "grok", "-p",
+            "grok",
             "--output-format", "json",
             "--permission-mode", "auto",
             "--always-approve",
@@ -263,7 +264,7 @@ class GrokAdapter:
         cmd = list(self.base)
         if sid:
             cmd += ["-r", sid]
-        cmd.append(prompt)
+        cmd += ["-p", prompt]
         p = subprocess.run(cmd, cwd=self.root, capture_output=True, text=True,
                            timeout=TURN_TIMEOUT_S, env=env)
         if p.returncode != 0:
