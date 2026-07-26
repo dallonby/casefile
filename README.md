@@ -70,9 +70,10 @@ tamper-evident by construction.
   the log and files what the conversation decided but never recorded; a
   one-line liveness pulse shows what changed since you last looked.
 - **`casefile spitball`** — a two-model deliberation driver (proposer vs
-  critic) that ferries turns between CLIs (Claude Code, Codex); both
-  models file claims and disputes into the same log, and convergence is
+  critic) that ferries turns between live CLIs (**Claude Code, Codex, Grok**);
+  both models file claims and disputes into the same log, and convergence is
   detected from the log itself, not from the transcript.
+  Example: `casefile spitball --topic "…" --models codex,grok`.
 - **`dig` and `recall`** — full history search (superseded entries
   included) and cross-case compost: "have we seen this before?"
 
