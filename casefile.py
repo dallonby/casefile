@@ -270,7 +270,18 @@ def load_active(root: Path, meta: dict | None = None) -> str | None:
     if p.exists():
         return p.read_text().strip() or None
     m = meta if meta is not None else load_meta(root)
-    return m.get("active_case")
+    cid = m.get("active_case")
+    if cid:
+        return cid
+    # Cross-machine cold boot: the pointer is untracked local state, so a
+    # fresh clone has none — resume the last-touched case in the log itself.
+    try:
+        for line in reversed((root / DIR / LOG).read_text().splitlines()):
+            if line.strip():
+                return json.loads(line)["case"]
+    except (OSError, ValueError, KeyError):
+        pass
+    return None
 
 
 def save_active(root: Path, cid: str | None):
@@ -317,6 +328,8 @@ def ensure_psycopg2_installed() -> str:
         return "ok"
     except ImportError:
         pass
+    if (os.environ.get("CASEFILE_SKIP_PIP") or "").strip():
+        return "failed: psycopg2 not importable (auto-install disabled by CASEFILE_SKIP_PIP)"
     cmd = [sys.executable, "-m", "pip", "install", "psycopg2-binary"]
     try:
         p = subprocess.run(
@@ -615,6 +628,55 @@ def _pg_count(conn, namespace: str) -> int:
         return int(cur.fetchone()[0])
 
 
+def _pg_join_preview(conn, namespace: str, root: Path) -> dict:
+    """What already lives in this namespace, and would enabling here merge two
+    unrelated histories? A non-empty namespace sharing zero entry ids with a
+    non-empty local log is the fork-collision signature (e.g. two forks whose
+    store folders share a basename)."""
+    remote_ids = _pg_existing_ids(conn, namespace)
+    local_ids = {e["id"] for e in _read_entries_local(root) if e.get("id")}
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT case_id, author, COUNT(*) FROM casefile_entries "
+            "WHERE namespace = %s GROUP BY case_id, author "
+            "ORDER BY COUNT(*) DESC LIMIT 20",
+            (namespace,),
+        )
+        rows = [{"case": r[0], "author": r[1], "entries": int(r[2])}
+                for r in cur.fetchall()]
+    overlap = len(remote_ids & local_ids)
+    return {"remote_entries": len(remote_ids),
+            "local_entries": len(local_ids),
+            "overlap": overlap,
+            "fork_collision": bool(remote_ids) and bool(local_ids) and not overlap,
+            "rows": rows}
+
+
+def _pg_load_registry(conn, namespace: str) -> dict:
+    with conn.cursor() as cur:
+        cur.execute("SELECT payload FROM casefile_meta WHERE namespace = %s",
+                    (namespace,))
+        row = cur.fetchone()
+    if not row:
+        return {}
+    payload = row[0]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return payload or {}
+
+
+def _pg_save_registry(conn, namespace: str, payload: dict) -> None:
+    with conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO casefile_meta (namespace, payload, updated_at) "
+            "VALUES (%s, %s::jsonb, now()) "
+            "ON CONFLICT (namespace) DO UPDATE "
+            "SET payload = EXCLUDED.payload, updated_at = now()",
+            (namespace, json.dumps(payload)),
+        )
+    conn.commit()
+
+
 def reconcile_postgres(root: Path, *, quiet: bool = False) -> dict:
     """Push local-only entries to Postgres; pull remote-only into local log.
 
@@ -656,6 +718,33 @@ def reconcile_postgres(root: Path, *, quiet: bool = False) -> dict:
                 pulled = len(missing_local)
         else:
             pulled = 0
+
+        # The case registry travels too: titles/goals live in meta.json, which
+        # a clone that pulls entries from PG otherwise never sees — and
+        # `status` stays blind to sharing without it.
+        try:
+            meta = load_meta(root)
+        except Exception:
+            meta = {"cases": {}}
+        local_cases = dict(meta.get("cases", {}))
+        remote_reg = _pg_load_registry(conn, ns)
+        remote_cases = dict(remote_reg.get("cases", {}))
+        pulled_cases = {c: v for c, v in remote_cases.items()
+                        if c not in local_cases}
+        # entries can arrive from a peer that never synced its registry —
+        # stub their cases so resolve/status don't KeyError on them
+        for e in missing_local:
+            c = e.get("case")
+            if c and c not in local_cases and c not in pulled_cases:
+                pulled_cases[c] = {"title": c, "goal": "",
+                                   "created": e.get("ts", "")}
+        if pulled_cases:
+            meta["cases"] = {**local_cases, **pulled_cases}
+            save_meta(root, meta)
+        merged_cases = {**remote_cases, **local_cases}
+        pushed_cases = len(set(merged_cases) - set(remote_cases))
+        if merged_cases != remote_cases:
+            _pg_save_registry(conn, ns, {**remote_reg, "cases": merged_cases})
     finally:
         conn.close()
     report = {
@@ -664,6 +753,8 @@ def reconcile_postgres(root: Path, *, quiet: bool = False) -> dict:
         "remote_before": remote_count,
         "pushed": pushed,
         "pulled": pulled,
+        "cases_pulled": len(pulled_cases),
+        "cases_pushed": pushed_cases,
     }
     if not quiet and (pushed or pulled or remote_count == 0 and local):
         print(
@@ -1160,6 +1251,19 @@ def _ensure_casefile_tracked_in_git(root: Path) -> None:
         print("updated: .gitignore (removed .casefile/ — log tracks in git per SPEC §5.1)")
 
 
+def _ensure_env_ignored(root: Path) -> None:
+    """`.env` carries the Postgres URL (password included) and the store is
+    designed to ride in git — make sure env files can never be committed."""
+    pgi = root / ".gitignore"
+    lines = pgi.read_text().splitlines() if pgi.exists() else []
+    have = {ln.strip() for ln in lines}
+    missing = [p for p in (".env", ".env.local") if p not in have]
+    if not missing:
+        return
+    pgi.write_text("\n".join(lines + missing) + "\n")
+    print(f"updated: .gitignore (+ {', '.join(missing)} — env files hold credentials)")
+
+
 def cmd_init(args):
     """One command onboards a project: create .casefile, open a default case
     named after the directory, and wire hooks for every supported vendor.
@@ -1191,6 +1295,7 @@ def cmd_init(args):
     # Rollback prior local-only policy: do not gitignore the whole store.
     # Cross-machine continuity requires log.jsonl + meta.json in the repo.
     _ensure_casefile_tracked_in_git(root)
+    _ensure_env_ignored(root)
     meta = load_meta(root)
     if not meta.get("cases"):
         cid = open_case(root, meta, root.name or "case", None)
@@ -1230,9 +1335,28 @@ def open_case(root: Path, meta: dict, title: str, goal: str | None) -> str:
     return cid
 
 
+def _surface_compost_hits(entries, meta, case, query, limit=3):
+    """Open-time auto-search (SPEC §10): surface strong compost matches from
+    other cases before the first hypothesis is filed."""
+    hits = [e for e in rank_matches(compost_entries(entries), query)
+            if e["case"] != case][:limit]
+    for e in hits:
+        title = meta.get("cases", {}).get(e["case"], {}).get("title", e["case"])
+        first = e["body"].strip().splitlines()[0] if e["body"].strip() else ""
+        print(f"compost: resembles `{e['case']}` ({title}) — {first[:90]}")
+    if hits:
+        print(f"    (expand with `casefile recall \"{query.strip()[:60]}\"` "
+              f"or `casefile dig \"<topic>\"`)")
+
+
 def cmd_open(args):
     root, entries, meta = require_root()
-    print(open_case(root, meta, args.title, args.goal))
+    known = set(meta["cases"])
+    cid = open_case(root, meta, args.title, args.goal)
+    print(cid)
+    if cid not in known:
+        _surface_compost_hits(entries, meta, cid,
+                              f"{args.title} {args.goal or ''}")
 
 
 def _body_arg(args) -> str:
@@ -1636,12 +1760,18 @@ def cmd_recheck(args):
         if args.case not in meta.get("cases", {}):
             die(f"unknown case '{args.case}' (see `casefile status`)")
         targets = [e for e in targets if e["case"] == args.case]
+    as_json = getattr(args, "json", False)
     if not targets:
-        print("no live checks to run")
+        if as_json:
+            print(json.dumps({"checks": [], "skipped": [], "held": 0,
+                              "total": 0, "unknown": 0, "drifted": 0}))
+        else:
+            print("no live checks to run")
         return
 
     durations = load_check_durations(root)
     skipped = []
+    skipped_rows = []
     if args.startup:  # bounded session-start pass: known-slow recipes wait
         slow = [e for e in targets
                 if durations.get(e["id"], 0) > SLOW_CHECK_S]
@@ -1650,9 +1780,13 @@ def cmd_recheck(args):
             prior = prior_recheck_pass(entries, e["id"])
             known = ("holds" if prior else "failing") if prior is not None \
                 else "never conclusively checked"
-            print(f"slow `{e['id']}` [{e['type']}] {e['body'][:52]}"
-                  f"  (skipped: {durations[e['id']]:.0f}s last run — last known"
-                  f" {known}; run `casefile recheck` for the full pass)")
+            skipped_rows.append({"id": e["id"], "type": e["type"],
+                                 "body": e["body"][:80], "last_known": known,
+                                 "last_secs": durations[e["id"]]})
+            if not as_json:
+                print(f"slow `{e['id']}` [{e['type']}] {e['body'][:52]}"
+                      f"  (skipped: {durations[e['id']]:.0f}s last run — last known"
+                      f" {known}; run `casefile recheck` for the full pass)")
             skipped.append(e)
 
     report = []
@@ -1680,11 +1814,17 @@ def cmd_recheck(args):
     save_check_durations(root, durations)
 
     drifted = 0
+    rows = []
     for e, status, prior in report:
         # only conclusive PASS<->FAIL transitions are epistemic drift
         drift = status != "UNKNOWN" and prior is not None \
             and prior != (status == "PASS")
         drifted += drift
+        rows.append({"id": e["id"], "type": e["type"], "body": e["body"][:80],
+                     "status": status, "drift": bool(drift),
+                     "prior": prior})
+        if as_json:
+            continue
         mark = {"PASS": "ok  ", "FAIL": "FAIL", "UNKNOWN": "??? "}[status]
         note = ""
         if drift:
@@ -1698,6 +1838,11 @@ def cmd_recheck(args):
         print(f"{mark} `{e['id']}` [{e['type']}] {e['body'][:52]}{note}")
     held = sum(1 for _, s, _ in report if s == "PASS")
     unknown = sum(1 for _, s, _ in report if s == "UNKNOWN")
+    if as_json:
+        print(json.dumps({"checks": rows, "skipped": skipped_rows,
+                          "held": held, "total": len(report),
+                          "unknown": unknown, "drifted": drifted}))
+        return
     print(f"\n{held}/{len(report)} hold" +
           (f"; {unknown} unknown" if unknown else "") +
           (f"; {len(skipped)} slow skipped" if skipped else "") +
@@ -2773,6 +2918,7 @@ def _cmd_persistence_enable(root: Path, args) -> None:
         print(f"url: {msg}")  # redacted summary when ok
 
     print(f"checking connection to {redact_postgres_url(url)} …")
+    ns = pg_namespace(root)
     conn = _pg_connect(url)
     try:
         with conn.cursor() as cur:
@@ -2782,8 +2928,25 @@ def _cmd_persistence_enable(root: Path, args) -> None:
         print(f"    {str(ver).split(',')[0]}")
         ensure_casefile_pg_schema(conn)
         print("ok: casefile_entries / casefile_meta present")
+        preview = _pg_join_preview(conn, ns, root)
     finally:
         conn.close()
+
+    # Join-time visibility: reconcile is bidirectional and pulls remote rows
+    # into the git-tracked local log, so an accidental namespace join gets
+    # committed — show what is already there and refuse the fork signature.
+    if preview["remote_entries"]:
+        print(f"namespace '{ns}' already holds {preview['remote_entries']} "
+              f"entries ({preview['overlap']} shared with this log):")
+        for r in preview["rows"][:8]:
+            print(f"    case {r['case']}  author {r['author']}  "
+                  f"{r['entries']} entries")
+    if preview["fork_collision"] and not getattr(args, "join_existing", False):
+        die(f"refusing to join namespace '{ns}': its {preview['remote_entries']} "
+            f"entries share zero ids with this store's {preview['local_entries']} "
+            "— two unrelated histories would merge (fork/folder-name collision). "
+            f"Partition first (set {ENV_PG_NAMESPACE} in .env to a unique id) "
+            "or re-run with --join-existing to merge deliberately")
 
     env_path = root / ".env"
     actions = upsert_dotenv_keys(env_path, {
@@ -2796,8 +2959,8 @@ def _cmd_persistence_enable(root: Path, args) -> None:
     os.environ[ENV_PERSISTENCE_MODE] = "postgres"
     os.environ[ENV_POSTGRES_URL] = url
     _PG_RECONCILED.discard(str(root.resolve()))
+    _ensure_env_ignored(root)
 
-    ns = pg_namespace(root)
     print(f"namespace: {ns}  (store folder name; override with {ENV_PG_NAMESPACE})")
     if not getattr(args, "no_reconcile", False):
         print("reconciling local log ↔ postgres …")
@@ -2943,12 +3106,28 @@ def _capture_startup_recheck(root: Path, case: str | None) -> dict:
     Subprocess keeps recheck side-effects (observations) on the real code path
     without threading stdout redirects through cmd_recheck.
     """
-    cmd = [sys.executable, str(Path(__file__).resolve()), "recheck", "--startup"]
+    cmd = [sys.executable, str(Path(__file__).resolve()),
+           "recheck", "--startup", "--json"]
     if case:
         cmd += ["--case", case]
     env = {**os.environ, ENV_ROOT: str(root)}
     p = subprocess.run(cmd, cwd=root, capture_output=True, text=True, env=env)
     text = (p.stdout or "").strip()
+    try:  # structured contract; the scrape below survives an older CLI
+        rep = json.loads(text)
+        lines = []
+        for c in rep["checks"]:
+            mark = {"PASS": "ok  ", "FAIL": "FAIL", "UNKNOWN": "??? "}[c["status"]]
+            note = "  <- DRIFT" if c["drift"] else ""
+            lines.append(f"{mark} `{c['id']}` [{c['type']}] {c['body'][:52]}{note}")
+        for s in rep["skipped"]:
+            lines.append(f"slow `{s['id']}` [{s['type']}] {s['body'][:52]}"
+                         f"  (skipped — last known {s['last_known']})")
+        return {"text": "\n".join(lines) or "(no live checks)",
+                "held": rep["held"], "total": rep["total"],
+                "drifted": rep["drifted"], "rc": p.returncode}
+    except (ValueError, KeyError, TypeError):
+        pass
     drifted = 0
     held = 0
     total = 0
@@ -3908,13 +4087,24 @@ all-or-nothing; each imported entry echoes.
    preserve the differential as-is.
 '''
 
+def _guarded(script: str) -> str:
+    """A hook command that no-ops silently when the store is absent (P9).
+
+    The wiring lives in tracked `.claude/settings.json` but the store does
+    not, so a fresh clone, a `git clean`, or a not-yet-inited project has the
+    hooks without `.casefile/hooks/*.py`. Unguarded, python3 exits non-zero on
+    the missing file and the vendor surfaces that as a blocking error on
+    *every* tool call. Test first and `exit 0`; `exec` on the happy path so a
+    real run keeps the script's own status (the Stop gate blocks by design).
+    """
+    p = f'"$CLAUDE_PROJECT_DIR/{script}"'
+    return f'test -f {p} || exit 0; exec python3 {p}'
+
+
 CLAUDE_HOOKS = [  # event, matcher, command, timeout
-    ("PostToolUse", "Bash",
-     'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/observe.py"', 15),
-    ("Stop", None,
-     'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/sweep.py"', 10),
-    ("SessionStart", None,
-     'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/session_start.py"', 10),
+    ("PostToolUse", "Bash", _guarded(".casefile/hooks/observe.py"), 15),
+    ("Stop", None, _guarded(".casefile/hooks/sweep.py"), 10),
+    ("SessionStart", None, _guarded(".casefile/hooks/session_start.py"), 10),
 ]
 
 
@@ -3927,12 +4117,34 @@ def _write_if_changed(path: Path, content: str) -> str:
     return verb
 
 
+HOOK_SCRIPT_RE = re.compile(r"\.casefile/hooks/(\w+\.py)")
+
+
+def _hook_script(command: str) -> str | None:
+    """Which casefile hook script a settings.json command runs, if any."""
+    m = HOOK_SCRIPT_RE.search(command or "")
+    return m.group(1) if m else None
+
+
 def _ensure_hook(settings: dict, event: str, matcher: str | None,
                  command: str, timeout: int) -> bool:
+    """Wire one hook, upgrading earlier wiring for the same script in place.
+
+    Identity is the hook script, not the literal command: when the command
+    form changes (adding the store-missing guard, say), an installed-from-an
+    -older-version entry must be rewritten rather than left beside a new one,
+    or the hook fires twice per event.
+    """
+    script = _hook_script(command)
     groups = settings.setdefault("hooks", {}).setdefault(event, [])
     for g in groups:
-        if any(h.get("command") == command for h in g.get("hooks", [])):
-            return False  # already installed
+        for h in g.get("hooks", []):
+            if h.get("command") == command:
+                return False  # already installed
+            if script and _hook_script(h.get("command")) == script:
+                h["command"] = command
+                h["timeout"] = timeout
+                return True
     g = {"hooks": [{"type": "command", "command": command, "timeout": timeout}]}
     if matcher:
         g = {"matcher": matcher, **g}
@@ -4052,7 +4264,8 @@ def _install_hook_scripts(root: Path):
                          (".casefile/hooks/sweep.py", HOOK_SWEEP_PY),
                          (".casefile/hooks/session_start.py", HOOK_SESSION_START_PY),
                          (".claude/skills/casefile/SKILL.md",
-                          SKILL_MD.replace("python3 casefile.py", cli))]:
+                          SKILL_MD.replace("python3 casefile.py", cli)
+                          + "\n" + _cheatsheet_markdown())]:
         print(f"{_write_if_changed(root / rel, content)}: {rel}")
 
 
@@ -4064,7 +4277,7 @@ def _install_claude(root: Path):
     if any(changed):
         sp.parent.mkdir(parents=True, exist_ok=True)
         sp.write_text(json.dumps(settings, indent=2) + "\n")
-        print(f"updated: .claude/settings.json ({sum(changed)} hook(s) added)")
+        print(f"updated: .claude/settings.json ({sum(changed)} hook(s) wired)")
     else:
         print("unchanged: .claude/settings.json (hooks already wired)")
     print("note: Claude Code loads settings at session start — restart the "
@@ -4556,9 +4769,14 @@ def cmd_talk(args):
 
 # --------------------------------------------------------------------- main
 
-def main():
+def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="casefile", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser(
+        "cheatsheet",
+        help="flag signatures for every command (generated from the parser)")
+    s.set_defaults(fn=lambda a: print(_cheatsheet_markdown(), end=""))
 
     s = sub.add_parser("init", help="create .casefile in the current directory")
     s.set_defaults(fn=cmd_init)
@@ -4691,6 +4909,8 @@ def main():
                    help=f"bounded session-start pass: skip recipes slower "
                         f"than {SLOW_CHECK_S}s last run, reporting their "
                         f"last conclusive result instead")
+    s.add_argument("--json", action="store_true",
+                   help="machine-readable report (boot consumes this)")
     s.set_defaults(fn=cmd_recheck)
 
     s = sub.add_parser("sync-journal", help="ingest new lines from configured "
@@ -4830,6 +5050,10 @@ def main():
     s.add_argument(
         "--no-reconcile", action="store_true",
         help="with `enable`: skip initial local↔postgres sync")
+    s.add_argument(
+        "--join-existing", action="store_true",
+        help="with `enable`: deliberately merge into a namespace that already "
+             "holds an unrelated history (fork-collision guard override)")
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_persistence)
 
@@ -4896,7 +5120,29 @@ def main():
     s.add_argument("--case")
     s.set_defaults(fn=cmd_checkpoint)
 
-    args = p.parse_args()
+    return p
+
+
+def _cheatsheet_markdown() -> str:
+    """Flag signatures for every subcommand, generated from the live parser so
+    the skill can never drift from the CLI. Appended to SKILL.md at install
+    time; agents read it instead of burning turns on per-command --help."""
+    sub = next(a for a in build_parser()._actions
+               if isinstance(a, argparse._SubParsersAction))
+    seen = set()
+    lines = ["## Command cheatsheet (generated from the CLI — flags come "
+             "after the subcommand)", "", "```"]
+    for name, sp in sub.choices.items():
+        if id(sp) in seen:  # aliases (update → upgrade) list once
+            continue
+        seen.add(id(sp))
+        lines.append(" ".join(sp.format_usage().replace("usage: ", "").split()))
+    lines += ["```", ""]
+    return "\n".join(lines)
+
+
+def main():
+    args = build_parser().parse_args()
     ensure_dotenv_loaded()
     args.fn(args)
 

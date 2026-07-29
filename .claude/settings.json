@@ -6,7 +6,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.casefile/hooks/observe.py\"",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/.casefile/hooks/observe.py\" || exit 0; exec python3 \"$CLAUDE_PROJECT_DIR/.casefile/hooks/observe.py\"",
             "timeout": 15
           }
         ]
@@ -17,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.casefile/hooks/sweep.py\"",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/.casefile/hooks/sweep.py\" || exit 0; exec python3 \"$CLAUDE_PROJECT_DIR/.casefile/hooks/sweep.py\"",
             "timeout": 10
           }
         ]
@@ -28,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "python3 \"$CLAUDE_PROJECT_DIR/.casefile/hooks/session_start.py\"",
+            "command": "test -f \"$CLAUDE_PROJECT_DIR/.casefile/hooks/session_start.py\" || exit 0; exec python3 \"$CLAUDE_PROJECT_DIR/.casefile/hooks/session_start.py\"",
             "timeout": 10
           }
         ]

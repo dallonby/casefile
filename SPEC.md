@@ -183,6 +183,9 @@ starter ignore list lives in `.casefile/.gitignore`, **not** a blanket
 - `case`: every entry belongs to exactly one case. The CLI resolves the
   active case automatically (last touched, per config); `--case` exists as
   an explicit override but the porcelain never requires the user to know it.
+  The active-case pointer is untracked local state; when it is absent (a
+  fresh clone of the store) the CLI falls back to the case of the last entry
+  in the log, so a cold checkout boots into the right case.
 
 ### 5.3 Entry types
 
@@ -348,6 +351,9 @@ resuming session must be cheap, `recheck --startup` skips recipes whose
 last recorded wall-time exceeded ~5s and reports their last conclusive
 result instead; the bare `recheck` remains the exhaustive pass. Per-recipe
 durations live in `.casefile/state/` (derived state, not ground truth).
+`recheck --json` emits the structured report (per-check status/drift, skipped
+recipes, held/total/drifted counts); `boot` consumes that contract rather
+than scraping the human-facing output.
 
 ## 9. Case lifecycle (no explicit ending — humans don't announce "solved")
 
@@ -385,11 +391,12 @@ system laundering its own conclusion.
   rebuilds it from scratch; it is gitignored and never backed up.
 - `casefile recall "<query>"` — plumbing beneath the porcelain question
   "have we seen this before?".
-- **Open-time auto-search**: when a case opens, the skill searches the
-  compost with the problem statement and surfaces strong hits *before the
+- **Open-time auto-search**: when a new case is created, `open` itself
+  mechanically surfaces strong compost hits from other cases *before the
   first hypothesis is filed* ("this resembles the March importer case —
-  encoding-sniffer theory was ruled out there, evidence attached").
-  Spitball drivers seed both models' opening context with strong matches.
+  encoding-sniffer theory was ruled out there, evidence attached"); the
+  skill adds conversational framing on top. Spitball drivers seed both
+  models' opening context with strong matches.
 - Embeddings may layer on later; not in scope for v1. Well-written
   abstracts make FTS surprisingly strong — they are dense with searchable
   nouns.
@@ -564,6 +571,12 @@ reply`, `interject(handle, msg)` (mid-request if supported), `cost(handle)`,
 - **Hook config** mapping Claude Code tool events → `casefile add -t
   observation --source hook:<event>` (test runs, failing commands, commits).
   Volume governed by config; mechanical compaction (§6.1) keeps noise down.
+  Hook commands are guarded (`test -f <script> || exit 0; exec python3
+  <script>`): the wiring is tracked but the store is not, so a clone without
+  `.casefile/` must no-op silently (P9) while a real run preserves the
+  script's own exit status (the Stop gate blocks by design). Reinstall keys
+  on the script path and upgrades legacy wiring in place — never a
+  duplicate entry that fires twice.
 - **External journal sync**: agents often keep their own structured logs
   (operations journals, run diaries) and file to them more reliably than to
   the case. `sync-journal` mechanically ingests new lines from journals
@@ -585,7 +598,10 @@ reply`, `interject(handle, msg)` (mid-request if supported), `cost(handle)`,
   rules; recognize casefile-directed speech (§11.2 table); propose case
   opening (§11.3); propose escalation to spitball when the differential
   stalls (two theories, no discriminating evidence, ~3 windows without
-  progress); never edit the log by hand.
+  progress); never edit the log by hand. A command cheatsheet generated from
+  the live argparse tree is appended at install time, so flag signatures in
+  the skill can never drift from the CLI and agents stop burning turns on
+  per-command `--help`.
 
 **Codex-side integration** (verified live against codex-cli 0.144.5, obs
 8c7a9b86): `casefile hooks install codex` appends a marker-delimited

@@ -2,11 +2,6 @@
   "schema": "1.0",
   "created": "2026-07-26T18:38:50+00:00",
   "cases": {
-    "fixture": {
-      "title": "fixture",
-      "goal": "",
-      "created": "2026-07-26T18:38:50+00:00"
-    },
     "free-shipping-threshold": {
       "title": "free shipping threshold",
       "goal": "find root cause of free-shipping mismatch with marketing",

@@ -235,14 +235,24 @@ class UnsweptTests(unittest.TestCase):
 class CliBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
-        self.dir = Path(self._tmp.name)
+        # realpath: macOS tmpdirs live behind the /var -> /private/var symlink
+        # and the CLI resolves paths (preflight containment check) — compare
+        # canonical against canonical.
+        self.dir = Path(os.path.realpath(self._tmp.name))
         self.addCleanup(self._tmp.cleanup)
         self.assertEqual(self.cli("init").rc, 0)
         self.assertEqual(self.cli("open", "Test case", "--goal", "g").rc, 0)
 
     def cli(self, *args, expect=None, stdin=None):
-        # CODEX_HOME sandboxed: init/hooks-install must never touch ~/.codex
-        env = {**os.environ, "CODEX_HOME": str(self.dir / ".codex-home")}
+        # Sandboxed: no CASEFILE_* inherited (a live CASEFILE_POSTGRES_URL
+        # would point the suite at a real shared log), bin dir + CODEX_HOME
+        # under the tmp store so init/hooks/symlink never touch the real
+        # HOME, and no pip side effects from init.
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CASEFILE_")}
+        env.update({"CODEX_HOME": str(self.dir / ".codex-home"),
+                    "CASEFILE_BIN_DIR": str(self.dir / ".bin"),
+                    "CASEFILE_SKIP_PIP": "1"})
         p = subprocess.run([sys.executable, str(CASEFILE), *args],
                            cwd=self.dir, capture_output=True, text=True,
                            env=env, input=stdin)
@@ -260,6 +270,42 @@ class CliBase(unittest.TestCase):
     def log_entries(self):
         p = self.dir / ".casefile" / "log.jsonl"
         return [json.loads(l) for l in p.read_text().splitlines() if l.strip()]
+
+
+class ContextSurfacingTests(CliBase):
+    def test_cheatsheet_lists_generated_signatures(self):
+        r = self.cli("cheatsheet", expect=0)
+        self.assertIn("casefile add", r.out)
+        self.assertIn("--body-stdin", r.out)
+        # installed skill carries the same generated section (no --help turns)
+        skill = (self.dir / ".claude" / "skills" / "casefile" / "SKILL.md")
+        self.assertIn("Command cheatsheet", skill.read_text())
+
+    def test_recheck_json_reports_structured_drift(self):
+        self.add("-t", "hypothesis", "-a", "claude", "truthy claim",
+                 "--check", "true")
+        r = self.cli("recheck", "--json", expect=0)
+        rep = json.loads(r.out)
+        self.assertEqual((rep["held"], rep["total"], rep["drifted"]), (1, 1, 0))
+        self.assertEqual(rep["checks"][0]["status"], "PASS")
+        self.assertFalse(rep["checks"][0]["drift"])
+
+    def test_recheck_json_empty_when_no_checks(self):
+        r = self.cli("recheck", "--json", expect=0)
+        self.assertEqual(json.loads(r.out)["total"], 0)
+
+    def test_open_surfaces_compost_from_other_cases(self):
+        self.cli("digest", "-a", "claude", "--kind", "abstract",
+                 "problem: flibbertigibbet sniffer corrupts imports", expect=0)
+        r = self.cli("open", "flibbertigibbet regression", expect=0)
+        self.assertIn("compost: resembles", r.out)
+        self.assertIn("test-case", r.out)
+
+    def test_open_existing_case_stays_quiet(self):
+        self.cli("digest", "-a", "claude", "--kind", "abstract",
+                 "problem: flibbertigibbet sniffer corrupts imports", expect=0)
+        r = self.cli("open", "Test case", expect=0)
+        self.assertNotIn("compost:", r.out)
 
 
 class CliValidationTests(CliBase):
@@ -300,6 +346,21 @@ class CliValidationTests(CliBase):
             "--receipt", str(self.dir / "outside.json"), "--nonce", "n")
         self.assertNotEqual(r.rc, 0)
         self.assertIn(".casefile/transcripts", r.err)
+
+    def test_init_gitignores_env_files(self):
+        # .env carries the Postgres password; the store rides in git
+        gi = (self.dir / ".gitignore").read_text().splitlines()
+        self.assertIn(".env", gi)
+        self.assertIn(".env.local", gi)
+
+    def test_active_case_survives_missing_pointer(self):
+        # cross-machine clone: .casefile/active is untracked local state, so a
+        # fresh checkout has none — the last-touched case in the log wins
+        self.add("-t", "note", "-a", "claude", "anchor entry")
+        (self.dir / ".casefile" / "active").unlink()
+        r = self.cli("status", expect=0)
+        self.assertIn("test-case", r.out)
+        self.assertNotIn("active case: (none)", r.out)
 
     def test_self_endorsement_rejected(self):
         h = self.add("-t", "hypothesis", "-a", "claude", "theory X")
@@ -1146,6 +1207,38 @@ class CliHooksInstallTests(CliBase):
                                 str(self.dir / ".casefile" / "hooks" / name)],
                                capture_output=True)
             self.assertEqual(p.returncode, 0, p.stderr)
+
+    def test_hook_command_no_ops_when_store_is_missing(self):
+        # the wiring is tracked but the store is not, so a fresh clone or a
+        # `git clean` leaves hooks pointing at scripts that aren't there. That
+        # must stay silent, not fail on every single tool call.
+        self.cli("hooks", "install", "claude-code", expect=0)
+        settings = json.loads((self.dir / ".claude" / "settings.json").read_text())
+        cmds = [h["command"] for groups in settings["hooks"].values()
+                for g in groups for h in g["hooks"]]
+        bare = self.dir / "no-store"
+        bare.mkdir()
+        for cmd in cmds:
+            p = subprocess.run(["sh", "-c", cmd], cwd=bare, text=True,
+                               capture_output=True,
+                               env={**os.environ, "CLAUDE_PROJECT_DIR": str(bare)})
+            self.assertEqual(p.returncode, 0, f"{cmd}: {p.stderr}")
+            self.assertEqual(p.stderr, "", cmd)
+
+    def test_legacy_wiring_is_upgraded_not_duplicated(self):
+        # a project wired by an older version carries the unguarded command;
+        # re-installing must rewrite it, not leave both to fire per event
+        sp = self.dir / ".claude" / "settings.json"
+        sp.parent.mkdir(parents=True, exist_ok=True)
+        legacy = 'python3 "$CLAUDE_PROJECT_DIR/.casefile/hooks/observe.py"'
+        sp.write_text(json.dumps({"hooks": {"PostToolUse": [
+            {"matcher": "Bash", "hooks": [{"type": "command", "timeout": 15,
+                                           "command": legacy}]}]}}))
+        self.cli("hooks", "install", "claude-code", expect=0)
+        groups = json.loads(sp.read_text())["hooks"]["PostToolUse"]
+        cmds = [h["command"] for g in groups for h in g["hooks"]]
+        self.assertEqual(len(cmds), 1, cmds)
+        self.assertIn("test -f", cmds[0])
 
     def test_unknown_vendor_rejected(self):
         r = self.cli("hooks", "install", "cursor")

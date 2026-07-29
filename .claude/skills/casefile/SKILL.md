@@ -165,3 +165,46 @@ all-or-nothing; each imported entry echoes.
    summaries, no live disputes/questions, complete claim cards, and exact
    candidate review can create a judgment. Turn/spend budget and stalemate
    preserve the differential as-is.
+
+## Command cheatsheet (generated from the CLI — flags come after the subcommand)
+
+```
+casefile cheatsheet [-h]
+casefile init [-h]
+casefile open [-h] [--goal GOAL] title
+casefile add [-h] -t {constraint,decision,hypothesis,note,observation,question} -a AUTHOR [--body-stdin] [--case CASE] [--refs [REFS ...]] [--ref REF] [--rationale RATIONALE] [--rejected [OPTION:REASON ...]] [--reject OPTION:REASON] [--source SOURCE] [--source-uri SOURCE_URI] [--source-type SOURCE_TYPE] [--published-at PUBLISHED_AT] [--accessed-at ACCESSED_AT] [--effective-at EFFECTIVE_AT] [--expires-at EXPIRES_AT] [--locator LOCATOR] [--jurisdiction JURISDICTION] [--check CHECK] [--claim-mode {association,causal-inference,diagnosis,forecast,mechanistic,normative-premise,recommendation}] [--mechanism MECHANISM] [--comparator COMPARATOR] [--analysis-layer ANALYSIS_LAYER] [--falsifier FALSIFIER] [--counterfactual COUNTERFACTUAL] [--horizon HORIZON] [--testability {external-now,longitudinal,not-empirical,within-session}] [--supersedes [SUPERSEDES ...]] [--supersede SUPERSEDE] [--to TO] [--json] [body]
+casefile endorse [-h] -a AUTHOR [--comment COMMENT] entry
+casefile dispute [-h] -a AUTHOR --reason REASON entry
+casefile revoke [-h] -a AUTHOR --reason REASON entry
+casefile resolve [-h] -a AUTHOR --outcome {upheld,withdrawn,answered,fulfilled} --reason REASON entry
+casefile verify [-h] -a AUTHOR [--comment COMMENT] entry observation
+casefile digest [-h] [--body-stdin] -a AUTHOR --kind {abstract,candidate,judgment,mechanical} [--supersedes [SUPERSEDES ...]] [--supersede SUPERSEDE] [--refs [REFS ...]] [--ref REF] [--case CASE] [--json] [body]
+casefile finalize-digest [-h] candidate
+casefile show [-h] [--case CASE] [--observations OBSERVATIONS]
+casefile resume-context [-h] [--case CASE] [--blind] [--observations OBSERVATIONS] [--budget BUDGET]
+casefile recheck [-h] [--case CASE] [--timeout TIMEOUT] [--startup] [--json]
+casefile sync-journal [-h] [--case CASE]
+casefile compact [-h] [--case CASE]
+casefile reindex [-h]
+casefile recall [-h] [--limit LIMIT] query
+casefile dig [-h] [--limit LIMIT] query
+casefile import [-h] [--case CASE] file
+casefile hooks [-h] {install} {claude-code,codex,all}
+casefile upgrade [-h] [--no-pull] [--ignore-pull-fail] [--no-reexec] [--no-hooks] [--bin-dir BIN_DIR] [--force-link] [--vendor {claude-code,codex,all}] [-a AUTHOR] [--json]
+casefile channel [-h] [name]
+casefile ui [-h] [--dry-run]
+casefile talk [-h]
+casefile spitball [-h] --topic TOPIC [--models MODELS] [--turns TURNS] [--budget-usd BUDGET_USD] [--blind BLIND] [--manifest MANIFEST] [--requirement REQUIREMENT] [--criterion CRITERION] [--weighting WEIGHTING] [--alternative ALTERNATIVE] [--evidence-domain EVIDENCE_DOMAIN] [--analysis-layer ANALYSIS_LAYER] [--open-question OPEN_QUESTION] [--manifest-mode {enforce,warn,off}] [--output-retries OUTPUT_RETRIES]
+casefile spitball-recover [-h] [--turns TURNS] [--budget-usd BUDGET_USD] session
+casefile lint [-h] [--launder-threshold LAUNDER_THRESHOLD] [--stale-threshold STALE_THRESHOLD]
+casefile status [-h] [--json] [-a AUTHOR]
+casefile persistence [-h] [--url URL] [--no-reconcile] [--join-existing] [--json] [{status,reconcile,enable,disable}]
+casefile log [-h] [-n N]
+casefile whoami [-h] [-a AUTHOR] [--json]
+casefile preflight [-h] [-a AUTHOR] [--json] [--receipt RECEIPT] [--nonce NONCE]
+casefile boot [-h] [--case CASE] [-a AUTHOR] [--budget BUDGET] [--skip-recheck] [--ok-exit]
+casefile packet [-h] --to TO [-a AUTHOR] [--case CASE] [--no-file]
+casefile inbox [-h] [--for FOR_AUTHOR] [-a AUTHOR] [--json]
+casefile next [-h] [--case CASE] [-a AUTHOR]
+casefile checkpoint [-h] [-a AUTHOR] [--case CASE] [body]
+```
