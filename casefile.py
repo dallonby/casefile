@@ -4259,6 +4259,22 @@ def cli_invocation(root: Path) -> str:
     return f"python3 {Path(__file__).resolve()}"
 
 
+def cli_invocation_shared(root: Path) -> str:
+    """Like `cli_invocation`, but for text written into a file the *project*
+    tracks in git — currently `AGENTS.md`, a repository convention file that
+    predates casefile and is normally committed.
+
+    An absolute path there is useless to every other clone and leaves the
+    file permanently modified, so it can never be committed and reappears
+    after each install. Resolve through the per-checkout `.casefile/cli`
+    pointer instead: the installer already writes it, `.casefile/.gitignore`
+    already excludes it, and reading it at invocation time keeps the CLI
+    resolvable without depending on PATH."""
+    if (root / "casefile.py").exists():
+        return "python3 casefile.py"
+    return 'python3 "$(cat .casefile/cli)"'
+
+
 def _install_hook_scripts(root: Path):
     # record where the CLI lives so hooks and skill text keep working in
     # repos that don't carry casefile.py at their root
@@ -4296,7 +4312,7 @@ def _install_codex(root: Path):
     print(f"{verb}: {cfg} (global block; dispatches per-project)")
     verb = _managed_block(root / "AGENTS.md", AGENTS_BEGIN, AGENTS_END,
                           AGENTS_SNIPPET.replace("python3 casefile.py",
-                                                 cli_invocation(root)))
+                                                 cli_invocation_shared(root)))
     print(f"{verb}: AGENTS.md")
     print("note: codex hook trust is per-hook and one-time — run `codex`, "
           "open /hooks, and trust the casefile hooks (headless runs can pass "
