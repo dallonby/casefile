@@ -4220,8 +4220,10 @@ This project keeps its investigation state in an append-only casefile log.
   alternatives, evidence domains, analysis layers, and open questions.
   Prefer `--manifest-mode enforce`; use `warn` only when an exploratory run
   may proceed without manufacturing a final judgment.
-- **Echo every entry you file** as one line in your visible reply —
-  `recorded: decision "…" (user)` — your own filings included.
+- **Echo-back**: every mutation of the *user's* words echoes as one line in
+  your visible reply — `recorded: constraint "don't touch the sniffer" (user)`.
+  This is how mistranscription gets caught. Your own routine filing is silent
+  by default; show it on request.
 - File hypotheses, decisions, observations, and questions as you work —
   the conventions in `.claude/skills/casefile/SKILL.md` apply to any agent.
   Never edit `.casefile/log.jsonl` by hand."""
