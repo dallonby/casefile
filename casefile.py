@@ -2610,13 +2610,18 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
             problems.append(f"CONSENSUS        `{e['id']}` ground truth exists in this "
                             f"case but claim is only consensus: {e['body'][:60]}")
 
-    _, ds = open_items(entries)
+    qs, ds = open_items(entries)
     index = {e["id"]: i for i, e in enumerate(entries)}
     for d in ds:
         age = len(entries) - index[d["id"]]
         if age >= stale_threshold:
             problems.append(f"STALE            dispute `{d['id']}` open for {age} "
                             f"entries: {d['body'][:60]}")
+    for q in qs:
+        age = len(entries) - index[q["id"]]
+        if age >= stale_threshold:
+            problems.append(f"STALE            question `{q['id']}` open for {age} "
+                            f"entries: {q['body'][:60]}")
 
     for e in entries:
         if e["type"] == "decision" and not e.get("refs") and not e.get("rationale"):
