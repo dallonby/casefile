@@ -954,7 +954,7 @@ class CodexAdapter:
         # spitball turn can have its substantive answer replaced by a
         # secretary-sweep receipt from the outer project.
         self.opts = ["--json", "--ignore-user-config", "--skip-git-repo-check",
-                     "--search", "--sandbox", "danger-full-access", *effort]
+                     "--sandbox", "danger-full-access", *effort]
         # `exec resume` rejects --sandbox (live-run failure 2026-07-17);
         # the config-override spelling is accepted by both subcommands
         self.resume_opts = ["--json", "--ignore-user-config",

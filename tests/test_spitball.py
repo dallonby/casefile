@@ -131,7 +131,7 @@ class AdapterRegistryTests(unittest.TestCase):
         self.assertIn("--skip-git-repo-check", adapter.opts)
         self.assertIn("--skip-git-repo-check", adapter.resume_opts)
         self.assertIn("danger-full-access", adapter.opts)
-        self.assertIn("--search", adapter.opts)
+        self.assertNotIn("--search", adapter.opts)
         self.assertIn('sandbox_mode="danger-full-access"', adapter.resume_opts)
         self.assertIn("--ignore-user-config", adapter.opts)
         self.assertIn("--ignore-user-config", adapter.resume_opts)
