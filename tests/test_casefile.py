@@ -1183,12 +1183,25 @@ class CliHooksInstallTests(CliBase):
         self.assertTrue(ptr.exists())
         self.assertEqual(ptr.read_text().strip(), str(CASEFILE.resolve()))
 
-    def test_skill_and_agents_reference_cli_by_absolute_path(self):
+    def test_skill_references_cli_by_absolute_path(self):
+        # SKILL.md is installer-owned, so an absolute path costs nothing and
+        # keeps the CLI resolvable without PATH.
         self.cli("hooks", "install", "all", expect=0)
-        for rel in (Path(".claude/skills/casefile/SKILL.md"), Path("AGENTS.md")):
-            text = (self.dir / rel).read_text()
-            self.assertIn(f"python3 {CASEFILE.resolve()}", text, rel)
-            self.assertNotIn("python3 casefile.py", text, rel)
+        rel = Path(".claude/skills/casefile/SKILL.md")
+        text = (self.dir / rel).read_text()
+        self.assertIn(f"python3 {CASEFILE.resolve()}", text, rel)
+        self.assertNotIn("python3 casefile.py", text, rel)
+
+    def test_agents_references_cli_without_baking_in_a_local_path(self):
+        # AGENTS.md is a project convention file and is normally tracked, so
+        # it must stay byte-identical across clones — resolve through the
+        # per-checkout .casefile/cli pointer instead.
+        self.cli("hooks", "install", "all", expect=0)
+        rel = Path("AGENTS.md")
+        text = (self.dir / rel).read_text()
+        self.assertIn('python3 "$(cat .casefile/cli)"', text, rel)
+        self.assertNotIn(str(CASEFILE.resolve()), text, rel)
+        self.assertNotIn("python3 casefile.py", text, rel)
 
     def test_sweep_reason_names_resolvable_cli(self):
         self.cli("hooks", "install", "claude-code", expect=0)
