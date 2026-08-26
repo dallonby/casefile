@@ -97,9 +97,11 @@ about intent, not about the world).
 
 ## Views
 
-- `casefile show` — compiled markdown: goal, constraints, decisions,
-  differential (hypotheses grouped by grade), open questions/disputes,
-  recent observations.
+- `casefile show [entry]` — with an id: full entry body (the memory a later
+  model needs). Without: compiled markdown of the case (goal, constraints,
+  decisions, differential, open questions/disputes, recent observations).
+- `casefile dig "<query>"` — IDF-ranked raw/superseded history, best-first,
+  near-duplicate observations collapsed. `dig <id>` expands digest links.
 - `casefile resume-context` — compact plain-text injection for a fresh
   model instance: goal, constraints, decisions with rationale, current
   differential with grades and *provenance spelled out in words* (so a

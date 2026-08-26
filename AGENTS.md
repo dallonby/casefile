@@ -19,9 +19,10 @@ This project keeps its investigation state in an append-only casefile log.
   `python3 casefile.py boot` (or `resume-context`) before acting. The log
   outranks compacted summary.
 - **Before filing a decision or changing an agreed plan**, run
-  `python3 casefile.py dig "<topic>"` (and `recall`) and cite what you find
-  in `--refs`. Decisions carry `--rationale` and `--rejected` for losing
-  options.
+  `python3 casefile.py dig "<topic>"` then `show <id>` on a hit (and
+  `recall` for past-case abstracts) and cite what you find in `--refs`.
+  Do not grep log.jsonl or a sidecar chat transcript. Decisions carry
+  `--rationale` and `--rejected` for losing options.
 - **Before a consequential spitball**, sweep the current conversation into
   the log and freeze a manifest of verbatim requirements, criteria/weights,
   alternatives, evidence domains, analysis layers, and open questions.

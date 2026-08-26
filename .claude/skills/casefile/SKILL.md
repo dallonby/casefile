@@ -97,8 +97,9 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 | "where are we on X?" | `boot` (or `resume-context`) → prose summary sized to the question |
 | "don't touch X" | `add -t constraint -a user` |
 | "I'm not convinced by X" | `dispute -a user` |
-| "why did we rule out X?" | `dig "<query>"` (searches superseded history; expands digests) |
-| "have we seen this before?" | `recall "<query>"` (searches past-case abstracts) |
+| "why did we rule out X?" / "how did we do X?" | `dig "<query>"` then `show <id>` on a hit. Do not grep log.jsonl or a sidecar chat transcript. |
+| "show me entry 0776174a" | `show 0776174a` (full body). `dig <id>` expands digest/supersession. |
+| "have we seen this before?" | `recall "<query>"` (past-case abstracts only — not operational how-to) |
 | "hand off to codex" | `packet --to codex` |
 | "what's waiting for me?" | `inbox --for $CASEFILE_AUTHOR` / `next` |
 | "what's codex saying?" / "show me the deliberation" | `channel <model>` (ui viewport → that model's live transcript) |
@@ -180,7 +181,7 @@ casefile resolve [-h] -a AUTHOR --outcome {upheld,withdrawn,answered,fulfilled} 
 casefile verify [-h] -a AUTHOR [--comment COMMENT] entry observation
 casefile digest [-h] [--body-stdin] -a AUTHOR --kind {abstract,candidate,judgment,mechanical} [--supersedes [SUPERSEDES ...]] [--supersede SUPERSEDE] [--refs [REFS ...]] [--ref REF] [--case CASE] [--json] [body]
 casefile finalize-digest [-h] candidate
-casefile show [-h] [--case CASE] [--observations OBSERVATIONS]
+casefile show [-h] [--case CASE] [--observations OBSERVATIONS] [entry]
 casefile resume-context [-h] [--case CASE] [--blind] [--observations OBSERVATIONS] [--budget BUDGET]
 casefile recheck [-h] [--case CASE] [--timeout TIMEOUT] [--startup] [--json]
 casefile sync-journal [-h] [--case CASE]

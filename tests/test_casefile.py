@@ -1074,6 +1074,98 @@ class CliMemoryTests(CliBase):
         r = self.cli("dig", dig_id, expect=0)
         self.assertIn("superseded", r.out)
 
+    def test_dig_idf_ranks_rare_term_ahead_of_firehose(self):
+        # high-DF "live/config/enable" observations must not bury the rare noun
+        for i in range(12):
+            self.add("-t", "observation", "-a", "system", "--source", "hook:t",
+                     f"Market-wide scout batch {i} live config enable last disable")
+        self.add("-t", "observation", "-a", "codex", "--source", "manual",
+                 "All 73 backrunner configs were atomically disabled. Rollback SQL.")
+        r = self.cli("dig",
+                     "backrunner strategies disabled live last week enable disable config",
+                     expect=0)
+        lines = [ln for ln in r.out.splitlines() if ln and not ln.startswith(" ")]
+        self.assertTrue(lines, r.out)
+        self.assertIn("backrunner", lines[0])
+        self.assertIn("atomically disabled", lines[0])
+        # firehose collapsed, not occupying the first visible hit
+        self.assertNotIn("Market-wide scout", lines[0])
+
+    def test_dig_collapses_similar_observations(self):
+        for i in range(8):
+            self.add("-t", "observation", "-a", "system", "--source", "hook:t",
+                     f"Market-wide scout batch Base {1000+i}-{2000+i} (250 blocks)")
+        r = self.cli("dig", "scout batch", expect=0)
+        scout_hits = [ln for ln in r.out.splitlines()
+                      if "Market-wide scout" in ln and not ln.startswith(" ")]
+        self.assertEqual(len(scout_hits), 1, r.out)
+        self.assertRegex(r.out, r"\+\d+ similar")
+
+    def test_dig_prints_relevance_order_not_log_order(self):
+        # common-term notes first in the log so chronology would pick them
+        for i in range(8):
+            self.add("-t", "note", "-a", "claude",
+                     f"early mention {i} of live config enable disable")
+        self.add("-t", "constraint", "-a", "user",
+                 "disable every backrunner older than 90 days")
+        r = self.cli("dig", "backrunner disable live config", expect=0)
+        lines = [ln for ln in r.out.splitlines() if ln and not ln.startswith(" ")]
+        self.assertIn("backrunner", lines[0], r.out)
+        self.assertTrue(lines[0].split()[1].startswith("constraint"), r.out)
+
+    def test_show_entry_prints_full_body(self):
+        eid = self.add("-t", "observation", "-a", "codex", "--source", "manual",
+                       "Rollback: UPDATE processor_configs SET enabled=true "
+                       "WHERE id IN (16,29,34).")
+        r = self.cli("show", eid, expect=0)
+        self.assertIn(eid, r.out)
+        self.assertIn("Rollback: UPDATE processor_configs", r.out)
+        self.assertIn("WHERE id IN (16,29,34)", r.out)
+        self.assertIn("source: manual", r.out)
+
+    def test_show_unknown_entry_errors(self):
+        r = self.cli("show", "deadbeef")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("deadbeef", r.err)
+        self.assertIn("dig", r.err)
+
+    def test_show_without_id_still_case_view(self):
+        self.add("-t", "constraint", "-a", "user", "do not restart live")
+        r = self.cli("show", expect=0)
+        self.assertIn("# Test case", r.out)
+        self.assertIn("do not restart live", r.out)
+
+
+class RankMatchTests(unittest.TestCase):
+    """Pure ranking: IDF + type weight, independent of CLI load cost."""
+
+    def test_rare_term_beats_common_term_count(self):
+        scouts = [E(f"s{i}", "observation",
+                    body=f"scout {i} live config enable last disable")
+                  for i in range(20)]
+        target = E("t1", "observation",
+                   body="73 backrunner configs atomically disabled. Rollback SQL.")
+        ranked = cf.rank_matches(
+            scouts + [target],
+            "backrunner strategies disabled live last week enable disable config")
+        self.assertEqual(ranked[0]["id"], "t1")
+
+    def test_constraint_outranks_observation_with_same_terms(self):
+        obs = E("o1", "observation",
+                body="disable backrunner configurations older than 90 days")
+        con = E("c1", "constraint", author="user",
+                body="disable backrunner configurations older than 90 days")
+        ranked = cf.rank_matches([obs, con], "backrunner disable")
+        self.assertEqual(ranked[0]["id"], "c1")
+
+    def test_snippet_windows_around_query_term(self):
+        body = ("At 2026-08-18T21:03:41Z the exact 90-day cutoff was Base "
+                "block 46,260,837. Batched archive searches. All 73 "
+                "backrunner configs were atomically disabled.")
+        snip = cf.dig_snippet(body, ["backrunner", "live", "config"])
+        self.assertIn("backrunner", snip)
+        self.assertIn("atomically disabled", snip)
+
 
 class CliFulfilledTests(CliBase):
     """§5.3: fulfilled dismisses a decision for the invariant without reading

@@ -390,7 +390,8 @@ system laundering its own conclusion.
 - **The index is a cache; the log is the truth.** `casefile reindex`
   rebuilds it from scratch; it is gitignored and never backed up.
 - `casefile recall "<query>"` — plumbing beneath the porcelain question
-  "have we seen this before?".
+  "have we seen this before?" (compost only: abstracts + judgment digests).
+  Operational how-to ("how did we disable X last week") is `dig`, not `recall`.
 - **Open-time auto-search**: when a new case is created, `open` itself
   mechanically surfaces strong compost hits from other cases *before the
   first hypothesis is filed* ("this resembles the March importer case —
@@ -407,11 +408,20 @@ system laundering its own conclusion.
 
 `init`, `open <title>` (creates or switches case; first mention creates —
 no ceremony), `add`, `endorse`, `dispute`, `resolve`, `verify`, `revoke`,
-`digest`, `finalize-digest`, `show`, `resume-context [--blind]`, `recheck`, `recall`, `dig
-<query>` (search superseded/raw history; expand digests), `lint`, `log`,
+`digest`, `finalize-digest`, `show [entry]` (full entry by id, or compiled
+case view), `resume-context [--blind]`, `recheck`, `recall`, `dig
+<query>` (IDF-ranked raw/superseded history, relevance order, collapse
+near-duplicate observations, expand exact ids; then `show <id>` for the
+full body), `lint`, `log`,
 `reindex`, `hooks install <vendor>`, `ui`, `spitball`,
 `spitball-recover`, `preflight`, `status` (JSON:
 active case, mailbox count, lint count, dormancy candidates, spend).
+
+The CLI is model-facing memory, not a human log browser. `dig` prints
+best-first because host UIs truncate tool output; a later model that only
+sees the first two lines must still recover the filed fact. `show <id>` is
+the verb models already try after seeing an id — it must not argparse-fail.
+Do not teach `log | rg` or a sidecar chat transcript as the retrieval path.
 
 Conventions: mutating commands print the new entry id on stdout, exit 0;
 all errors to stderr, exit ≠0. `add`/`digest` accept `--body-stdin`, JSON

@@ -9,6 +9,7 @@ Stdlib only.
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -2054,22 +2055,112 @@ def _query_terms(query: str) -> list[str]:
     return [t for t in re.findall(r"[a-z0-9]+", query.lower()) if len(t) >= 2]
 
 
+# Epistemic types are the memory; observations are the firehose. Modest
+# multipliers so a constraint/decision with one rare noun outranks a stack
+# of routine observations that share "live"/"config"/"enable".
+_TYPE_WEIGHT = {
+    "constraint": 1.6,
+    "decision": 1.6,
+    "hypothesis": 1.35,
+    "digest": 1.25,
+    "question": 1.2,
+    "note": 1.05,
+    "observation": 1.0,
+}
+
+DIG_SNIPPET = 220
+
+
 def rank_matches(candidates: list[dict], query: str) -> list[dict]:
-    """Any-term ranked matching. Agents search with keyword soup, so
-    all-terms-AND (or whole-phrase substring) returns empty exactly when
-    search matters most. Score = distinct terms present; ties break to
-    recency. Returns candidates ordered best-first."""
+    """Any-term IDF-ranked matching for model memory lookup.
+
+    Agents search with keyword soup, so all-terms-AND returns empty exactly
+    when search matters most. Score = sum of smoothed IDF over matched terms,
+    times a type weight (constraints/decisions beat observation firehose).
+    Ties break to recency. Returns candidates ordered best-first — tool
+    output is truncated, so the first lines *are* the memory.
+    """
     terms = _query_terms(query)
     if not terms:
         return []
-    scored = []
+    n = max(len(candidates), 1)
+    df = {t: 0 for t in terms}
+    hits: list[tuple[dict, int, list[str]]] = []
     for i, e in enumerate(candidates):
-        body = e["body"].lower()
-        n = sum(1 for t in terms if t in body)
-        if n:
-            scored.append((-n, -i, e))
-    scored.sort(key=lambda x: (x[0], x[1]))
+        body = (e.get("body") or "").lower()
+        matched = [t for t in terms if t in body]
+        if not matched:
+            continue
+        hits.append((e, i, matched))
+        for t in matched:
+            df[t] += 1
+    scored = []
+    for e, i, matched in hits:
+        idf_sum = sum(math.log((n + 1) / (df[t] + 1)) + 1.0 for t in matched)
+        score = idf_sum * _TYPE_WEIGHT.get(e.get("type"), 1.0)
+        scored.append((-score, -i, e))
+    scored.sort()
     return [e for _, _, e in scored]
+
+
+def dig_snippet(body: str, terms: list[str], width: int = DIG_SNIPPET) -> str:
+    """One-line snippet; window around the first query term that hits.
+
+    First-line truncation hides the noun a later model needs ('atomically
+    disabled', rollback SQL) when the body opens with a timestamp.
+    """
+    compact = " ".join((body or "").split())
+    if not compact:
+        return ""
+    low = compact.lower()
+    pos = -1
+    for t in terms:
+        p = low.find(t)
+        if p >= 0:
+            pos = p
+            break
+    if pos < 0:
+        chunk = compact[:width]
+        return chunk + ("…" if len(compact) > width else "")
+    start = max(0, pos - 32)
+    chunk = compact[start:start + width]
+    if start:
+        chunk = "…" + chunk
+    if start + width < len(compact):
+        chunk += "…"
+    return chunk
+
+
+def collapse_dig_hits(
+        ranked: list[dict], hidden: set[str], limit: int
+        ) -> list[tuple[dict, int, int]]:
+    """Keep the best hit per observation first-line signature.
+
+    Repeated 'Market-wide scout batch Base <digits>…' rows would otherwise
+    fill the default limit and hide the distinctive memory. Returns
+    (entry, extra_count, superseded_in_group).
+    """
+    groups: list[list[dict]] = []
+    index: dict[tuple, int] = {}
+    for e in ranked:
+        if e.get("type") == "observation":
+            sig: tuple = ("obs", obs_signature(e.get("body") or ""))
+        else:
+            sig = ("id", e["id"])
+        if sig[0] == "id" or sig not in index:
+            if sig[0] == "obs":
+                index[sig] = len(groups)
+            groups.append([e])
+        else:
+            groups[index[sig]].append(e)
+    out = []
+    for g in groups:
+        extra = len(g) - 1
+        n_sup = sum(1 for x in g if x["id"] in hidden)
+        out.append((g[0], extra, n_sup))
+        if len(out) >= limit:
+            break
+    return out
 
 
 def _fts_or_query(query: str) -> str:
@@ -2130,19 +2221,25 @@ def cmd_dig(args):
         for d in entries:  # who hid this entry?
             if d["type"] == "digest" and e["id"] in d.get("supersedes", []):
                 print(f"    ⤷ hidden by digest {d['id']} [{d.get('kind')}]: {d['body'][:60]}")
+        print(f"(full entry: casefile show {e['id']})")
         return
 
+    terms = _query_terms(args.query)
     ranked = rank_matches(entries, args.query)
     if not ranked:
         print("no matches in raw history (searched any of: "
-              f"{', '.join(_query_terms(args.query)) or '—'})")
+              f"{', '.join(terms) or '—'})")
         return
-    # top hits by relevance, displayed in log order so causality reads right
-    order = {id(e): i for i, e in enumerate(entries)}
-    matches = sorted(ranked[:args.limit], key=lambda e: order[id(e)])
-    for e in matches:
+    # Relevance order, not log order: host UIs truncate tool output, so the
+    # first lines are the only memory a later model is guaranteed to see.
+    for e, extra, n_sup in collapse_dig_hits(ranked, hidden, args.limit):
         tag = "[superseded] " if e["id"] in hidden else ""
-        print(f"{e['id']}  {e['type']:<11} {tag}{e['body'].splitlines()[0][:78]}")
+        print(f"{e['id']}  {e['type']:<11} {tag}{dig_snippet(e['body'], terms)}")
+        if extra:
+            bits = [f"+{extra} similar"]
+            if n_sup:
+                bits.append(f"{n_sup} [superseded]")
+            print(f"    {', '.join(bits)}")
         if e["type"] == "digest":
             for sid in e.get("supersedes", []):
                 s = by_id.get(sid)
@@ -2308,7 +2405,97 @@ def claim_card_text(e: dict) -> str:
     return "; ".join(bits)
 
 
+_SHOW_EXTRA_KEYS = (
+    "rationale", "rejected", "source", "source_uri", "source_type",
+    "published_at", "accessed_at", "effective_at", "expires_at",
+    "locator", "jurisdiction", "check", "claim_mode", "mechanism",
+    "comparator", "analysis_layer", "falsifier", "counterfactual",
+    "horizon", "testability", "to", "kind",
+)
+
+
+def _cheap_grade(e: dict) -> str:
+    """Grade without the full log — enough for a single-entry show."""
+    t, a = e.get("type"), e.get("author", "")
+    if t == "observation":
+        return "ground-truth"
+    if t in ("decision", "constraint"):
+        return "stated" if a == "user" else "asserted"
+    if t == "hypothesis":
+        return "hypothesis"
+    return ""
+
+
+def _scan_entry_by_id(root: Path, eid: str) -> dict | None:
+    """Find one JSONL line by id without parsing the rest of the log."""
+    path = root / DIR / LOG
+    if not path.exists():
+        return None
+    needle = f'"id": "{eid}"'
+    with path.open() as f:
+        for line in f:
+            if needle not in line:
+                continue
+            try:
+                e = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if e.get("id") == eid:
+                return e
+    return None
+
+
+def format_entry(e: dict, grade: str = "", superseded: bool = False) -> str:
+    """Full entry dump — the memory a later model actually needs."""
+    tag = []
+    if superseded:
+        tag.append("superseded")
+    if grade:
+        tag.append(grade)
+    marks = f"  [{'; '.join(tag)}]" if tag else ""
+    lines = [
+        f"{e['id']}  {e.get('type', '')}  {e.get('author', '')}  "
+        f"{e.get('ts', '')}  {e.get('case', '')}{marks}",
+    ]
+    if e.get("refs"):
+        lines.append("refs: " + ",".join(e["refs"]))
+    if e.get("supersedes"):
+        lines.append("supersedes: " + ",".join(e["supersedes"]))
+    for k in _SHOW_EXTRA_KEYS:
+        v = e.get(k)
+        if v:
+            lines.append(f"{k}: {v}")
+    lines.append("---")
+    lines.append(e.get("body") or "")
+    return "\n".join(lines)
+
+
+def cmd_show_entry(args):
+    eid = args.entry
+    root = find_root()
+    if root is None:
+        die("no .casefile found here or in any parent "
+            f"(run `casefile init`, or set {ENV_ROOT})")
+    e = None
+    grades: dict[str, str] = {}
+    hidden: set[str] = set()
+    if persistence_mode() != "postgres":
+        e = _scan_entry_by_id(root, eid)
+    if e is None:
+        root, entries, meta = require_root()
+        e = next((x for x in entries if x["id"] == eid), None)
+        if e is None:
+            die(f"no entry `{eid}` — search with `dig {eid}` or `dig \"<topic>\"`")
+        grades = compute_grades(entries)
+        hidden = superseded_ids(entries)
+    grade = grades.get(e["id"], "") or _cheap_grade(e)
+    print(format_entry(e, grade, e["id"] in hidden))
+
+
 def cmd_show(args):
+    if getattr(args, "entry", None):
+        cmd_show_entry(args)
+        return
     root, entries, meta = require_root()
     case = resolve_case(root, meta, args.case)
     ce, grades = case_view(entries, meta, case)
@@ -3235,7 +3422,10 @@ def agent_card(author: str, author_source: str = "env") -> str:
         "Self-endorsement is rejected; get a foreign author or ground truth.",
         "Handoff: casefile packet --to <peer> | casefile inbox --for " + author,
         "Checkpoint: casefile checkpoint -a " + author + "  # abstract + reindex",
-        "Recall: casefile recall \"problem keywords\"   Dig: casefile dig \"…\"",
+        "Memory: casefile dig \"topic\"  then  casefile show <id>  "
+        "(do not grep log.jsonl or a sidecar chat log)",
+        "Recall: casefile recall \"problem keywords\"  "
+        "(compost/abstracts only — operational how-to is dig)",
         "Boot exit codes: 0 ok | 10 mailbox | 20 drift | 30 abstract stale | "
         "40 identity unset",
     ]
@@ -4022,8 +4212,9 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 | "where are we on X?" | `boot` (or `resume-context`) → prose summary sized to the question |
 | "don't touch X" | `add -t constraint -a user` |
 | "I'm not convinced by X" | `dispute -a user` |
-| "why did we rule out X?" | `dig "<query>"` (searches superseded history; expands digests) |
-| "have we seen this before?" | `recall "<query>"` (searches past-case abstracts) |
+| "why did we rule out X?" / "how did we do X?" | `dig "<query>"` then `show <id>` on a hit. Do not grep log.jsonl or a sidecar chat transcript. |
+| "show me entry 0776174a" | `show 0776174a` (full body). `dig <id>` expands digest/supersession. |
+| "have we seen this before?" | `recall "<query>"` (past-case abstracts only — not operational how-to) |
 | "hand off to codex" | `packet --to codex` |
 | "what's waiting for me?" | `inbox --for $CASEFILE_AUTHOR` / `next` |
 | "what's codex saying?" / "show me the deliberation" | `channel <model>` (ui viewport → that model's live transcript) |
@@ -4212,9 +4403,10 @@ This project keeps its investigation state in an append-only casefile log.
   `python3 casefile.py boot` (or `resume-context`) before acting. The log
   outranks compacted summary.
 - **Before filing a decision or changing an agreed plan**, run
-  `python3 casefile.py dig "<topic>"` (and `recall`) and cite what you find
-  in `--refs`. Decisions carry `--rationale` and `--rejected` for losing
-  options.
+  `python3 casefile.py dig "<topic>"` then `show <id>` on a hit (and
+  `recall` for past-case abstracts) and cite what you find in `--refs`.
+  Do not grep log.jsonl or a sidecar chat transcript. Decisions carry
+  `--rationale` and `--rejected` for losing options.
 - **Before a consequential spitball**, sweep the current conversation into
   the log and freeze a manifest of verbatim requirements, criteria/weights,
   alternatives, evidence domains, analysis layers, and open questions.
@@ -4912,7 +5104,9 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("candidate")
     s.set_defaults(fn=cmd_finalize_digest)
 
-    s = sub.add_parser("show", help="compiled markdown view of a case")
+    s = sub.add_parser("show", help="full entry by id, or compiled markdown view of a case")
+    s.add_argument("entry", nargs="?",
+                   help="entry id (full body). Omit for the compiled case view.")
     s.add_argument("--case")
     s.add_argument("--observations", type=int, default=5)
     s.set_defaults(fn=cmd_show)
