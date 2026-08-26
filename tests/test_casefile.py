@@ -1135,6 +1135,37 @@ class CliMemoryTests(CliBase):
         self.assertIn("# Test case", r.out)
         self.assertIn("do not restart live", r.out)
 
+    def test_reindex_reports_history_count(self):
+        self.add("-t", "note", "-a", "claude", "alpha")
+        self.add("-t", "note", "-a", "claude", "beta")
+        r = self.cli("reindex", expect=0)
+        self.assertIn("indexed 0 compost", r.out)
+        self.assertIn("2 history", r.out)
+
+    def test_append_keeps_history_index_fresh(self):
+        import sqlite3
+        self.add("-t", "note", "-a", "claude", "first memory")
+        self.add("-t", "note", "-a", "claude", "second memory")
+        db = sqlite3.connect(self.dir / ".casefile" / "index.db")
+        n = db.execute("SELECT count(*) FROM history").fetchone()[0]
+        db.close()
+        self.assertEqual(n, len(self.log_entries()))
+        r = self.cli("dig", "second memory", expect=0)
+        self.assertIn("second memory", r.out)
+
+    def test_dig_fts_prefix_matches_enabled(self):
+        self.add("-t", "observation", "-a", "codex", "--source", "manual",
+                 "the backrunner config was enabled last Tuesday")
+        r = self.cli("dig", "enable backrunner", expect=0)
+        self.assertIn("enabled", r.out)
+        self.assertIn("backrunner", r.out)
+
+    def test_dig_survives_missing_index(self):
+        self.add("-t", "note", "-a", "claude", "flux capacitor undervolts")
+        (self.dir / ".casefile" / "index.db").unlink(missing_ok=True)
+        r = self.cli("dig", "capacitor", expect=0)
+        self.assertIn("flux capacitor", r.out)
+
 
 class RankMatchTests(unittest.TestCase):
     """Pure ranking: IDF + type weight, independent of CLI load cost."""

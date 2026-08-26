@@ -564,6 +564,11 @@ def _append_entries_local(root: Path, batch: list[dict]) -> None:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
             f.flush()
             os.fsync(f.fileno())
+        # Index is a cache (P1): failure must not roll back the log.
+        try:
+            _index_append(root, batch)
+        except Exception:
+            pass
 
 
 def _pg_insert_batch(conn, namespace: str, batch: list[dict]) -> int:
@@ -1617,8 +1622,9 @@ def cmd_digest(args):
     save_active(root, case)  # SPEC §5.1: active case follows "last touched"
     if args.kind in ("abstract", "judgment"):
         # compost changed: refresh the recall cache now rather than trusting
-        # the author to remember `reindex` (a stale index reads as amnesia)
-        build_index(root, entries, meta)
+        # the author to remember `reindex` (a stale index reads as amnesia).
+        # History FTS is incremental on append — do not wipe it here.
+        build_index(root, entries, meta, history=False)
     if args.json:
         print(json.dumps({
             "id": e["id"], "case": case, "type": "digest",
@@ -2019,36 +2025,144 @@ def index_path(root: Path) -> Path:
     return root / DIR / "index.db"
 
 
-def build_index(root: Path, entries: list[dict], meta: dict) -> int | None:
-    """Rebuild the FTS5 recall cache from scratch (SPEC §10: the index is a
-    cache; the log is the truth). Returns row count, or None if FTS5 is
-    unavailable in this SQLite build (recall then falls back to a log scan)."""
+def _connect_index(root: Path):
     import sqlite3
-    p = index_path(root)
-    p.unlink(missing_ok=True)
-    db = sqlite3.connect(p)
+    return sqlite3.connect(index_path(root))
+
+
+def _ensure_index_schema(db) -> bool:
+    """Create compost + history FTS and side tables. False if no FTS5."""
     try:
-        db.execute("CREATE VIRTUAL TABLE compost USING fts5(id, case_id, title, ts, body)")
+        db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS compost USING fts5("
+            "id, case_id, title, ts, body)")
+        db.execute(
+            "CREATE VIRTUAL TABLE IF NOT EXISTS history USING fts5("
+            "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
+            "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED)")
+    except Exception:
+        return False
+    db.execute("CREATE TABLE IF NOT EXISTS superseded (id TEXT PRIMARY KEY)")
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS hidden_by ("
+        "id TEXT, digest_id TEXT, kind TEXT, body TEXT, "
+        "PRIMARY KEY (id, digest_id))")
+    db.execute(
+        "CREATE TABLE IF NOT EXISTS index_meta (k TEXT PRIMARY KEY, v TEXT)")
+    return True
+
+
+def _history_row(e: dict) -> tuple:
+    return (
+        e.get("id", ""),
+        e.get("case", ""),
+        e.get("type", ""),
+        e.get("author", ""),
+        e.get("ts", ""),
+        e.get("body") or "",
+        ",".join(e.get("supersedes") or []),
+    )
+
+
+def _index_record_digest(db, e: dict) -> None:
+    if e.get("type") != "digest" or e.get("kind") == "candidate":
+        return
+    kind = e.get("kind") or ""
+    preview = (e.get("body") or "")[:80]
+    for sid in e.get("supersedes") or []:
+        db.execute("INSERT OR IGNORE INTO superseded(id) VALUES (?)", (sid,))
+        db.execute(
+            "INSERT OR IGNORE INTO hidden_by(id, digest_id, kind, body) "
+            "VALUES (?,?,?,?)",
+            (sid, e.get("id", ""), kind, preview))
+
+
+def _index_append(root: Path, batch: list[dict]) -> None:
+    """Incremental history FTS insert. Best-effort; the log is truth."""
+    if not batch:
+        return
+    import sqlite3
+    db = _connect_index(root)
+    try:
+        if not _ensure_index_schema(db):
+            return
+        db.executemany(
+            "INSERT INTO history(id, case_id, etype, author, ts, body, supersedes) "
+            "VALUES (?,?,?,?,?,?,?)",
+            [_history_row(e) for e in batch])
+        for e in batch:
+            _index_record_digest(db, e)
+        n = db.execute("SELECT count(*) FROM history").fetchone()[0]
+        db.execute(
+            "INSERT INTO index_meta(k, v) VALUES ('n_history', ?) "
+            "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(n),))
+        db.commit()
     except sqlite3.OperationalError:
+        pass
+    finally:
         db.close()
-        p.unlink(missing_ok=True)
-        return None
+
+
+def _rebuild_compost(db, entries: list[dict], meta: dict) -> int:
+    db.execute("DROP TABLE IF EXISTS compost")
+    db.execute(
+        "CREATE VIRTUAL TABLE compost USING fts5(id, case_id, title, ts, body)")
     rows = [(e["id"], e["case"],
              meta.get("cases", {}).get(e["case"], {}).get("title", e["case"]),
              e.get("ts", ""), e["body"])
             for e in compost_entries(entries)]
     db.executemany("INSERT INTO compost VALUES (?,?,?,?,?)", rows)
+    return len(rows)
+
+
+def _rebuild_history(db, entries: list[dict]) -> int:
+    db.execute("DROP TABLE IF EXISTS history")
+    db.execute(
+        "CREATE VIRTUAL TABLE history USING fts5("
+        "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
+        "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED)")
+    db.execute("DELETE FROM superseded")
+    db.execute("DELETE FROM hidden_by")
+    db.executemany(
+        "INSERT INTO history(id, case_id, etype, author, ts, body, supersedes) "
+        "VALUES (?,?,?,?,?,?,?)",
+        [_history_row(e) for e in entries])
+    for e in entries:
+        _index_record_digest(db, e)
+    db.execute(
+        "INSERT INTO index_meta(k, v) VALUES ('n_history', ?) "
+        "ON CONFLICT(k) DO UPDATE SET v=excluded.v", (str(len(entries)),))
+    return len(entries)
+
+
+def build_index(root: Path, entries: list[dict], meta: dict,
+                history: bool = True) -> int | None:
+    """Rebuild the FTS5 cache (SPEC §10: the index is a cache; the log is
+    the truth). Returns compost row count, or None if FTS5 is unavailable.
+    history=False refreshes compost only (digest path) so a 10^5-entry log
+    is not rewritten on every abstract."""
+    p = index_path(root)
+    db = _connect_index(root)
+    if not _ensure_index_schema(db):
+        db.close()
+        p.unlink(missing_ok=True)
+        return None
+    n = _rebuild_compost(db, entries, meta)
+    if history:
+        _rebuild_history(db, entries)
     db.commit()
     db.close()
-    return len(rows)
+    return n
 
 
 def cmd_reindex(args):
     root, entries, meta = require_root()
-    n = build_index(root, entries, meta)
+    n = build_index(root, entries, meta, history=True)
     if n is None:
-        die("SQLite FTS5 unavailable in this build; `recall` still works via log scan")
-    print(f"indexed {n} compost entr{'y' if n == 1 else 'ies'}")
+        die("SQLite FTS5 unavailable in this build; `recall`/`dig` still work via log scan")
+    h = len(entries)
+    print(f"indexed {n} compost {'entry' if n == 1 else 'entries'}, "
+          f"{h} history {'entry' if h == 1 else 'entries'}")
 
 
 def _query_terms(query: str) -> list[str]:
@@ -2170,6 +2284,118 @@ def _fts_or_query(query: str) -> str:
     return " OR ".join(f'"{t}"' for t in _query_terms(query))
 
 
+def _fts_history_query(query: str) -> str:
+    """OR of exact token plus prefix so 'enable' matches 'enabled' the way
+    the JSONL substring scan did — FTS5 tokens are otherwise whole words."""
+    parts = []
+    for t in _query_terms(query):
+        parts.append(f'"{t}" OR {t}*')
+    return " OR ".join(parts)
+
+
+def _log_line_count(root: Path) -> int:
+    path = root / DIR / LOG
+    if not path.exists():
+        return 0
+    n = 0
+    with path.open() as f:
+        for line in f:
+            if line.strip():
+                n += 1
+    return n
+
+
+def _history_rows_to_entries(rows) -> list[dict]:
+    out = []
+    for r in rows:
+        eid, case, typ, author, ts, body, supersedes = r
+        e = {"id": eid, "case": case, "type": typ, "author": author,
+             "ts": ts, "body": body or "",
+             "supersedes": [s for s in (supersedes or "").split(",") if s]}
+        out.append(e)
+    return out
+
+
+def _index_hidden(root: Path) -> set[str]:
+    import sqlite3
+    p = index_path(root)
+    if not p.exists():
+        return set()
+    db = sqlite3.connect(p)
+    try:
+        rows = db.execute("SELECT id FROM superseded").fetchall()
+        return {r[0] for r in rows}
+    except sqlite3.OperationalError:
+        return set()
+    finally:
+        db.close()
+
+
+def _index_hidden_by(root: Path, eid: str) -> list[tuple[str, str, str]]:
+    import sqlite3
+    p = index_path(root)
+    if not p.exists():
+        return []
+    db = sqlite3.connect(p)
+    try:
+        return db.execute(
+            "SELECT digest_id, kind, body FROM hidden_by WHERE id = ?",
+            (eid,)).fetchall()
+    except sqlite3.OperationalError:
+        return []
+    finally:
+        db.close()
+
+
+def _dig_fts_candidates(root: Path, query: str) -> list[dict] | None:
+    """Return history hits from FTS, or None to fall back to a log scan.
+
+    None means: no index, no history table, or row-count drift (stale cache).
+    An empty list means a fresh index with no matches.
+    """
+    import sqlite3
+    p = index_path(root)
+    fts = _fts_history_query(query)
+    if not p.exists() or not fts:
+        return None
+    db = sqlite3.connect(p)
+    try:
+        n_hist = db.execute("SELECT count(*) FROM history").fetchone()[0]
+        if n_hist != _log_line_count(root):
+            return None
+        seen: set[str] = set()
+        rows = []
+        for sql, args in (
+            ("SELECT id, case_id, etype, author, ts, body, supersedes "
+             "FROM history WHERE history MATCH ? ORDER BY bm25(history) LIMIT 200",
+             (fts,)),
+        ):
+            rows.extend(db.execute(sql, args).fetchall())
+        # Guarantee each query term's own top hits make the candidate set
+        # even if OR-BM25 is dominated by a high-DF token like 'live'.
+        for t in _query_terms(query):
+            term_q = f'"{t}" OR {t}*'
+            try:
+                rows.extend(db.execute(
+                    "SELECT id, case_id, etype, author, ts, body, supersedes "
+                    "FROM history WHERE history MATCH ? "
+                    "ORDER BY bm25(history) LIMIT 40",
+                    (term_q,)).fetchall())
+            except sqlite3.OperationalError:
+                continue
+        out = []
+        for e in _history_rows_to_entries(rows):
+            if e["id"] in seen:
+                continue
+            seen.add(e["id"])
+            out.append(e)
+        return out
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        db.close()
+
+
 def _scan_recall(entries, meta, query, limit):
     out = []
     for e in rank_matches(compost_entries(entries), query)[:limit]:
@@ -2204,35 +2430,23 @@ def cmd_recall(args):
         print(f"`{case}` {title}\n    {first[:100]}")
 
 
-def cmd_dig(args):
-    root, entries, meta = require_root()
-    hidden = superseded_ids(entries)
-    by_id = {e["id"]: e for e in entries}
+def _print_dig_id(root: Path, e: dict, hidden: set[str]) -> None:
+    tag = " [superseded]" if e["id"] in hidden else ""
+    print(f"{e['id']}  {e['type']}{tag}: {e['body']}")
+    for sid in e.get("supersedes") or []:
+        s = _scan_entry_by_id(root, sid) if persistence_mode() != "postgres" else None
+        if s:
+            print(f"    ↳ superseded {sid} ({s['type']}): {s['body'][:70]}")
+        else:
+            print(f"    ↳ superseded {sid}")
+    for digest_id, kind, body in _index_hidden_by(root, e["id"]):
+        print(f"    ⤷ hidden by digest {digest_id} [{kind}]: {body[:60]}")
+    print(f"(full entry: casefile show {e['id']})")
 
-    # exact-id lookup: expand one entry and its digest relationships
-    if args.query in by_id:
-        e = by_id[args.query]
-        tag = " [superseded]" if e["id"] in hidden else ""
-        print(f"{e['id']}  {e['type']}{tag}: {e['body']}")
-        for sid in e.get("supersedes", []):
-            s = by_id.get(sid)
-            if s:
-                print(f"    ↳ superseded {sid} ({s['type']}): {s['body'][:70]}")
-        for d in entries:  # who hid this entry?
-            if d["type"] == "digest" and e["id"] in d.get("supersedes", []):
-                print(f"    ⤷ hidden by digest {d['id']} [{d.get('kind')}]: {d['body'][:60]}")
-        print(f"(full entry: casefile show {e['id']})")
-        return
 
-    terms = _query_terms(args.query)
-    ranked = rank_matches(entries, args.query)
-    if not ranked:
-        print("no matches in raw history (searched any of: "
-              f"{', '.join(terms) or '—'})")
-        return
-    # Relevance order, not log order: host UIs truncate tool output, so the
-    # first lines are the only memory a later model is guaranteed to see.
-    for e, extra, n_sup in collapse_dig_hits(ranked, hidden, args.limit):
+def _print_dig_hits(root: Path, ranked: list[dict], hidden: set[str],
+                    terms: list[str], limit: int) -> None:
+    for e, extra, n_sup in collapse_dig_hits(ranked, hidden, limit):
         tag = "[superseded] " if e["id"] in hidden else ""
         print(f"{e['id']}  {e['type']:<11} {tag}{dig_snippet(e['body'], terms)}")
         if extra:
@@ -2241,10 +2455,54 @@ def cmd_dig(args):
                 bits.append(f"{n_sup} [superseded]")
             print(f"    {', '.join(bits)}")
         if e["type"] == "digest":
-            for sid in e.get("supersedes", []):
-                s = by_id.get(sid)
-                if s:
-                    print(f"    ↳ {sid} ({s['type']}): {s['body'].splitlines()[0][:66]}")
+            for sid in e.get("supersedes") or []:
+                s = _scan_entry_by_id(root, sid) if persistence_mode() != "postgres" else None
+                preview = (s["body"].splitlines()[0][:66] if s
+                           else (e.get("body") or "")[:66])
+                print(f"    ↳ {sid} ({s['type'] if s else '?'}): {preview}")
+
+
+def cmd_dig(args):
+    root = find_root()
+    if root is None:
+        die("no .casefile found here or in any parent "
+            f"(run `casefile init`, or set {ENV_ROOT})")
+    terms = _query_terms(args.query)
+    pg = persistence_mode() == "postgres"
+
+    # exact-id: one JSONL line, not the whole log
+    if re.fullmatch(r"[0-9a-f]{8}", args.query) and not pg:
+        e = _scan_entry_by_id(root, args.query)
+        if e is not None:
+            _print_dig_id(root, e, _index_hidden(root))
+            return
+
+    hidden: set[str] = set()
+    ranked: list[dict] | None = None
+    if not pg:
+        cands = _dig_fts_candidates(root, args.query)
+        if cands is not None:
+            ranked = rank_matches(cands, args.query)
+            hidden = _index_hidden(root)
+
+    if ranked is None:
+        # cache missing/stale or postgres: log is truth
+        root, entries, meta = require_root()
+        if not pg:
+            build_index(root, entries, meta, history=True)
+            cands = _dig_fts_candidates(root, args.query)
+            if cands is not None:
+                ranked = rank_matches(cands, args.query)
+                hidden = _index_hidden(root)
+        if ranked is None:
+            ranked = rank_matches(entries, args.query)
+            hidden = superseded_ids(entries)
+
+    if not ranked:
+        print("no matches in raw history (searched any of: "
+              f"{', '.join(terms) or '—'})")
+        return
+    _print_dig_hits(root, ranked, hidden, terms, args.limit)
 
 
 # -------- import (SPEC §11.3 / M3)

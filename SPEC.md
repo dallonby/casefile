@@ -383,15 +383,22 @@ abstract records the terminal state honestly (P9):
 Dormancy never asserts "solved" on its own authority — that would be the
 system laundering its own conclusion.
 
-## 10. Recall index (the compost)
+## 10. Recall index (the compost) and history FTS
 
-- SQLite **FTS5** over abstracts + judgment digests (BM25 ranking). Fields:
-  case, title, status, body, ruled_out, ts.
+- SQLite **FTS5** in `index.db` (gitignored, destroyable). Two virtual tables:
+  **compost** — abstracts + judgment digests, for `recall` / open-time
+  auto-search; **history** — every entry body, for `dig`. Side tables
+  record supersession so `dig` can tag hidden rows without parsing the log.
 - **The index is a cache; the log is the truth.** `casefile reindex`
-  rebuilds it from scratch; it is gitignored and never backed up.
-- `casefile recall "<query>"` — plumbing beneath the porcelain question
-  "have we seen this before?" (compost only: abstracts + judgment digests).
-  Operational how-to ("how did we disable X last week") is `dig`, not `recall`.
+  rebuilds both tables from the JSONL. Appends update history incrementally.
+  A digest refreshes compost only (a 10^5-entry history rewrite on every
+  abstract would make checkpoints unusable). If history row-count drifts
+  from the log, `dig` rebuilds then queries; if FTS5 is missing it scans.
+- `casefile recall "<query>"` — "have we seen this before?" (compost only).
+  Operational how-to ("how did we disable X last week") is `dig`, which
+  must not be a linear JSONL substring scan on the hot path.
+- JSONL text search is not an acceptable lookup engine for later model
+  sessions. The SQL cache covers raw history, not only abstracts.
 - **Open-time auto-search**: when a new case is created, `open` itself
   mechanically surfaces strong compost hits from other cases *before the
   first hypothesis is filed* ("this resembles the March importer case —
@@ -410,9 +417,9 @@ system laundering its own conclusion.
 no ceremony), `add`, `endorse`, `dispute`, `resolve`, `verify`, `revoke`,
 `digest`, `finalize-digest`, `show [entry]` (full entry by id, or compiled
 case view), `resume-context [--blind]`, `recheck`, `recall`, `dig
-<query>` (IDF-ranked raw/superseded history, relevance order, collapse
+<query>` (history FTS + IDF/type weight, relevance order, collapse
 near-duplicate observations, expand exact ids; then `show <id>` for the
-full body), `lint`, `log`,
+full body; JSONL scan is the stale-cache fallback), `lint`, `log`,
 `reindex`, `hooks install <vendor>`, `ui`, `spitball`,
 `spitball-recover`, `preflight`, `status` (JSON:
 active case, mailbox count, lint count, dormancy candidates, spend).
