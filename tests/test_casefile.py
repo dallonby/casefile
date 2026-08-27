@@ -148,6 +148,52 @@ class InvariantTests(unittest.TestCase):
     def test_unknown_entry_reported(self):
         self.assertTrue(self.viol([], ["nope"]))
 
+    def test_digest_lint_preserves_history_without_prefix_slices(self):
+        class PrefixTrackingList(list):
+            prefix_slices = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, slice) and key.start is None \
+                        and isinstance(key.stop, int):
+                    self.prefix_slices += 1
+                return super().__getitem__(key)
+
+        es = PrefixTrackingList([
+            E("c1", "constraint"),
+            E("d-open", "digest", supersedes=["c1"]),
+            E("rv1", "revocation", refs=["c1"]),
+            E("d-revoked", "digest", supersedes=["c1"]),
+            E("q1", "question"),
+            E("d-question", "digest", supersedes=["q1"]),
+            E("r1", "resolution", refs=["q1"], outcome="answered"),
+            E("d-answered", "digest", supersedes=["q1"]),
+            E("h1", "hypothesis"),
+            E("o1", "observation"),
+            E("v1", "verification", refs=["h1", "o1"]),
+            E("d-protected", "digest", supersedes=["o1"]),
+            E("v-forward", "verification", refs=["h2", "o2"]),
+            E("h2", "hypothesis"),
+            E("o2", "observation"),
+            E("d-forward", "digest", supersedes=["o2"]),
+            E("d-unknown", "digest", supersedes=["missing"]),
+        ])
+
+        problems = [
+            p for p in cf.lint_problems(es)
+            if p.startswith("DIGEST-VIOLATION")
+        ]
+
+        self.assertEqual(problems, [
+            "DIGEST-VIOLATION `d-open` supersedes c1: unrevoked constraint",
+            "DIGEST-VIOLATION `d-question` supersedes q1: open question",
+            "DIGEST-VIOLATION `d-protected` supersedes o1: observation "
+            "referenced by a verification",
+            "DIGEST-VIOLATION `d-forward` supersedes o2: observation "
+            "referenced by a verification",
+            "DIGEST-VIOLATION `d-unknown` supersedes missing: unknown entry",
+        ])
+        self.assertEqual(es.prefix_slices, 0)
+
 
 # --------------------------------------------------- unit: lifecycle (SPEC §9)
 

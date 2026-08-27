@@ -1045,6 +1045,64 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
     return out
 
 
+def historical_digest_invariant_problems(entries: list[dict]) -> list[str]:
+    """Replay stored digest checks once in chronological order."""
+    by_id: dict[str, dict] = {}
+    revoked: set[str] = set()
+    fulfilled: set[str] = set()
+    resolved: set[str] = set()
+    verification_refs: set[str] = set()
+    protected_obs: set[str] = set()
+    out: list[str] = []
+
+    for e in entries:
+        # Validate before incorporating this entry, preserving entries[:i].
+        if e["type"] == "digest" and e.get("supersedes"):
+            for sid in e["supersedes"]:
+                target = by_id.get(sid)
+                violation = None
+                if not target:
+                    violation = f"{sid}: unknown entry"
+                elif target["type"] == "constraint" and sid not in revoked:
+                    violation = f"{sid}: unrevoked constraint"
+                elif target["type"] == "decision" \
+                        and sid not in revoked and sid not in fulfilled:
+                    violation = (
+                        f"{sid}: undismissed decision (revoke or resolve "
+                        f"--outcome fulfilled first)"
+                    )
+                elif target["type"] in ("dispute", "question") \
+                        and sid not in resolved:
+                    violation = f"{sid}: open {target['type']}"
+                elif target["type"] == "observation" and sid in protected_obs:
+                    violation = (
+                        f"{sid}: observation referenced by a verification"
+                    )
+                if violation:
+                    out.append(
+                        f"DIGEST-VIOLATION `{e['id']}` supersedes {violation}"
+                    )
+
+        by_id[e["id"]] = e
+        refs = e.get("refs", [])
+        if e["type"] == "revocation":
+            revoked.update(refs)
+        elif e["type"] == "resolution":
+            resolved.update(refs)
+            if e.get("outcome") == "fulfilled":
+                fulfilled.update(refs)
+        elif e["type"] == "verification":
+            verification_refs.update(refs)
+            protected_obs.update(
+                r for r in refs
+                if by_id.get(r, {}).get("type") == "observation"
+            )
+        elif e["type"] == "observation" and e["id"] in verification_refs:
+            protected_obs.add(e["id"])
+
+    return out
+
+
 # --------------------------------------------------------------- case logic
 
 def require_root(start: Path | None = None):
@@ -3167,12 +3225,8 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
                     problems.append(f"CONTRADICTION    verified `{r}` is disputed by "
                                     f"`{e['id']}` — human review needed")
 
-    # DIGEST-VIOLATION: replay each stored digest against the log as it stood
-    for i, e in enumerate(entries):
-        if e["type"] == "digest" and e.get("supersedes"):
-            viol = digest_invariant_violations(entries, e["supersedes"], as_of=i)
-            for v in viol:
-                problems.append(f"DIGEST-VIOLATION `{e['id']}` supersedes {v}")
+    # DIGEST-VIOLATION: replay stored digests against their historical state.
+    problems.extend(historical_digest_invariant_problems(entries))
 
     # CHECK-FAILING: a live check that keeps failing needs an owner — fix the
     # recipe, supersede the claim, or dispute it; letting it fail on schedule
