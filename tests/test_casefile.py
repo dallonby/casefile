@@ -2121,3 +2121,50 @@ class AuthorIdentityCoherenceTests(CliBase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PerfPathTests(unittest.TestCase):
+    """Whole-log passes must not ride every hook call (large-store latency)."""
+
+    def _mod(self):
+        spec = importlib.util.spec_from_file_location(
+            "casefile_perf", Path(__file__).resolve().parents[1] / "casefile.py")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        return mod
+
+    def test_local_reader_fast_path_and_corrupt_line_report(self):
+        cf = self._mod()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".casefile").mkdir()
+            log = root / ".casefile" / "log.jsonl"
+            log.write_text('{"id":"a"}\n\n   \n{"id":"b"}\n')
+            self.assertEqual([e["id"] for e in cf._read_entries_local(root)], ["a", "b"])
+            log.write_text('{"id":"a"}\n{not json}\n')
+            with self.assertRaises(SystemExit):
+                cf._read_entries_local(root)
+
+    def test_pg_reconcile_freshness_gate(self):
+        cf = self._mod()
+        stamp = {"size": 10, "mtime_ns": 5}
+        fresh = {"namespace": "ns", "size": 10, "mtime_ns": 5, "remote_count": 3}
+        self.assertTrue(cf.pg_reconcile_is_fresh(fresh, stamp, 3, "ns"))
+        self.assertFalse(cf.pg_reconcile_is_fresh(None, stamp, 3, "ns"))
+        self.assertFalse(cf.pg_reconcile_is_fresh(fresh, stamp, 4, "ns"))
+        self.assertFalse(cf.pg_reconcile_is_fresh(fresh, {"size": 11, "mtime_ns": 5}, 3, "ns"))
+        self.assertFalse(cf.pg_reconcile_is_fresh(fresh, stamp, 3, "other"))
+
+    def test_hook_maintenance_is_throttled(self):
+        cf = self._mod()
+        with tempfile.TemporaryDirectory() as d:
+            root = Path(d)
+            (root / ".casefile").mkdir()
+            cf.install_hooks(root, "claude-code")
+            spec = importlib.util.spec_from_file_location(
+                "observe_hook", root / ".casefile" / "hooks" / "observe.py")
+            hook = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(hook)
+            self.assertTrue(hook._maintenance_due(root, now=1000.0, interval=600))
+            self.assertFalse(hook._maintenance_due(root, now=1300.0, interval=600))
+            self.assertTrue(hook._maintenance_due(root, now=1700.0, interval=600))

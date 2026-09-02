@@ -544,6 +544,13 @@ def _read_entries_local(root: Path) -> list[dict]:
     path = root / DIR / LOG
     if not path.exists():
         return []
+    # Fast path: one json.loads per non-blank line. Any decode error falls
+    # through to the numbered scan below so the corrupt line is reported.
+    try:
+        with path.open() as f:
+            return [json.loads(line) for line in f if not line.isspace()]
+    except json.JSONDecodeError:
+        pass
     out = []
     with path.open() as f:
         for n, line in enumerate(f, 1):
@@ -597,6 +604,68 @@ def _pg_insert_batch(conn, namespace: str, batch: list[dict]) -> int:
             inserted += cur.rowcount
     conn.commit()
     return inserted
+
+
+_PG_LOCAL_CACHE: dict[str, list[dict]] = {}
+
+
+def _pg_reconcile_state_path(root: Path) -> Path:
+    return root / DIR / "state" / "pg-reconcile.json"
+
+
+def _local_log_stamp(root: Path) -> dict:
+    try:
+        st = (root / DIR / LOG).stat()
+        return {"size": st.st_size, "mtime_ns": st.st_mtime_ns}
+    except FileNotFoundError:
+        return {"size": 0, "mtime_ns": 0}
+
+
+def pg_reconcile_is_fresh(state: dict | None, local_stamp: dict,
+                          remote_count: int, namespace: str) -> bool:
+    """The last reconcile is still valid when neither side changed since:
+    same namespace, same local mirror size/mtime, same remote row count."""
+    if not isinstance(state, dict):
+        return False
+    return (state.get("namespace") == namespace
+            and state.get("size") == local_stamp.get("size")
+            and state.get("mtime_ns") == local_stamp.get("mtime_ns")
+            and state.get("remote_count") == remote_count)
+
+
+def _save_pg_reconcile_state(root: Path, namespace: str, remote_count: int) -> None:
+    try:
+        p = _pg_reconcile_state_path(root)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(json.dumps({
+            "namespace": namespace,
+            "remote_count": int(remote_count),
+            "ts": datetime.now(timezone.utc).isoformat(),
+            **_local_log_stamp(root),
+        }))
+    except OSError:
+        pass
+
+
+def _load_pg_reconcile_state(root: Path) -> dict | None:
+    try:
+        state = json.loads(_pg_reconcile_state_path(root).read_text())
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
+def _pg_fetch_by_ids(conn, namespace: str, ids: list[str]) -> list[dict]:
+    if not ids:
+        return []
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT payload FROM casefile_entries "
+            "WHERE namespace = %s AND id = ANY(%s) ORDER BY ts ASC, id ASC",
+            (namespace, list(ids)),
+        )
+        rows = cur.fetchall()
+    return [p if isinstance(p, dict) else json.loads(p) for (p,) in rows]
 
 
 def _pg_fetch_all(conn, namespace: str) -> list[dict]:
@@ -702,11 +771,15 @@ def reconcile_postgres(root: Path, *, quiet: bool = False) -> dict:
         pushed = _pg_insert_batch(conn, ns, to_push) if to_push else 0
 
         # Pull entries that exist only on PG into the local mirror (git/offline).
-        if remote_count + pushed > 0:
+        # Only the missing rows travel: an empty mirror takes the full set,
+        # otherwise just the ids the mirror lacks (never a whole-table fetch).
+        missing_ids = [i for i in remote_ids if i not in local_by_id]
+        if not local and remote_count > 0:
             remote_all = _pg_fetch_all(conn, ns)
+            missing_local = remote_all
         else:
             remote_all = []
-        missing_local = [e for e in remote_all if e.get("id") not in local_by_id]
+            missing_local = _pg_fetch_by_ids(conn, ns, missing_ids)
         if missing_local:
             # Preserve PG order when rewriting local log from full remote set
             # only if local was empty; otherwise append missing only.
@@ -753,6 +826,12 @@ def reconcile_postgres(root: Path, *, quiet: bool = False) -> dict:
             _pg_save_registry(conn, ns, {**remote_reg, "cases": merged_cases})
     finally:
         conn.close()
+    # After this point the local mirror equals the remote set, so reads can
+    # come from the mirror and the next process can skip reconcile until
+    # either side changes.
+    key = str(root.resolve())
+    _PG_LOCAL_CACHE[key] = remote_all if (missing_local and not local) else local + missing_local
+    _save_pg_reconcile_state(root, ns, remote_count + pushed)
     report = {
         "namespace": ns,
         "local_before": len(local),
@@ -776,6 +855,20 @@ def ensure_pg_reconciled(root: Path) -> None:
     key = str(root.resolve())
     if key in _PG_RECONCILED:
         return
+    # Freshness gate: a full reconcile parses the mirror and walks the remote
+    # id set; skip it while the mirror is byte-identical to the last reconcile
+    # and the remote row count is unchanged (one COUNT(*) round trip).
+    state = _load_pg_reconcile_state(root)
+    if state is not None:
+        ns = pg_namespace(root)
+        conn = _pg_connect()
+        try:
+            remote_count = _pg_count(conn, ns)
+        finally:
+            conn.close()
+        if pg_reconcile_is_fresh(state, _local_log_stamp(root), remote_count, ns):
+            _PG_RECONCILED.add(key)
+            return
     reconcile_postgres(root, quiet=True)
     _PG_RECONCILED.add(key)
 
@@ -785,12 +878,12 @@ def read_entries(root: Path) -> list[dict]:
     if persistence_mode() != "postgres":
         return _read_entries_local(root)
     ensure_pg_reconciled(root)
-    ns = pg_namespace(root)
-    conn = _pg_connect()
-    try:
-        return _pg_fetch_all(conn, ns)
-    finally:
-        conn.close()
+    # The reconciled mirror equals the remote set: serve reads from it rather
+    # than re-fetching (and re-decoding) every row on every invocation.
+    cached = _PG_LOCAL_CACHE.get(str(root.resolve()))
+    if cached is not None:
+        return list(cached)
+    return _read_entries_local(root)
 
 
 class LogLock:
@@ -843,14 +936,23 @@ def append_entries(root: Path, batch: list[dict]):
     ns = pg_namespace(root)
     conn = _pg_connect()
     try:
-        _pg_insert_batch(conn, ns, batch)
+        inserted = _pg_insert_batch(conn, ns, batch)
     finally:
         conn.close()
     # Mirror locally (skip ids already present — import may have raced).
-    local_ids = {e.get("id") for e in _read_entries_local(root)}
+    key = str(root.resolve())
+    cached = _PG_LOCAL_CACHE.get(key)
+    local_ids = {e.get("id") for e in (cached if cached is not None
+                                       else _read_entries_local(root))}
     to_local = [e for e in batch if e.get("id") not in local_ids]
     if to_local:
         _append_entries_local(root, to_local)
+    _PG_LOCAL_CACHE.pop(key, None)
+    # Both sides moved together: advance the freshness stamp so the next
+    # process does not pay for a reconcile it does not need.
+    state = _load_pg_reconcile_state(root)
+    if state is not None and state.get("namespace") == ns:
+        _save_pg_reconcile_state(root, ns, int(state.get("remote_count", 0)) + inserted)
 
 
 def new_id(existing: set[str], body: str) -> str:
@@ -2020,11 +2122,13 @@ def cmd_sync_journal(args):
     local-only: `.casefile/journals`, one absolute path per line. A journal
     seen for the first time is registered at EOF — sync captures lines written
     after configuration, never a historical flood."""
-    root, entries, meta = require_root()
-    cfg = root / DIR / JOURNALS_FILE
-    if not cfg.exists():
+    root0 = find_root()
+    if root0 is not None and not (root0 / DIR / JOURNALS_FILE).exists():
+        # Nothing configured: answer before loading the log.
         print("no journals configured (.casefile/journals: one absolute path per line)")
         return
+    root, entries, meta = require_root()
+    cfg = root / DIR / JOURNALS_FILE
     case = resolve_case(root, meta, args.case)
     total = 0
     for raw in cfg.read_text().splitlines():
@@ -4148,6 +4252,31 @@ def _cli(root):
     return ["casefile"]
 
 
+MAINTENANCE_INTERVAL_S = 600
+
+
+def _maintenance_due(root, now=None, interval=MAINTENANCE_INTERVAL_S):
+    # Compaction and journal sync ride hook batches (§6.1/§13) but each is a
+    # whole-log pass; on a large store that is seconds per tool call. Run
+    # them at most once per interval per store, tracked by a stamp file.
+    import time
+    stamp = Path(root) / ".casefile" / "state" / "hook-maintenance.stamp"
+    now = time.time() if now is None else now
+    try:
+        if now - stamp.stat().st_mtime < interval:
+            return False
+    except OSError:
+        pass
+    try:
+        stamp.parent.mkdir(parents=True, exist_ok=True)
+        stamp.write_text(str(now))
+        import os
+        os.utime(stamp, (now, now))
+    except OSError:
+        pass
+    return True
+
+
 def _field(hook, *names, default=None):
     """Claude/Codex use snake_case; Grok uses camelCase. Accept both."""
     for name in names:
@@ -4185,10 +4314,11 @@ def main():
     subprocess.run(cli + ["add", "-t", "observation", "-a", "system",
                           "--source", "hook:post-bash", body],
                    cwd=root, capture_output=True, timeout=10)
-    subprocess.run(cli + ["compact"],  # §6.1: compaction rides hook batches
-                   cwd=root, capture_output=True, timeout=10)
-    subprocess.run(cli + ["sync-journal"],  # §13: external journals ride too
-                   cwd=root, capture_output=True, timeout=10)
+    if _maintenance_due(root):
+        subprocess.run(cli + ["compact"],  # §6.1: compaction rides hook batches
+                       cwd=root, capture_output=True, timeout=10)
+        subprocess.run(cli + ["sync-journal"],  # §13: external journals ride too
+                       cwd=root, capture_output=True, timeout=10)
 
 
 if __name__ == "__main__":
