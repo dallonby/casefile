@@ -2369,3 +2369,422 @@ class PerfPathTests(unittest.TestCase):
             self.assertTrue(hook._maintenance_due(root, now=1000.0, interval=600))
             self.assertFalse(hook._maintenance_due(root, now=1300.0, interval=600))
             self.assertTrue(hook._maintenance_due(root, now=1700.0, interval=600))
+
+
+# ------------------------------------ session-start economy (boot / resume)
+
+def _section(text: str, header: str) -> str:
+    lines = text.splitlines()
+    if header not in lines:
+        return ""
+    body = []
+    for ln in lines[lines.index(header) + 1:]:
+        if ln.startswith("=== "):
+            break
+        body.append(ln)
+    return "\n".join(body)
+
+
+class BootBudgetTests(CliBase):
+    """The whole boot output is budgeted; sections keep their newest items."""
+
+    def seed(self, n_dec=40, n_con=20):
+        for i in range(n_con):
+            self.add("-t", "constraint", "-a", "user", "--force",
+                     f"constraint number {i}: keep the {i}th invariant intact "
+                     "across every deployment window")
+        for i in range(n_dec):
+            self.add("-t", "decision", "-a", "codex", "--rationale", f"reason {i}",
+                     "--force",
+                     "--reject", f"option {i}a: too slow for the {i}th run",
+                     "--reject", f"option {i}b: unproven against the {i}th control",
+                     f"decision number {i}: run the {i}th control leg before "
+                     "the candidate leg and keep the baseline flag off")
+
+    def boot(self, budget, author="claude"):
+        return self.cli("boot", "-a", author, "--skip-recheck", "--ok-exit",
+                        "--budget", str(budget), expect=0).out
+
+    def test_boot_total_output_within_budget(self):
+        self.seed()
+        for budget in (300, 1000, 3000):
+            out = self.boot(budget)
+            variable = sum(len(_section(out, h))
+                           for h in ("=== BRIEF ===", "=== SINCE ===", "=== DO NOT ==="))
+            # allocation plus one "… N more" line per section
+            self.assertLessEqual(variable, budget * 4 + 12 * 120, (budget, len(out)))
+            for label in BootTests.REQUIRED + ("=== SINCE ===",):
+                self.assertIn(label, out)
+
+    def test_boot_output_monotone_in_budget(self):
+        self.seed()
+        sizes = [len(self.boot(b)) for b in (200, 800, 2000, 6000)]
+        self.assertEqual(sizes, sorted(sizes), sizes)
+
+    def test_boot_sections_keep_newest_and_point_to_more(self):
+        self.seed(n_dec=30, n_con=30)
+        out = self.boot(600)
+        brief = _section(out, "=== BRIEF ===")
+        self.assertIn("constraint number 29", brief)
+        self.assertNotIn("constraint number 0:", brief)
+        self.assertIn("decision number 29", brief)
+        self.assertRegex(brief, r"… \d+ more")
+        do_not = _section(out, "=== DO NOT ===")
+        self.assertIn("option 29a", do_not)
+        self.assertLess(do_not.count("rejected alternative:"), 60)
+
+    def test_boot_do_not_counts_old_rejected_alternatives(self):
+        # a decision older than the recency window contributes a count only
+        old = (datetime.now(timezone.utc) - timedelta(days=40)).isoformat(timespec="seconds")
+        e = {"id": "01d0ec15", "ts": old, "case": "test-case", "type": "decision",
+             "author": "codex", "body": "ancient decision", "refs": [],
+             "rationale": "r", "rejected": [{"option": "ancient option",
+                                              "reason": "ancient reason"}]}
+        with (self.dir / ".casefile" / "log.jsonl").open("a") as f:
+            f.write(json.dumps(e) + "\n")
+        self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                 "--reject", "fresh option: fresh reason", "fresh decision")
+        do_not = _section(self.boot(2000), "=== DO NOT ===")
+        self.assertIn("fresh option", do_not)
+        self.assertNotIn("ancient option", do_not)
+        self.assertIn("+1 rejected alternative(s) on decisions older than", do_not)
+
+    def test_boot_since_delta_is_author_watermark(self):
+        self.add("-t", "note", "-a", "claude", "claude was here")
+        self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                 "codex decided the pool size")
+        self.add("-t", "observation", "-a", "system", "--source", "hook:post-bash",
+                 "$ make test: ok")
+        since = _section(self.boot(2000), "=== SINCE ===")
+        self.assertIn("since your last entry", since)
+        self.assertIn("1 substantive of 2 new entries", since)
+        self.assertIn("codex decided the pool size", since)
+        self.assertNotIn("make test", since)
+        since_codex = _section(self.boot(2000, author="codex"), "=== SINCE ===")
+        self.assertIn("0 substantive of 1 new", since_codex)
+        since_grok = _section(self.boot(2000, author="grok"), "=== SINCE ===")
+        self.assertIn("no prior entries by grok", since_grok)
+
+    def test_since_command_lists_delta_newest_first(self):
+        self.add("-t", "note", "-a", "claude", "watermark")
+        self.add("-t", "hypothesis", "-a", "codex", "first theory of the day")
+        self.add("-t", "hypothesis", "-a", "codex", "second theory of the day")
+        r = self.cli("since", "-a", "claude", expect=0)
+        lines = r.out.splitlines()
+        self.assertIn("2 substantive of 2 new entries", lines[0])
+        self.assertIn("second theory", lines[1])
+        self.assertIn("first theory", lines[2])
+        d = json.loads(self.cli("since", "-a", "claude", "--json", expect=0).out)
+        self.assertEqual(d["substantive"], 2)
+        self.assertEqual(d["entries"][0]["headline"], "second theory of the day")
+
+    def test_where_reports_substantive_count_and_author_liveness(self):
+        self.add("-t", "note", "-a", "codex", "peer was here")
+        self.add("-t", "observation", "-a", "system", "--source", "hook:post-bash",
+                 "$ make test: ok")
+        where = _section(self.boot(2000), "=== WHERE ===")
+        self.assertIn("(1 substantive", where)
+        self.assertIn("authors last filed: codex", where)
+
+
+class ResumeBudgetTests(CliBase):
+    def test_resume_evicts_within_section_not_whole_section(self):
+        for i in range(5):
+            self.add("-t", "constraint", "-a", "user", f"constraint number {i} holds")
+        for i in range(20):
+            self.add("-t", "decision", "-a", "codex", "--rationale", f"why {i}",
+                     "--force",
+                     f"decision number {i} about the {i}th knob of the system")
+        out = self.cli("resume-context", "--budget", "220", expect=0).out
+        self.assertIn("CONSTRAINTS", out)
+        self.assertIn("constraint number 4", out)      # newest survives
+        self.assertIn("DECISIONS", out)
+        self.assertIn("decision number 19", out)
+        self.assertNotIn("decision number 0 ", out)
+        self.assertRegex(out, r"… \d+ more")
+        self.assertIn("evicted", out)
+
+    def test_resume_lines_carry_ids(self):
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "why",
+                     "first line is the headline\nsecond line is detail")
+        out = self.cli("resume-context", expect=0).out
+        self.assertIn(f"`{d}` first line is the headline", out)
+        self.assertNotIn("second line is detail", out)
+
+    def test_resume_recent_observations_prefer_substantive(self):
+        self.add("-t", "observation", "-a", "codex", "--source", "manual",
+                 "the pool metric spiked at noon")
+        for i in range(10):
+            self.add("-t", "observation", "-a", "system", "--source", "recheck:abcd1234",
+                     "[PASS] hypothesis abcd1234: true")
+        out = self.cli("resume-context", "--observations", "2", expect=0).out
+        self.assertIn("pool metric spiked", out)
+        self.assertNotIn("[PASS] hypothesis", out)
+
+
+class AbstractRecencyTests(CliBase):
+    def test_leading_theory_is_newest_at_best_grade(self):
+        es = [E("h1", "hypothesis", body="old theory"),
+              E("h2", "hypothesis", body="new theory")]
+        meta = {"cases": {"c": {"title": "t"}}}
+        self.assertIn("new theory", cf.synthesize_abstract(es, meta, "c").splitlines()[1])
+
+    def test_abstract_lists_newest_constraints_and_decisions(self):
+        es = [E(f"c{i}", "constraint", author="user", body=f"constraint {i}")
+              for i in range(8)] + [E(f"d{i}", "decision", body=f"decision {i}",
+                                      rationale="r") for i in range(8)]
+        meta = {"cases": {"c": {"title": "t"}}}
+        body = cf.synthesize_abstract(es, meta, "c")
+        self.assertIn("constraint 7", body)
+        self.assertNotIn("constraint 0", body)
+        self.assertIn("decision 7", body)
+        self.assertNotIn("decision 0", body)
+
+    def test_checkpoint_noop_when_unchanged(self):
+        self.add("-t", "hypothesis", "-a", "claude", "steady theory")
+        self.cli("checkpoint", "-a", "claude", expect=0)
+        n = len([e for e in self.log_entries() if e.get("kind") == "abstract"])
+        r = self.cli("checkpoint", "-a", "claude", expect=0)
+        self.assertIn("abstract unchanged", r.out)
+        self.assertEqual(
+            n, len([e for e in self.log_entries() if e.get("kind") == "abstract"]))
+        self.add("-t", "hypothesis", "-a", "claude", "a newer theory emerges")
+        r = self.cli("checkpoint", "-a", "claude", expect=0)
+        self.assertIn("checkpoint abstract", r.out)
+
+    def test_freshness_counts_only_substantive_entries(self):
+        es = [E("a1", "digest", kind="abstract", body="abstract")] + [
+            E(f"o{i}", "observation", author="system", body="[PASS] x",
+              source="recheck:h1") for i in range(40)]
+        self.assertFalse(cf.abstract_freshness(es, "c")["stale"])
+        es += [E(f"n{i}", "note", body=f"real note {i}") for i in range(25)]
+        self.assertTrue(cf.abstract_freshness(es, "c")["stale"])
+
+    def test_boot_not_stale_after_noise_only(self):
+        self.add("-t", "hypothesis", "-a", "claude", "theory A")
+        self.cli("checkpoint", "-a", "claude", expect=0)
+        for i in range(30):
+            self.add("-t", "observation", "-a", "system", "--source", "hook:post-bash",
+                     f"$ make test {i}: ok")
+        self.cli("boot", "-a", "claude", "--skip-recheck", expect=0)
+
+    def test_recall_returns_live_abstract_once(self):
+        for i in range(3):
+            self.cli("checkpoint", "-a", "claude",
+                     f"Encoding sniffer abstract revision {i}", expect=0)
+        r = self.cli("recall", "sniffer", expect=0)
+        self.assertEqual(r.out.count("`test-case`"), 1, r.out)
+        self.assertIn("revision 2", r.out)
+        (self.dir / ".casefile" / "index.db").unlink()
+        r = self.cli("recall", "sniffer", expect=0)  # scan fallback agrees
+        self.assertEqual(r.out.count("`test-case`"), 1, r.out)
+
+    def test_dig_collapses_abstract_lineage_to_live_one(self):
+        for i in range(4):
+            self.cli("checkpoint", "-a", "claude",
+                     f"Encoding sniffer abstract revision {i}", expect=0)
+        r = self.cli("dig", "sniffer", expect=0)
+        hits = [ln for ln in r.out.splitlines() if ln and not ln.startswith(" ")
+                and "digest" in ln.split()[1:2]]
+        self.assertEqual(len(hits), 1, r.out)
+        self.assertIn("revision 3", hits[0])
+        self.assertNotIn("[superseded]", hits[0])
+        self.assertIn("3 [superseded]", r.out)
+
+
+# ------------------------------------------------ write-time hygiene (add)
+
+class AddHygieneTests(CliBase):
+    BODY = ("keep the widget frobnicator disabled until the flux capacitor "
+            "has been recalibrated against the reference clock")
+    NEAR = ("keep the widget frobnicator disabled until the flux capacitor "
+            "is recalibrated against the reference clock")
+
+    def test_add_refuses_near_duplicate_and_points_to_id(self):
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "r", self.BODY)
+        r = self.cli("add", "-t", "decision", "-a", "codex", "--rationale", "r",
+                     self.NEAR)
+        self.assertEqual(r.rc, cf.EXIT_DUPLICATE, r.err)
+        self.assertIn(f"near-duplicate of `{d}`", r.err)
+        for hint in (f"--ref {d}", f"--supersede {d}", "--force"):
+            self.assertIn(hint, r.err)
+        self.assertEqual(len([e for e in self.log_entries()
+                              if e["type"] == "decision"]), 1)
+
+    def test_duplicate_allowed_with_ref_or_force(self):
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "r", self.BODY)
+        cited = self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                         "--ref", d, self.NEAR)
+        self.assertEqual(next(e for e in self.log_entries() if e["id"] == cited)
+                         ["refs"], [d])
+        self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                 "--force", self.NEAR)
+
+    def test_duplicate_across_author_class_and_type_is_allowed(self):
+        self.add("-t", "decision", "-a", "codex", "--rationale", "r", self.BODY)
+        self.add("-t", "decision", "-a", "user", self.BODY)      # user restates
+        self.add("-t", "constraint", "-a", "codex", self.BODY)   # different type
+
+    def test_similar_below_threshold_is_noted_not_blocked(self):
+        self.add("-t", "hypothesis", "-a", "codex",
+                 "the flux capacitor undervolts under sustained load at night")
+        r = self.cli("add", "-t", "hypothesis", "-a", "codex",
+                     "the flux capacitor overheats under sustained load at night "
+                     "sometimes when hot", expect=0)
+        self.assertIn("similar to", r.err)
+
+    def test_short_bodies_are_never_judged(self):
+        self.add("-t", "hypothesis", "-a", "claude", "theory X")
+        r = self.cli("add", "-t", "hypothesis", "-a", "claude", "theory Y", expect=0)
+        self.assertNotIn("similar", r.err)
+
+    def test_dedupe_survives_stale_index(self):
+        self.add("-t", "decision", "-a", "codex", "--rationale", "r", self.BODY)
+        (self.dir / ".casefile" / "index.db").unlink()
+        r = self.cli("add", "-t", "decision", "-a", "codex", "--rationale", "r",
+                     self.NEAR)
+        self.assertEqual(r.rc, cf.EXIT_DUPLICATE)
+
+    def test_body_similarity_masks_digits(self):
+        self.assertEqual(cf.body_similarity("run 42 legs for 10 min",
+                                            "run 43 legs for 12 min"), 1.0)
+        self.assertLess(cf.body_similarity("alpha beta gamma", "delta"), 0.01)
+
+    def test_add_harvests_body_ids_into_refs(self):
+        a = self.add("-t", "hypothesis", "-a", "claude", "pool exhaustion theory")
+        b = self.add("-t", "observation", "-a", "claude", "--source", "manual",
+                     "pool metric flat")
+        r = self.cli("add", "-t", "decision", "-a", "claude", "--rationale", "r",
+                     "--json", f"drop {a} because `{b}` shows the metric flat", expect=0)
+        receipt = json.loads(r.out)
+        self.assertEqual(receipt["refs"], [a, b])
+        self.assertEqual(r.err, "")
+
+    def test_add_warns_on_phantom_and_foreign_ids(self):
+        self.add("-t", "note", "-a", "claude", "anchor in first case")
+        self.cli("open", "Other case", expect=0)
+        other = self.add("-t", "note", "-a", "claude", "anchor in other case")
+        self.cli("open", "Test case", expect=0)
+        r = self.cli("add", "-t", "note", "-a", "claude",
+                     f"see deadbe12 and {other} and 20260903 for context", expect=0)
+        self.assertIn("unknown id deadbe12", r.err)
+        self.assertIn(f"cites {other} from case other-case", r.err)
+        self.assertNotIn("20260903", r.err)
+        e = next(x for x in self.log_entries() if x["id"] == r.out)
+        self.assertEqual(e["refs"], [])
+
+    def test_cited_ids_need_a_letter_and_a_digit(self):
+        self.assertEqual(cf.cited_ids("ids 0776174a, deadbeef, 12345678, x0776174ab"),
+                         ["0776174a"])
+
+    def test_system_author_skips_hygiene(self):
+        r = self.cli("add", "-t", "observation", "-a", "system", "--source",
+                     "hook:post-bash", "$ git log: commit a1b2c3d4 then a1b2c3d4",
+                     expect=0)
+        self.assertEqual(r.err, "")
+
+
+class QuietSweepTests(CliBase):
+    def setUp(self):
+        super().setUp()
+        self.cli("hooks", "install", "claude-code", expect=0)
+
+    def stop(self):
+        p = subprocess.run(
+            [sys.executable, str(self.dir / ".casefile" / "hooks" / "sweep.py")],
+            cwd=self.dir, capture_output=True, text=True,
+            input=json.dumps({"session_id": "s1", "stop_hook_active": False}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout.strip()
+
+    def test_nothing_unrecorded_writes_stamp_not_note(self):
+        before = len(self.log_entries())
+        r = self.cli("add", "-t", "note", "-a", "claude",
+                     "Secretary sweep: nothing unrecorded; drill fine", expect=0)
+        self.assertIn("sweep stamped", r.out)
+        self.assertEqual(len(self.log_entries()), before)
+        stamp = json.loads(
+            (self.dir / ".casefile" / "state" / "sweep-stamp.json").read_text())
+        self.assertEqual(stamp["author"], "claude")
+        self.assertIn("nothing unrecorded", stamp["body"])
+        r = self.cli("add", "-t", "note", "-a", "claude", "--json",
+                     "secretary sweep: nothing unrecorded", expect=0)
+        self.assertIsNone(json.loads(r.out)["id"])
+
+    def test_sweep_that_filed_gaps_remains_a_note(self):
+        d = self.add("-t", "note", "-a", "claude",
+                     "secretary sweep: gaps filed — one decision, one constraint")
+        self.assertEqual(len(d), 8)
+        self.assertTrue(cf.is_sweep_marker(self.log_entries()[-1]))
+
+    def test_stop_hook_honours_stamp(self):
+        self.assertIn("block", self.stop())            # never swept
+        self.cli("add", "-t", "note", "-a", "claude",
+                 "secretary sweep: nothing unrecorded", expect=0)
+        self.assertEqual(self.stop(), "")               # stamp covers the tail
+        self.add("-t", "decision", "-a", "user", "ship it on Friday")
+        self.assertIn("block", self.stop())            # something to sweep
+        self.cli("add", "-t", "note", "-a", "claude",
+                 "secretary sweep: nothing unrecorded", expect=0)
+        self.assertEqual(self.stop(), "")               # stamped again
+
+    def test_unswept_lint_honours_stamp(self):
+        es = [E("n1", "note", ts=ago(hours=6)), E("n2", "note", ts=ago(hours=5))]
+        self.assertEqual(cf.unswept_blocks(es, now=NOW), [])   # convention unused
+        stamp = {"after_id": "n1", "ts_parsed": NOW - timedelta(hours=6)}
+        blocks = cf.unswept_blocks(es, now=NOW, stamp=stamp)
+        self.assertEqual([b[2] for b in blocks], [1])            # n2 unswept
+        stamp = {"after_id": "n2", "ts_parsed": NOW - timedelta(hours=5)}
+        self.assertEqual(cf.unswept_blocks(es, now=NOW, stamp=stamp), [])
+        stamp = {"after_id": "gone", "ts_parsed": NOW - timedelta(hours=5)}
+        self.assertEqual(cf.unswept_blocks(es, now=NOW, stamp=stamp), [])  # by time
+        self.assertTrue(any(p.startswith("UNSWEPT") for p in cf.lint_problems(
+            es, now=NOW, sweep_stamp={"after_id": "n1",
+                                      "ts_parsed": NOW - timedelta(hours=6)})))
+
+    def test_sweep_markers_rank_as_noise_in_dig(self):
+        marker = E("m1", "note", body="secretary sweep: filed the capacitor decision")
+        dec = E("d1", "decision", body="capacitor decision: keep it cold")
+        self.assertTrue(cf._is_hook_noise(marker))
+        self.assertFalse(cf.substantive(marker))
+        self.assertEqual(cf.rank_matches([marker, dec], "capacitor")[0]["id"], "d1")
+
+
+class CompactNoiseTests(CliBase):
+    def _rows(self, source, bodies):
+        return [self.add("-t", "observation", "-a", "system", "--source", source, b)
+                for b in bodies]
+
+    def test_recheck_series_keeps_first_last_and_transitions(self):
+        ids = self._rows("recheck:abcd1234",
+                         ["[PASS] hypothesis abcd1234: true"] * 4
+                         + ["[FAIL] hypothesis abcd1234: true\nboom"] * 3)
+        r = self.cli("compact", expect=0)
+        self.assertIn("compacted 3", r.out)
+        sup = cf.superseded_ids(self.log_entries())
+        self.assertEqual(sup, {ids[1], ids[2], ids[5]})
+        self.assertNotIn(ids[3], sup)   # last PASS before the transition
+        self.assertNotIn(ids[4], sup)   # first FAIL: the transition
+
+    def test_journal_rows_collapse_per_day_keeping_first_and_last(self):
+        ids = self._rows("journal:ops.md",
+                         [f"2026-09-01T0{i}:00:00Z BEGIN step {i} of the deploy"
+                          for i in range(5)])
+        r = self.cli("compact", expect=0)
+        self.assertIn("compacted 3", r.out)
+        self.assertEqual(cf.superseded_ids(self.log_entries()), set(ids[1:4]))
+        self.assertIn("journal:ops.md", r.out)
+
+    def test_model_filed_rows_are_never_compacted(self):
+        for i in range(4):
+            self.add("-t", "observation", "-a", "codex", "--source", "hook:post-bash",
+                     "same line every time")
+        self.assertIn("nothing to compact", self.cli("compact", expect=0).out)
+
+    def test_plan_chunks_large_groups(self):
+        es = [E(f"o{i:05d}", "observation", author="system",
+                body="[PASS] constraint c1: true", source="recheck:c1")
+              for i in range(1203)]
+        plan = cf.compaction_plan(es)
+        self.assertEqual(sum(len(ids) for _, ids, _ in plan), 1201)
+        self.assertEqual(max(len(ids) for _, ids, _ in plan), cf.COMPACT_DIGEST_MAX_IDS)

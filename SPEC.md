@@ -218,6 +218,26 @@ Rules enforced at append time:
 - refs must exist and belong to the same case (digests exempted for
   cross-case abstracts only).
 
+Write-time hygiene in `add` (the cheapest moment to fix a filing, while
+the context is still in hand):
+- **Near-duplicate refusal.** A hypothesis/decision/constraint/question/note
+  whose digit-masked token set overlaps a recent (30 d) live entry of the
+  same case, type and author class (user vs model) at Jaccard ≥ 0.7 is
+  refused with exit **3**, naming the earlier id: cite it (`--ref`),
+  replace it (`--supersede`), or file anyway (`--force`). Lower overlap
+  (≥ 0.5) is mentioned on stderr, never blocked. Observations, system
+  rows, packets and sweep markers are exempt. Candidates come from the
+  history FTS index; a stale index falls back to a bounded scan, never a
+  rebuild on the write path.
+- **Ref harvesting.** 8-hex tokens cited in the body (at least one digit
+  and one letter) that resolve to entries of the same case are appended to
+  `refs`, so prose citations become graph edges lint can see. Tokens that
+  resolve nowhere, or to another case, produce a warning (exit 0) — the
+  entry is still filed, the phantom id is caught at the source.
+- **Quiet sweep markers.** A sweep note whose body says
+  `secretary sweep: nothing …` is recorded as a state stamp
+  (`.casefile/state/sweep-stamp.json`), not a log entry (§13).
+
 ### 5.4 Epistemic grades (computed per P3)
 
 For a `hypothesis`, first match wins:
@@ -259,7 +279,9 @@ expand them.
 
 ### 6.1 Mechanical compaction (no model judgment)
 
-Runs on hook batches or pre-commit. Targets hook-sourced observations only:
+Runs on hook batches or pre-commit. Targets system-authored machine rows
+only — `hook:*`, `recheck:*` and `journal:*` observations; nothing a
+person or model filed is ever collapsed:
 
 - keep the latest observation per `source`;
 - keep every **transition** (pass→fail, fail→pass, new error signature —
@@ -270,7 +292,9 @@ Runs on hook batches or pre-commit. Targets hook-sourced observations only:
   adjacency — interactive sessions interleave commands, so the same check
   rarely lands back-to-back. The first and latest of each group survive;
   transitions survive because a changed outcome or signature is by
-  definition a different group.
+  definition a different group. Journal lines are free text, so their
+  signature is the UTC day (first and last line of each day survive). A
+  mechanical digest supersedes at most 500 ids so its line stays parseable.
 
 Never touches anything protected by the evidence-chain invariant (§5.3).
 
@@ -310,6 +334,16 @@ abstract is what the recall index consumes and what dormancy files. There is
 deliberately **no separate closing ceremony**: whenever a case goes quiet,
 the last abstract simply is the record.
 
+The mechanical default (`checkpoint` without a body, `synthesize_abstract`)
+prefers recency: the leading theory is the *newest* hypothesis at the best
+grade, and the ruled-out / constraint / key-decision lists are the newest
+items, rendered as headlines with ids. `checkpoint` never files an abstract
+byte-identical to the live one — it reports "abstract unchanged" and exits
+0, so a store never accumulates copies. Freshness (`ABSTRACT_STALE_ENTRIES`,
+boot exit 30) counts only substantive entries — not `system` rows, hook /
+recheck / journal observations, or sweep markers — so machine noise cannot
+make an abstract stale by itself.
+
 ## 7. Lint (drift detection)
 
 `casefile lint` exits 1 on findings; the concierge surfaces findings
@@ -332,7 +366,8 @@ conversationally (§11.4) — lint is a smoke alarm, not a report.
   or a remote source class lacks retrieval provenance.
 - **STALE-JUDGMENT**: a judgment references a constraint/decision that has
   since been replaced or revoked.
-- **UNSWEPT**: a session ended without a secretary sweep entry (requires
+- **UNSWEPT**: a session ended without a secretary sweep — neither a sweep
+  marker note nor the quiet-sweep stamp covers its entries (requires
   hooks; see §13).
 
 ## 8. Recheck recipes
@@ -394,9 +429,13 @@ system laundering its own conclusion.
   A digest refreshes compost only (a 10^5-entry history rewrite on every
   abstract would make checkpoints unusable). If history row-count drifts
   from the log, `dig` rebuilds then queries; if FTS5 is missing it scans.
-- `casefile recall "<query>"` — "have we seen this before?" (compost only).
-  Operational how-to ("how did we disable X last week") is `dig`, which
-  must not be a linear JSONL substring scan on the hot path.
+- `casefile recall "<query>"` — "have we seen this before?" (compost only:
+  the *live* abstract per case plus judgment digests; superseded abstracts
+  are `dig` history, not recall hits). Operational how-to ("how did we
+  disable X last week") is `dig`, which must not be a linear JSONL
+  substring scan on the hot path. `dig` shows one hit per abstract lineage
+  (the live one, with a `+N similar, N [superseded]` count) so a case's
+  abstract history cannot crowd out its other memory.
 - JSONL text search is not an acceptable lookup engine for later model
   sessions. The SQL cache covers raw history, not only abstracts.
 - **Open-time auto-search**: when a new case is created, `open` itself
@@ -433,18 +472,39 @@ the verb models already try after seeing an id — it must not argparse-fail.
 Do not teach `log | rg` or a sidecar chat transcript as the retrieval path.
 
 Conventions: mutating commands print the new entry id on stdout, exit 0;
-all errors to stderr, exit ≠0. `add`/`digest` accept `--body-stdin`, JSON
-receipts, and repeatable singular `--ref`/`--reject`/`--supersede` flags so
-models do not lose positional bodies to variadic parsing. Exit codes are API.
+all errors to stderr, exit ≠0 (`add` exits **3** for a near-duplicate
+refusal, §5.3). `add`/`digest` accept `--body-stdin`, JSON receipts, and
+repeatable singular `--ref`/`--reject`/`--supersede` flags so models do not
+lose positional bodies to variadic parsing. Exit codes are API.
 
 `resume-context` composition, in fixed priority order with a token budget
-(config, default 2000): constraints → open disputes → decisions (with
-rationale + rejected alternatives) → ruled-out list → live differential
-(grades in words) → open questions/mailbox → last-N observations. Eviction
-pressure applies only from the bottom. Opens with the P6 sentence. `--blind`
-omits the differential and ruled-out list — used for independent
-replication when the recorded differential itself may be the problem
-(fresh model forms its own theory; diff against the record).
+(config, default 2000): abstract → constraints → open disputes → decisions
+(with rationale + rejected alternatives) → ruled-out list → live
+differential (grades in words) → open questions/mailbox → last-N
+observations. **Every section is budgeted, none is evicted whole**: each
+section is guaranteed a share of the budget, unused share flows to the
+next section in priority order, and within a section items are kept
+newest first until the share is spent, followed by an "… N more" line.
+Entries render as one headline line each (first line of the body, capped)
+with the id kept, so `show <id>` reaches the full body; observations stay
+fenced. Opens with the P6 sentence. `--blind` omits the differential and
+ruled-out list — used for independent replication when the recorded
+differential itself may be the problem (fresh model forms its own theory;
+diff against the record).
+
+`boot` applies the same budget to BRIEF + SINCE + DO NOT together (the
+structural WHERE / YOU ARE / WORLD vs LOG / NEXT / CARD sections are short
+and unbudgeted), so the default briefing stays a few thousand tokens on a
+store of any size. BRIEF holds the abstract, then constraints, recent
+decisions, differential, questions, disputes and mailbox — each newest
+first. SINCE is the "since your last session" delta: substantive entries
+filed after this author's last entry in the case, derived from the log so
+it is correct across hosts (the per-session pulse cursor is seeded at the
+log tip when a session starts, so it cannot answer this). DO NOT lists
+refuted hypotheses and the rejected alternatives of decisions filed in the
+last 14 days; older ones are counted, not printed. WHERE reports the
+substantive entry count and when each author last filed. `casefile since
+[-a author] [--limit N] [--json]` prints the same delta standalone.
 
 ### 11.2 Porcelain (human-facing; conversational)
 
@@ -608,14 +668,19 @@ reply`, `interject(handle, msg)` (mid-request if supported), `cost(handle)`,
   diff its conversation against the log — "anything decided, constrained,
   or ruled out here that isn't recorded?" — and file the gaps. Closes the
   biggest leak: the decision made conversationally in window 4 that nobody
-  wrote down. The sweep files a `note` marker; lint's UNSWEPT rule keys off
-  it. The hook only prompts when the log tail shows something to sweep
-  since the last marker — a non-system decision/constraint/hypothesis/
-  question/verification, twenty non-system observations, or any
-  non-system entry once the marker is over thirty minutes old (constants
-  at the top of the installed `sweep.py`); a quiet turn ends silently,
-  with no marker required. Automatic `system`/`hook:*` entries never
-  trigger a sweep on their own.
+  wrote down. A sweep that filed gaps ends with a `note` marker
+  (`secretary sweep: <gaps filed>`); a sweep that found nothing says
+  `secretary sweep: nothing unrecorded`, which `add` records as the
+  quiet-sweep stamp (`.casefile/state/sweep-stamp.json`: time, author and
+  the id it was filed after) instead of a log entry — so the log holds
+  memory, not hundreds of identical "nothing" notes. Lint's UNSWEPT rule
+  and the hook key off the newer of marker and stamp. The hook only
+  prompts when the log tail shows something to sweep since the last
+  sweep — a non-system decision/constraint/hypothesis/question/verification,
+  twenty non-system observations, or any non-system entry once the sweep
+  is over thirty minutes old (constants at the top of the installed
+  `sweep.py`); a quiet turn ends silently, with no marker required.
+  Automatic `system`/`hook:*` entries never trigger a sweep on their own.
 - **The skill file** (`SKILL.md` dropped where Claude Code discovers it),
   teaching every session in the repo: read resume-context (and run
   `recheck`) on start; address the mailbox; file hypotheses/decisions as it

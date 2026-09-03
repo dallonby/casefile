@@ -151,10 +151,23 @@ author: claude (from env)
 rolling abstract:
 PROBLEM: payment-service — find the cause
 STATUS: leading theory is connection-pool exhaustion (verified against ground truth)
+constraints (newest first):
+- `2f9c1e4a` (the user decided) do not restart the load balancer mid-flight
+...
+=== SINCE ===
+since your last entry `a1b2c3d4` (2026-08-30T09:12:00+00:00, 2 d ago): 3 substantive of 41 new entries
+- `e5f6a7b8` decision (codex) switch the pool to lazy reconnect
 ...
 === NEXT ===
 1. casefile packet --to codex -a claude
 ```
+
+The whole briefing is budgeted (`--budget`, default ~2000 tokens): every
+section keeps its newest items as one headline line per entry with the id
+and prints "… N more" instead of vanishing, so a 20,000-entry store boots
+in a few thousand tokens and `casefile show <id>` reaches any full body.
+SINCE is derived from the log (entries after your own last one), so it is
+right across machines.
 
 ## How it works
 
@@ -180,14 +193,19 @@ tamper-evident by construction.
 - **`casefile boot`** — single cold-start ritual for any model: store
   discovery (`CASEFILE_ROOT` / walk-up / `.casefile-pointer`), author
   identity (`CASEFILE_AUTHOR`), startup recheck, and a structured brief
-  (WHERE / YOU ARE / WORLD vs LOG / BRIEF / DO NOT / NEXT / CARD). Exit
-  codes for orchestrators: 0 ok, 10 mailbox, 20 drift, 30 abstract stale.
+  (WHERE / YOU ARE / WORLD vs LOG / BRIEF / SINCE / DO NOT / NEXT / CARD),
+  budgeted as a whole and newest-first in every section. Exit codes for
+  orchestrators: 0 ok, 10 mailbox, 20 drift, 30 abstract stale.
+  `casefile since` prints the SINCE delta on its own.
 - **`casefile packet` / `inbox` / `next`** — log-only multi-agent handoff.
   One author emits a peer packet; the peer lists inbox items and concrete
   next CLI actions without a shared chat transcript.
 - **`casefile checkpoint`** — refresh the rolling abstract and rebuild the
   FTS compost index so `recall` works after context resets.
 - **`casefile resume-context`** — compact briefing (also embedded in boot).
+  Sections are budgeted individually and keep their newest items; nothing
+  is evicted whole, so a fresh agent always sees the latest constraints,
+  decisions and open questions.
 - **`casefile recheck`** — re-runs every recorded check recipe and reports
   *drift*: which claims still hold versus held-three-days-ago. Timeouts
   record `UNKNOWN`, never false failure. `--startup` keeps session start
@@ -199,8 +217,11 @@ tamper-evident by construction.
 - **Hooks** — a Stop-hook "secretary sweep" diffs each AI session against
   the log and files what the conversation decided but never recorded (it
   only asks when something worth sweeping was filed since the last sweep;
-  quiet turns end silently); a one-line liveness pulse shows what changed
-  since you last looked.
+  quiet turns end silently, and a "nothing unrecorded" sweep is recorded as
+  a state stamp rather than a log entry); a one-line liveness pulse shows
+  what changed since you last looked. Mechanical compaction collapses
+  steady-state hook, recheck and journal rows into digests (`dig` still
+  expands them); nothing a person or model filed is ever touched.
 - **`casefile spitball`** — a two-model deliberation driver (proposer vs
   critic) that ferries turns between live CLIs (**Claude Code, Codex, Grok**);
   both models file claims and disputes into the same log, and convergence is
@@ -267,6 +288,14 @@ casefile add -t observation -a codex "measured inclusion latency" \
   --source benchmark --source-type test --locator "run 184 / p99" \
   --accessed-at 2026-07-26T12:00:00Z --expires-at 2026-08-02T12:00:00Z
 ```
+
+`add` also does its hygiene at write time, while the context is still in
+hand: a hypothesis/decision/constraint/question that near-duplicates a
+recent entry of the same type by the same author class is refused (exit 3)
+with the earlier id — cite it with `--ref`, replace it with `--supersede`,
+or file anyway with `--force`; and 8-hex ids cited in the body are
+harvested into `refs` automatically, with a warning for ids that do not
+exist (the entry is still filed).
 
 Singular `--ref`, `--reject`, and `--supersede` flags are repeatable and avoid
 the positional swallowing ambiguity of their legacy variadic counterparts.

@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
@@ -48,6 +48,15 @@ EXIT_MAILBOX = 10
 EXIT_DRIFT = 20
 EXIT_ABSTRACT_STALE = 30
 EXIT_IDENTITY = 40  # CASEFILE_AUTHOR unset — agent must claim an identity
+EXIT_DUPLICATE = 3  # `add` refused a near-duplicate (cite/supersede/--force)
+
+# Write-time near-duplicate guard (`add`): same case, type and author class,
+# filed within DUPLICATE_WINDOW_D days, token-Jaccard >= DUPLICATE_THRESHOLD.
+DEDUPE_TYPES = ("hypothesis", "decision", "constraint", "question")
+DUPLICATE_THRESHOLD = 0.7
+DUPLICATE_NOTICE = 0.5  # below the refusal line: mention, do not block
+DUPLICATE_WINDOW_D = 30
+DUPLICATE_MIN_TOKENS = 6  # shorter bodies ('theory X') are never judged
 
 # Rolling abstract is stale when this many entries land after it with no refresh.
 ABSTRACT_STALE_ENTRIES = 25
@@ -58,10 +67,26 @@ BOOT_SECTIONS = (
     "YOU ARE",
     "WORLD vs LOG",
     "BRIEF",
+    "SINCE",
     "DO NOT",
     "NEXT",
     "CARD",
 )
+
+# Budget shares for the variable sections of boot / resume-context. Every
+# section keeps its newest items; nothing is evicted whole (SPEC §11.1).
+BOOT_SHARES = (
+    ("abstract", 0.30), ("constraints", 0.16), ("decisions", 0.12),
+    ("differential", 0.10), ("since", 0.12), ("questions", 0.06),
+    ("disputes", 0.03), ("mailbox", 0.03), ("do_not", 0.08),
+)
+RESUME_SHARES = (
+    ("abstract", 0.20), ("judgments", 0.06), ("candidates", 0.04),
+    ("constraints", 0.16), ("disputes", 0.06), ("decisions", 0.14),
+    ("ruled_out", 0.08), ("differential", 0.10), ("questions", 0.08),
+    ("observations", 0.08),
+)
+RECENT_DAYS = 14  # DO NOT lists rejected alternatives of decisions this recent
 
 AUTHOR_ALIASES = {
     "gpt": "codex",
@@ -966,6 +991,51 @@ def new_id(existing: set[str], body: str) -> str:
 
 # --------------------------------------------------------------- derivation
 
+# Machine-filed rows: automatic hook/recheck/journal observations and the
+# secretary-sweep markers. They stay in the log and in `dig`, but they are
+# not what a person or model deliberately filed, so freshness, deltas and
+# duplicate checks count only the substantive remainder.
+NOISE_SOURCES = ("hook:", "recheck:", "journal:")
+SWEEP_MARKER_PREFIX = "secretary sweep"
+SWEEP_STAMP = "sweep-stamp.json"  # under .casefile/state/: last quiet sweep
+
+
+def is_sweep_marker(e: dict) -> bool:
+    return (e.get("type") == "note"
+            and str(e.get("body") or "").lower().startswith(SWEEP_MARKER_PREFIX))
+
+
+def is_quiet_sweep(body: str) -> bool:
+    """A sweep marker that filed nothing ('secretary sweep: nothing
+    unrecorded…'). Such a sweep is a state stamp, not memory."""
+    low = body.strip().lower()
+    if not low.startswith(SWEEP_MARKER_PREFIX):
+        return False
+    rest = low[len(SWEEP_MARKER_PREFIX):].lstrip(" :—-\t")
+    return rest.startswith("nothing")
+
+
+def substantive(e: dict) -> bool:
+    """Not system-authored, not a hook/recheck/journal row, not a sweep marker."""
+    if e.get("author") == "system":
+        return False
+    if str(e.get("source") or "").startswith(NOISE_SOURCES):
+        return False
+    return not is_sweep_marker(e)
+
+
+def headline(body: str, width: int = 160) -> str:
+    """First line of a body, whitespace-collapsed and capped."""
+    first = ""
+    for ln in (body or "").splitlines():
+        if ln.strip():
+            first = " ".join(ln.split())
+            break
+    if len(first) > width:
+        first = first[:width - 1].rstrip() + "…"
+    return first
+
+
 def superseded_ids(entries: list[dict]) -> set[str]:
     s: set[str] = set()
     for e in entries:
@@ -1562,6 +1632,114 @@ def _migrate_legacy_active(root: Path, meta: dict):
         save_meta(root, meta)
 
 
+def _body_tokens(body: str) -> set[str]:
+    """Digit-masked lower-case word set (the obs_signature idea, whole body)."""
+    return {t for t in re.findall(r"[a-z#]+", re.sub(r"\d+", "#", body.lower()))
+            if len(t) >= 2}
+
+
+def body_similarity(a: str, b: str) -> float:
+    ta, tb = _body_tokens(a), _body_tokens(b)
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
+
+
+def _author_class(author: str) -> str:
+    return "user" if normalize_author(author) == "user" else "model"
+
+
+def _dup_candidates_fts(root: Path, case: str, type_: str, body: str):
+    """Same-case, same-type history rows that share terms with `body`, via
+    the FTS index (SPEC §10). None when the index is absent or stale — the
+    guard then falls back to a bounded scan of recent entries rather than
+    paying for a rebuild on the write path."""
+    import sqlite3
+    p = index_path(root)
+    terms = _query_terms(body)
+    if not p.exists() or not terms:
+        return None
+    # the rarest-looking terms carry the match; cap the OR to keep it cheap
+    terms = sorted(set(terms), key=lambda t: (-len(t), t))[:24]
+    fts = " OR ".join(f'"{t}"' for t in terms)
+    db = sqlite3.connect(p)
+    try:
+        n_hist = db.execute("SELECT count(*) FROM history").fetchone()[0]
+        if n_hist != _log_line_count(root):
+            return None
+        rows = db.execute(
+            _HISTORY_SELECT + " WHERE history MATCH ? AND case_id = ? "
+            "AND etype = ? ORDER BY bm25(history) LIMIT 40",
+            (fts, case, type_)).fetchall()
+        return _history_rows_to_entries(rows)
+    except sqlite3.OperationalError:
+        return None
+    finally:
+        db.close()
+
+
+def near_duplicate(root: Path, entries: list[dict], case: str, type_: str,
+                   author: str, body: str) -> tuple[dict, float] | None:
+    """Best (entry, similarity) among recent live same-type entries by the
+    same author class, or None when nothing is even similar."""
+    if len(_body_tokens(body)) < DUPLICATE_MIN_TOKENS:
+        return None
+    cands = _dup_candidates_fts(root, case, type_, body)
+    if cands is None:
+        cands = [e for e in entries if e["case"] == case and e["type"] == type_][-200:]
+    by_id = {e["id"]: e for e in entries}
+    hidden = superseded_ids(entries)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DUPLICATE_WINDOW_D)
+    cls = _author_class(author)
+    best: tuple[dict, float] | None = None
+    for c in cands:
+        e = by_id.get(c["id"], c)
+        if e["id"] in hidden or not substantive(e) or e.get("to"):
+            continue
+        if _author_class(e.get("author", "")) != cls:
+            continue
+        try:
+            if parse_ts(e["ts"]) < cutoff:
+                continue
+        except (ValueError, KeyError):
+            continue
+        s = body_similarity(body, e.get("body") or "")
+        if s >= DUPLICATE_NOTICE and (best is None or s > best[1]):
+            best = (e, s)
+    return best
+
+
+ID_TOKEN = re.compile(r"(?<![0-9a-zA-Z])([0-9a-f]{8})(?![0-9a-zA-Z])")
+
+
+def cited_ids(body: str) -> list[str]:
+    """8-hex tokens in prose that look like entry ids (at least one digit and
+    one letter — dates and plain words are not ids). Ordered, deduped."""
+    out = []
+    for tok in ID_TOKEN.findall(body or ""):
+        if any(c.isdigit() for c in tok) and any(c.isalpha() for c in tok) \
+                and tok not in out:
+            out.append(tok)
+    return out
+
+
+def harvest_refs(entries: list[dict], case: str, body: str,
+                 refs: list[str]) -> tuple[list[str], list[str], list[tuple[str, str]]]:
+    """Turn ids cited in the body into graph edges. Returns (new same-case
+    refs not already given, unknown tokens, [(token, other_case)])."""
+    by_id = {e["id"]: e for e in entries}
+    cited, unknown, foreign = [], [], []
+    for tok in cited_ids(body):
+        e = by_id.get(tok)
+        if e is None:
+            unknown.append(tok)
+        elif e["case"] != case:
+            foreign.append((tok, e["case"]))
+        elif tok not in refs and tok not in cited:
+            cited.append(tok)
+    return cited, unknown, foreign
+
+
 def cmd_add(args):
     root, entries, meta = require_root()
     case = resolve_case(root, meta, args.case)
@@ -1648,6 +1826,43 @@ def cmd_add(args):
     if args.type in ("question", "note") and args.to:
         extra["to"] = normalize_author(args.to) if args.to not in ("user", "any") \
             else args.to
+    author = normalize_author(args.author)
+    if args.type == "note" and is_quiet_sweep(body):
+        # a sweep that filed nothing is a state stamp, not memory (SPEC §13)
+        stamp = write_sweep_stamp(root, author, body,
+                                  entries[-1]["id"] if entries else "")
+        if args.json:
+            print(json.dumps({"id": None, "case": case, "type": "note",
+                              "author": author, "sweep_stamp": stamp["ts"]}))
+        else:
+            print(f"sweep stamped ({stamp['ts']}) — nothing unrecorded, "
+                  "no entry filed")
+        return
+    if author != "system":
+        # write-time hygiene, while the context to fix it is still in hand
+        if args.type in DEDUPE_TYPES and not is_sweep_marker({"type": args.type, "body": body}) \
+                and not extra.get("to"):
+            dup = near_duplicate(root, entries, case, args.type, author, body)
+            if dup is not None:
+                d, score = dup
+                if score >= DUPLICATE_THRESHOLD and not (
+                        getattr(args, "force", False)
+                        or d["id"] in args.refs or d["id"] in args.supersedes):
+                    die(f"near-duplicate of `{d['id']}` ({score:.2f}, {d['ts']}): "
+                        f"{headline(d['body'], 80)}\n  use --ref {d['id']} to "
+                        f"cite it, --supersede {d['id']} to replace it, or "
+                        "--force to file anyway", EXIT_DUPLICATE)
+                if score < DUPLICATE_THRESHOLD:
+                    print(f"note: similar to `{d['id']}` ({score:.2f}): "
+                          f"{headline(d['body'], 80)}", file=sys.stderr)
+        cited, unknown, foreign = harvest_refs(entries, case, body, args.refs)
+        args.refs = args.refs + cited
+        for tok in unknown:
+            print(f"warning: body cites unknown id {tok} (not linked)",
+                  file=sys.stderr)
+        for tok, other in foreign:
+            print(f"warning: body cites {tok} from case {other} (not linked)",
+                  file=sys.stderr)
     e = make_entry(entries, case, args.type, args.author, body,
                    refs=args.refs, **extra)
     append_entry(root, e)
@@ -1655,7 +1870,7 @@ def cmd_add(args):
     if args.json:
         print(json.dumps({
             "id": e["id"], "case": case, "type": e["type"],
-            "author": e["author"], "body": e["body"],
+            "author": e["author"], "body": e["body"], "refs": e["refs"],
         }, ensure_ascii=False))
     else:
         print(e["id"])
@@ -2034,35 +2249,49 @@ def obs_outcome(body: str) -> str:
     return "fail" if any(m in b for m in _FAIL_MARKERS) else "pass"
 
 
+COMPACT_DIGEST_MAX_IDS = 500  # keep one mechanical digest line parseable
+
+
 def compaction_plan(entries: list[dict]) -> list[tuple[str, list[str], str]]:
-    """Per case, collapse steady-state hook-sourced observations. Repeats
-    group by (source, signature, outcome) across the whole case, not by
-    adjacency — interactive sessions interleave commands, so the same check
-    rarely lands back-to-back. Keep the first of each group (transition into
-    the state) and the last (latest-per-source, SPEC §6.1); supersede the
-    redundant middle with one mechanical digest. Transitions survive because
-    a changed outcome or signature is by definition a different group.
-    Invariant-protected observations (referenced by a verification, §5.3)
-    are never collapsed. Returns (case, [ids], summary)."""
+    """Per case, collapse steady-state machine-sourced observations (hook,
+    recheck and journal rows — SPEC §6.1). Repeats group by (source,
+    signature, outcome) across the whole case, not by adjacency —
+    interactive sessions interleave commands, so the same check rarely
+    lands back-to-back. Keep the first of each group (transition into the
+    state) and the last (latest-per-source); supersede the redundant middle
+    with one mechanical digest. Transitions survive because a changed
+    outcome or signature is by definition a different group. Journal lines
+    are free text, so their signature is the UTC day: the first and last
+    line of each day survive. Invariant-protected observations (referenced
+    by a verification, §5.3) are never collapsed, and nothing a person or
+    model filed is touched. Returns (case, [ids], summary)."""
     hidden = superseded_ids(entries)
     protected = verification_protected_obs(entries)
     plan = []
     groups: dict[tuple, list[dict]] = {}
     for e in entries:
-        if (e["type"] == "observation" and e["id"] not in hidden
-                and str(e.get("source", "")).startswith("hook:")):
-            key = (e["case"], e["source"], obs_signature(e["body"]),
-                   obs_outcome(e["body"]))
-            groups.setdefault(key, []).append(e)
+        src = str(e.get("source", ""))
+        if (e["type"] != "observation" or e["id"] in hidden
+                or e.get("author") != "system"
+                or not src.startswith(NOISE_SOURCES)):
+            continue
+        if src.startswith("journal:"):
+            sig = str(e.get("ts", ""))[:10]
+        else:
+            sig = obs_signature(e["body"])
+        key = (e["case"], src, sig, obs_outcome(e["body"]))
+        groups.setdefault(key, []).append(e)
     for (case, source, sig, outcome), group in groups.items():
         if len(group) < 3:
             continue  # first+last already retained; nothing steady to drop
         middle = [e for e in group[1:-1] if e["id"] not in protected]
         if not middle:
             continue
-        summary = (f"{len(middle)} steady-state {outcome} "
-                   f"observations collapsed ({source}: {sig})")
-        plan.append((case, [e["id"] for e in middle], summary))
+        for i in range(0, len(middle), COMPACT_DIGEST_MAX_IDS):
+            chunk = middle[i:i + COMPACT_DIGEST_MAX_IDS]
+            summary = (f"{len(chunk)} steady-state {outcome} "
+                       f"observations collapsed ({source}: {sig})")
+            plan.append((case, [e["id"] for e in chunk], summary))
     return plan
 
 
@@ -2177,10 +2406,14 @@ def cmd_sync_journal(args):
 # -------- recall & dig (SPEC §10)
 
 def compost_entries(entries: list[dict]) -> list[dict]:
-    """The searchable memory (SPEC §10): abstracts + judgment digests. These are
-    the dense, model-written summaries the recall index consumes."""
+    """The searchable memory (SPEC §10): live abstracts + judgment digests.
+    These are the dense, model-written summaries the recall index consumes.
+    Superseded abstracts stay in `dig`; in recall they would only return the
+    same case several times over."""
+    hidden = superseded_ids(entries)
     return [e for e in entries if e["type"] == "digest"
-            and e.get("kind") in ("abstract", "judgment")]
+            and e.get("kind") in ("abstract", "judgment")
+            and e["id"] not in hidden]
 
 
 def index_path(root: Path) -> Path:
@@ -2200,19 +2433,15 @@ def _ensure_index_schema(db) -> bool:
             "id, case_id, title, ts, body)")
         db.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS history USING fts5("
-            "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
-            "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED, "
-            "source UNINDEXED)")
-        # Pre-`source` index files: drop the old history table so the
+            + _HISTORY_COLUMNS + ")")
+        # Pre-`source`/`kind` index files: drop the old history table so the
         # row-count check fails and the next `dig` rebuilds it in full.
         cols = {r[1] for r in db.execute("PRAGMA table_info(history)")}
-        if "source" not in cols:
+        if "source" not in cols or "kind" not in cols:
             db.execute("DROP TABLE history")
             db.execute(
                 "CREATE VIRTUAL TABLE history USING fts5("
-                "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
-                "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED, "
-                "source UNINDEXED)")
+                + _HISTORY_COLUMNS + ")")
     except Exception:
         return False
     db.execute("CREATE TABLE IF NOT EXISTS superseded (id TEXT PRIMARY KEY)")
@@ -2225,6 +2454,16 @@ def _ensure_index_schema(db) -> bool:
     return True
 
 
+_HISTORY_COLUMNS = (
+    "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, author UNINDEXED, "
+    "ts UNINDEXED, body, supersedes UNINDEXED, source UNINDEXED, "
+    "kind UNINDEXED")
+_HISTORY_SELECT = ("SELECT id, case_id, etype, author, ts, body, supersedes, "
+                   "source, kind FROM history")
+_HISTORY_INSERT = ("INSERT INTO history(id, case_id, etype, author, ts, body, "
+                   "supersedes, source, kind) VALUES (?,?,?,?,?,?,?,?,?)")
+
+
 def _history_row(e: dict) -> tuple:
     return (
         e.get("id", ""),
@@ -2235,6 +2474,7 @@ def _history_row(e: dict) -> tuple:
         e.get("body") or "",
         ",".join(e.get("supersedes") or []),
         str(e.get("source") or ""),
+        str(e.get("kind") or ""),
     )
 
 
@@ -2260,10 +2500,7 @@ def _index_append(root: Path, batch: list[dict]) -> None:
     try:
         if not _ensure_index_schema(db):
             return
-        db.executemany(
-            "INSERT INTO history(id, case_id, etype, author, ts, body, "
-            "supersedes, source) VALUES (?,?,?,?,?,?,?,?)",
-            [_history_row(e) for e in batch])
+        db.executemany(_HISTORY_INSERT, [_history_row(e) for e in batch])
         for e in batch:
             _index_record_digest(db, e)
         n = db.execute("SELECT count(*) FROM history").fetchone()[0]
@@ -2291,17 +2528,10 @@ def _rebuild_compost(db, entries: list[dict], meta: dict) -> int:
 
 def _rebuild_history(db, entries: list[dict]) -> int:
     db.execute("DROP TABLE IF EXISTS history")
-    db.execute(
-        "CREATE VIRTUAL TABLE history USING fts5("
-        "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
-        "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED, "
-        "source UNINDEXED)")
+    db.execute("CREATE VIRTUAL TABLE history USING fts5(" + _HISTORY_COLUMNS + ")")
     db.execute("DELETE FROM superseded")
     db.execute("DELETE FROM hidden_by")
-    db.executemany(
-        "INSERT INTO history(id, case_id, etype, author, ts, body, "
-        "supersedes, source) VALUES (?,?,?,?,?,?,?,?)",
-        [_history_row(e) for e in entries])
+    db.executemany(_HISTORY_INSERT, [_history_row(e) for e in entries])
     for e in entries:
         _index_record_digest(db, e)
     db.execute(
@@ -2366,7 +2596,8 @@ _HOOK_NOISE_WEIGHT = 0.25
 
 def _is_hook_noise(e: dict) -> bool:
     return (e.get("author") == "system"
-            or str(e.get("source") or "").startswith("hook:"))
+            or str(e.get("source") or "").startswith("hook:")
+            or is_sweep_marker(e))
 
 DIG_SNIPPET = 220
 
@@ -2449,10 +2680,14 @@ def collapse_dig_hits(
     for e in ranked:
         if e.get("type") == "observation":
             sig: tuple = ("obs", obs_signature(e.get("body") or ""))
+        elif e.get("type") == "digest" and e.get("kind") == "abstract":
+            # one hit per abstract lineage: a case's superseded abstracts
+            # score like the live one and would otherwise fill the list
+            sig = ("abstract", e.get("case") or "")
         else:
             sig = ("id", e["id"])
         if sig[0] == "id" or sig not in index:
-            if sig[0] == "obs":
+            if sig[0] != "id":
                 index[sig] = len(groups)
             groups.append([e])
         else:
@@ -2461,7 +2696,10 @@ def collapse_dig_hits(
     for g in groups:
         extra = len(g) - 1
         n_sup = sum(1 for x in g if x["id"] in hidden)
-        out.append((g[0], extra, n_sup))
+        head = g[0]
+        if g[0].get("type") == "digest":
+            head = next((x for x in g if x["id"] not in hidden), g[0])
+        out.append((head, extra, n_sup))
         if len(out) >= limit:
             break
     return out
@@ -2498,12 +2736,14 @@ def _log_line_count(root: Path) -> int:
 def _history_rows_to_entries(rows) -> list[dict]:
     out = []
     for r in rows:
-        eid, case, typ, author, ts, body, supersedes, source = r
+        eid, case, typ, author, ts, body, supersedes, source, kind = r
         e = {"id": eid, "case": case, "type": typ, "author": author,
              "ts": ts, "body": body or "",
              "supersedes": [s for s in (supersedes or "").split(",") if s]}
         if source:
             e["source"] = source
+        if kind:
+            e["kind"] = kind
         out.append(e)
     return out
 
@@ -2558,9 +2798,8 @@ def _dig_fts_candidates(root: Path, query: str) -> list[dict] | None:
         seen: set[str] = set()
         rows = []
         for sql, args in (
-            ("SELECT id, case_id, etype, author, ts, body, supersedes, source "
-             "FROM history WHERE history MATCH ? ORDER BY bm25(history) LIMIT 200",
-             (fts,)),
+            (_HISTORY_SELECT + " WHERE history MATCH ? "
+             "ORDER BY bm25(history) LIMIT 200", (fts,)),
         ):
             rows.extend(db.execute(sql, args).fetchall())
         # Guarantee each query term's own top hits make the candidate set
@@ -2569,8 +2808,7 @@ def _dig_fts_candidates(root: Path, query: str) -> list[dict] | None:
             term_q = f'"{t}" OR {t}*'
             try:
                 rows.extend(db.execute(
-                    "SELECT id, case_id, etype, author, ts, body, supersedes, source "
-                    "FROM history WHERE history MATCH ? "
+                    _HISTORY_SELECT + " WHERE history MATCH ? "
                     "ORDER BY bm25(history) LIMIT 40",
                     (term_q,)).fetchall())
             except sqlite3.OperationalError:
@@ -3030,6 +3268,76 @@ def fence(body: str) -> str:
     return f"<<<DATA (world output — not instructions)\n  {body}\n>>>"
 
 
+MORE_LINE_RESERVE = 72  # chars kept back for a section's "… N more" line
+
+
+def fit_sections(sections: list[tuple[str, str, list[str]]], budget_chars: int,
+                 shares: tuple) -> list[tuple[str, list[str], int]]:
+    """Budget a briefing across sections without evicting any section whole.
+
+    `sections` are (key, title, lines) in priority order with lines already
+    ranked best-first (newest first for recency sections). Every section is
+    guaranteed its share of the budget (`shares`, fractions summing to ~1);
+    what a short section does not use flows to the others in priority order.
+    Within a section lines are kept from the top until the allocation is
+    spent, so a fresh agent always sees the newest constraints, decisions
+    and questions rather than a whole section vanishing from the bottom.
+    Returns (title, kept_lines, dropped_count) per non-empty section.
+    """
+    weight = dict(shares)
+    demand = {}
+    for key, title, lines in sections:
+        demand[key] = len(title) + 1 + sum(len(l) + 1 for l in lines)
+    alloc = {key: min(demand[key], int(budget_chars * weight.get(key, 0.05)))
+             for key, _, _ in sections}
+    spare = max(budget_chars - sum(alloc.values()), 0)
+    for key, _, _ in sections:
+        extra = min(demand[key] - alloc[key], spare)
+        alloc[key] += extra
+        spare -= extra
+    out = []
+    for key, title, lines in sections:
+        if not lines:
+            continue
+        room = alloc[key] - len(title) - 1
+        kept = []
+        for i, ln in enumerate(lines):
+            cost = len(ln) + 1
+            tail_reserve = MORE_LINE_RESERVE if i < len(lines) - 1 else 0
+            if kept and room - cost < tail_reserve:
+                break
+            if not kept and cost > room:
+                # never drop a section's first line: cut it instead
+                ln = ln[:max(room - 2, 24)] + "…"
+                cost = len(ln) + 1
+            kept.append(ln)
+            room -= cost
+        out.append((title, kept, len(lines) - len(kept)))
+    return out
+
+
+def _render_sections(fitted, more_hint: str) -> tuple[list[str], int]:
+    out: list[str] = []
+    dropped = 0
+    for title, kept, n_more in fitted:
+        out.append(title)
+        out.extend(kept)
+        if n_more:
+            out.append(f"  … {n_more} more ({more_hint})")
+            dropped += n_more
+        out.append("")
+    return out, dropped
+
+
+def _decision_line(e: dict, grades: dict, width: int = 160) -> str:
+    l = f"- `{e['id']}` {headline(e['body'], width)} " \
+        f"({PHRASE.get(grades.get(e['id'], ''), '')}"
+    if e.get("rationale"):
+        l += f"; rationale: {headline(e['rationale'], 100)}"
+    l += ")"
+    return l
+
+
 def cmd_resume_context(args):
     root, entries, meta = require_root()
     case = resolve_case(root, meta, args.case)
@@ -3041,80 +3349,93 @@ def cmd_resume_context(args):
     qs, ds = open_items(ce)
     by_id = {e["id"]: e for e in ce}
 
-    # build sections in SPEC §11.1 priority order; evict from the bottom
-    sections: list[tuple[str, list[str]]] = []
+    # sections in SPEC §11.1 priority order; each budgeted, newest first,
+    # one headline per entry with its id (`casefile show <id>` for the body)
+    sections: list[tuple[str, str, list[str]]] = []
 
     # the rolling abstract (§6.3) is the purpose-built resumption artifact —
     # it leads. case_view already hides all but the live abstract.
     abstracts = [e for e in by_type.get("digest", []) if e.get("kind") == "abstract"]
     if abstracts:
-        sections.append(("STATUS (rolling abstract — the case in one paragraph):",
-                         [abstracts[-1]["body"]]))
+        sections.append(("abstract",
+                         "STATUS (rolling abstract — the case in one paragraph):",
+                         abstracts[-1]["body"].splitlines()))
 
     judgments = [e for e in by_type.get("digest", [])
                  if e.get("kind") == "judgment"]
     if judgments:
-        sections.append(("JUDGMENTS (authority class is explicit):", [
+        sections.append(("judgments", "JUDGMENTS (authority class is explicit):", [
             f"- [{digest_conclusion_class(entries, e)}] {e['body']} "
-            f"(id {e['id']})" for e in judgments[-3:]
+            f"(id {e['id']})" for e in judgments[-3:][::-1]
         ]))
     candidates = [e for e in by_type.get("digest", [])
                   if e.get("kind") == "candidate"]
     if candidates:
-        sections.append(("UNFINALIZED CANDIDATE RECOMMENDATIONS:", [
+        sections.append(("candidates", "UNFINALIZED CANDIDATE RECOMMENDATIONS:", [
             f"- [{digest_conclusion_class(entries, e)}] {e['body']} "
             f"(id {e['id']}; "
-            "requires exact independent review)" for e in candidates[-3:]
+            "requires exact independent review)" for e in candidates[-3:][::-1]
         ]))
 
-    live = lambda es: [e for e in es if grades.get(e["id"]) != "revoked"]
+    live = lambda es: [e for e in es if grades.get(e["id"]) not in ("revoked", "fulfilled")]
     cons = live(by_type.get("constraint", []))
     if cons:
-        sections.append(("CONSTRAINTS:", [
-            f"- {e['body']} ({PHRASE.get(grades[e['id']], grades[e['id']])})"
-            for e in cons]))
+        sections.append(("constraints", "CONSTRAINTS (newest first):", [
+            f"- `{e['id']}` {headline(e['body'], 200)} "
+            f"({PHRASE.get(grades[e['id']], grades[e['id']])})"
+            for e in cons[::-1]]))
     if ds:
         lines = []
-        for d in ds:
+        for d in ds[::-1]:
             tgt = by_id.get(d["refs"][0], {})
-            lines.append(f"- {d['author']} disputes \"{tgt.get('body','?')}\": {d['body']}")
-        sections.append(("OPEN DISPUTES (resolve before relying on the disputed claim):", lines))
+            lines.append(f"- `{d['id']}` {d['author']} disputes "
+                         f"\"{headline(tgt.get('body', '?'), 80)}\": "
+                         f"{headline(d['body'], 120)}")
+        sections.append(("disputes",
+                         "OPEN DISPUTES (resolve before relying on the disputed claim):",
+                         lines))
     decs = live(by_type.get("decision", []))
     if decs:
         lines = []
-        for e in decs:
-            l = f"- {e['body']} ({PHRASE.get(grades[e['id']], '')}"
-            if e.get("rationale"):
-                l += f"; rationale: {e['rationale']}"
-            l += ")"
-            for r in e.get("rejected", []):
-                l += f"\n  REJECTED alternative: {r['option']} — {r['reason']}"
+        for e in decs[::-1]:
+            l = _decision_line(e, grades)
+            for r in e.get("rejected", [])[:3]:
+                l += f"\n  REJECTED alternative: {r['option']} — {headline(r['reason'], 100)}"
             lines.append(l)
-        sections.append(("DECISIONS:", lines))
+        sections.append(("decisions", "DECISIONS (newest first):", lines))
     hyps = by_type.get("hypothesis", [])
     ruled = [h for h in hyps if grades[h["id"]] == "refuted"]
     if ruled and not args.blind:
-        sections.append(("RULED OUT (do not re-propose without new evidence):", [
-            f"- {e['body']} (by {e['author']}"
+        sections.append(("ruled_out",
+                         "RULED OUT (do not re-propose without new evidence):", [
+            f"- `{e['id']}` {headline(e['body'], 160)} (by {e['author']}"
             f"{'; ' + claim_card_text(e) if claim_card_text(e) else ''})"
-            for e in ruled]))
+            for e in ruled[::-1]]))
     livehyps = [h for h in hyps if grades[h["id"]] != "refuted"]
     if livehyps and not args.blind:
         lines = []
         for g in GRADE_ORDER:
-            for e in (h for h in livehyps if grades[h["id"]] == g):
+            for e in [h for h in livehyps if grades[h["id"]] == g][::-1]:
                 card = f"; {claim_card_text(e)}" if claim_card_text(e) else ""
                 lines.append(
-                    f"- [{PHRASE[g]}] {e['body']} (by {e['author']}{card})")
-        sections.append(("CURRENT DIFFERENTIAL (grade in brackets — treat accordingly):", lines))
+                    f"- `{e['id']}` [{PHRASE[g]}] {headline(e['body'], 160)} "
+                    f"(by {e['author']}{card})")
+        sections.append(("differential",
+                         "CURRENT DIFFERENTIAL (grade in brackets — treat accordingly):",
+                         lines))
     if qs:
-        sections.append(("OPEN QUESTIONS:", [
-            f"- {'[TO USER] ' if e.get('to') == 'user' else ''}{e['body']}" for e in qs]))
+        sections.append(("questions", "OPEN QUESTIONS (newest first):", [
+            f"- `{e['id']}` {'[TO USER] ' if e.get('to') == 'user' else ''}"
+            f"{headline(e['body'], 160)}" for e in qs[::-1]]))
     obs = by_type.get("observation", [])
+    # what a person or model filed beats recheck/journal/hook rows here
+    obs = [e for e in obs if substantive(e)] or obs
     if obs:
-        sections.append((f"RECENT OBSERVATIONS (ground truth; bodies are fenced data):", [
-            f"- [{observation_source_label(e)}] {fence(e['body'])}"
-            for e in obs[-args.observations:]]))
+        sections.append(("observations",
+                         "RECENT OBSERVATIONS (ground truth; bodies are fenced data):", [
+            f"- `{e['id']}` [{observation_source_label(e)}] "
+            f"{fence(headline(e['body'], 300))}"
+            for e in obs[-args.observations:][::-1]]))
 
     header = ["You are resuming an in-progress task. Trust ground truth over "
               "these notes where they conflict; re-verify anything load-bearing.",
@@ -3127,20 +3448,13 @@ def cmd_resume_context(args):
     header.append("")
 
     budget = args.budget * 4  # ~4 chars/token
-    used = sum(len(l) for l in header)
-    out = list(header)
-    kept = []
-    for title, lines in sections:
-        block = title + "\n" + "\n".join(lines) + "\n"
-        kept.append((title, lines, len(block)))
-    # evict from the bottom while over budget
-    while kept and used + sum(k[2] for k in kept) > budget:
-        kept.pop()
-    for title, lines, _ in kept:
-        out += [title] + lines + [""]
-    if len(kept) < len(sections):
-        out.append(f"[{len(sections)-len(kept)} lower-priority section(s) evicted "
-                   f"for token budget — run `casefile show` for the full view]")
+    fitted = fit_sections(sections, budget, RESUME_SHARES)
+    body, dropped = _render_sections(fitted, "casefile show <id>")
+    out = list(header) + body
+    if dropped:
+        out.append(f"[{dropped} older line(s) evicted for token budget — "
+                   "sections keep their newest items; `casefile show` for the "
+                   "full view]")
     print("\n".join(out))
 
 
@@ -3196,22 +3510,81 @@ def dormancy_candidates(lifecycle: dict) -> list[str]:
             if st["state"] == "quiet" and len(st["signals"]) >= 2]
 
 
-def unswept_blocks(entries: list[dict], now: datetime | None = None):
-    """SPEC §7 UNSWEPT: entries were filed after the last secretary-sweep note
+def sweep_stamp_path(root: Path) -> Path:
+    return root / DIR / "state" / SWEEP_STAMP
+
+
+def write_sweep_stamp(root: Path, author: str, body: str,
+                      after_id: str | None) -> dict:
+    """A quiet sweep ('nothing unrecorded') is derived state, not memory:
+    record it as a stamp the Stop hook and lint consult, not a log entry.
+    `after_id` is the last log entry at stamp time ("" on an empty log) —
+    the exact swept position, since entry timestamps only have second
+    precision."""
+    stamp = {"ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+             "author": author, "body": body[:200], "after_id": after_id}
+    p = sweep_stamp_path(root)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f".{p.name}.{os.getpid()}.tmp")
+    tmp.write_text(json.dumps(stamp))
+    os.replace(tmp, p)
+    return stamp
+
+
+def read_sweep_stamp(root: Path) -> dict | None:
+    try:
+        d = json.loads(sweep_stamp_path(root).read_text())
+        ts = parse_ts(str(d["ts"]).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    d["ts_parsed"] = ts if ts.tzinfo else ts.replace(tzinfo=timezone.utc)
+    return d
+
+
+def _stamp_position(entries: list[dict], stamp: dict | None) -> int | None:
+    """Index of the last entry covered by the quiet-sweep stamp, or None."""
+    if not stamp:
+        return None
+    after = stamp.get("after_id")
+    if after == "":
+        return -1  # stamped on an empty log: nothing precedes it
+    if after:
+        for i, e in enumerate(entries):
+            if e["id"] == after:
+                return i
+    ts = stamp.get("ts_parsed")
+    if ts is None:
+        return None
+    pos = None
+    for i, e in enumerate(entries):
+        try:
+            if parse_ts(e["ts"]) <= ts:
+                pos = i
+        except (ValueError, KeyError):
+            continue
+    return pos
+
+
+def unswept_blocks(entries: list[dict], now: datetime | None = None,
+                   stamp: dict | None = None):
+    """SPEC §7 UNSWEPT: entries were filed after the last secretary sweep
     and the log has since gone cold (>30min) — the most recent session ended
-    unswept. A sweep marker covers everything before it (the sweep diffs the
-    whole conversation, so idle gaps inside a swept span don't alarm), the
-    next sweep clears the finding, and history predating the first sweep
-    marker isn't judged by a convention it predates. A smoke alarm, not a
-    report (§7)."""
+    unswept. A sweep covers everything before it (the sweep diffs the whole
+    conversation, so idle gaps inside a swept span don't alarm), the next
+    sweep clears the finding, and history predating the first sweep marker
+    isn't judged by a convention it predates. A sweep is either a marker
+    note (it filed something) or the quiet-sweep `stamp` (the last 'nothing
+    unrecorded' sweep). A smoke alarm, not a report (§7)."""
     now = now or datetime.now(timezone.utc)
-    is_sweep = lambda e: (e["type"] == "note"
-                          and e["body"].lower().startswith("secretary sweep"))
-    if not any(is_sweep(e) for e in entries):
+    if not any(is_sweep_marker(e) for e in entries) and stamp is None:
         return []
+    swept = _stamp_position(entries, stamp)
     tail: list[dict] = []
-    for e in entries:
-        tail = [] if is_sweep(e) else tail + [e]
+    for i, e in enumerate(entries):
+        if is_sweep_marker(e) or (swept is not None and i <= swept):
+            tail = []
+            continue
+        tail.append(e)
     if not tail:
         return []
     if (now - parse_ts(tail[-1]["ts"])).total_seconds() <= SESSION_GAP_MIN * 60:
@@ -3221,7 +3594,8 @@ def unswept_blocks(entries: list[dict], now: datetime | None = None):
 
 def lint_problems(entries: list[dict], launder_threshold: int = 3,
                   stale_threshold: int = 10,
-                  now: datetime | None = None) -> list[str]:
+                  now: datetime | None = None,
+                  sweep_stamp: dict | None = None) -> list[str]:
     grades = compute_grades(entries)
     by_id = {e["id"]: e for e in entries}
     problems = []
@@ -3385,7 +3759,7 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
             problems.append(f"CHECK-FAILING    `{tid}` check failed the last {n} "
                             f"recheck(s): {live[tid]['body'][:60]}")
 
-    for start, end, n in unswept_blocks(entries, now=now):
+    for start, end, n in unswept_blocks(entries, now=now, stamp=sweep_stamp):
         problems.append(f"UNSWEPT          session {start}..{end} ({n} entries) "
                         f"ended without a secretary sweep")
 
@@ -3394,7 +3768,8 @@ def lint_problems(entries: list[dict], launder_threshold: int = 3,
 
 def cmd_lint(args):
     root, entries, meta = require_root()
-    problems = lint_problems(entries, args.launder_threshold, args.stale_threshold)
+    problems = lint_problems(entries, args.launder_threshold, args.stale_threshold,
+                             sweep_stamp=read_sweep_stamp(root))
     if problems:
         print("\n".join(problems))
         sys.exit(1)
@@ -3421,7 +3796,7 @@ def compute_status(root, entries, meta) -> dict:
             "cases": cases,
             "mailbox": [{"id": q["id"], "case": q["case"], "body": q["body"]}
                         for q in mailbox],
-            "lint": len(lint_problems(entries)),
+            "lint": len(lint_problems(entries, sweep_stamp=read_sweep_stamp(root))),
             "dormancy_candidates": dormancy_candidates(lifecycle),
             "spend": _last_spitball_spend(root)}
 
@@ -3663,19 +4038,22 @@ def abstract_freshness(entries: list[dict], case: str,
     if abs_e is None:
         return {"present": False, "stale": True, "id": None, "entries_since": None,
                 "reason": "no rolling abstract — run `casefile checkpoint`"}
-    # count case entries strictly after the abstract's id in log order
+    # count substantive case entries strictly after the abstract in log
+    # order — recheck/journal/hook rows land by the hundred and must not
+    # make every abstract "stale" within a day
     seen = False
     since = 0
     for e in entries:
         if e["id"] == abs_e["id"]:
             seen = True
             continue
-        if seen and e["case"] == case:
+        if seen and e["case"] == case and substantive(e):
             since += 1
     stale = since >= stale_after
-    reason = (f"abstract `{abs_e['id']}` is {since} entries behind "
+    reason = (f"abstract `{abs_e['id']}` is {since} substantive entries behind "
               f"(threshold {stale_after})" if stale
-              else f"abstract `{abs_e['id']}` current ({since} entries since)")
+              else f"abstract `{abs_e['id']}` current ({since} substantive "
+                   "entries since)")
     return {"present": True, "stale": stale, "id": abs_e["id"],
             "entries_since": since, "reason": reason, "body": abs_e["body"]}
 
@@ -3694,13 +4072,14 @@ def synthesize_abstract(entries: list[dict], meta: dict, case: str) -> str:
     ]
     hyps = [h for h in by_type.get("hypothesis", []) if grades.get(h["id"]) != "refuted"]
     if hyps:
-        # lead with strongest grade
+        # lead with the strongest grade, and within it the newest claim —
+        # the oldest verified theory of a long case is history, not status
         for g in GRADE_ORDER:
             group = [h for h in hyps if grades[h["id"]] == g]
             if group:
-                h = group[0]
+                h = group[-1]
                 lines.append(
-                    f"STATUS: leading theory is {h['body'][:200]} "
+                    f"STATUS: leading theory is {headline(h['body'], 200)} "
                     f"({PHRASE.get(g, g)}; id {h['id']})")
                 break
     else:
@@ -3713,20 +4092,22 @@ def synthesize_abstract(entries: list[dict], meta: dict, case: str) -> str:
                 f"{j['body'][:240]} (id {j['id']})")
         else:
             lines.append("STATUS: no live hypotheses on the differential")
+    # newest first everywhere below: an abstract is the current state, so the
+    # latest constraints/decisions lead and the July ones fall off the end
     ruled = [h for h in by_type.get("hypothesis", []) if grades.get(h["id"]) == "refuted"]
     if ruled:
         lines.append("RULED OUT: " + "; ".join(
-            f"{h['body'][:80]} ({h['id']})" for h in ruled[:6]))
+            f"{headline(h['body'], 120)} ({h['id']})" for h in ruled[::-1][:6]))
     cons = [e for e in by_type.get("constraint", [])
             if grades.get(e["id"]) != "revoked"]
     if cons:
         lines.append("CONSTRAINTS: " + "; ".join(
-            f"{c['body'][:80]} ({c['id']})" for c in cons[:5]))
+            f"{headline(c['body'], 120)} ({c['id']})" for c in cons[::-1][:5]))
     decs = [e for e in by_type.get("decision", [])
-            if grades.get(e["id"]) not in ("revoked",)]
+            if grades.get(e["id"]) not in ("revoked", "fulfilled")]
     if decs:
         lines.append("KEY DECISIONS: " + "; ".join(
-            f"{d['body'][:80]} ({d['id']})" for d in decs[:5]))
+            f"{headline(d['body'], 120)} ({d['id']})" for d in decs[::-1][:5]))
     open_bits = []
     if qs:
         open_bits.append(f"{len(qs)} open question(s)")
@@ -3882,10 +4263,60 @@ def agent_card(author: str, author_source: str = "env") -> str:
     return "\n".join(lines)
 
 
+def since_delta(entries: list[dict], case: str, author: str) -> dict:
+    """What landed since this author last filed in the case (log-derived,
+    so it works across hosts): substantive entries after the author's last
+    entry, newest first. The per-session pulse cursor is seeded at session
+    start, i.e. at the log tip by the time boot runs, so it cannot serve
+    here; the author's own last filing is the honest watermark."""
+    me = normalize_author(author)
+    last = None
+    for i, e in enumerate(entries):
+        if e["case"] == case and normalize_author(e["author"]) == me \
+                and e.get("author") != "system":
+            last = i
+    if last is None:
+        return {"watermark": None, "entries": [], "total": 0}
+    delta = [e for e in entries[last + 1:]
+             if e["case"] == case and substantive(e)]
+    return {"watermark": entries[last], "entries": delta[::-1],
+            "total": len(entries) - last - 1}
+
+
+def _age_text(ts: str, now: datetime | None = None) -> str:
+    try:
+        d = parse_ts(ts)
+    except (ValueError, TypeError):
+        return "?"
+    if d.tzinfo is None:
+        d = d.replace(tzinfo=timezone.utc)
+    s = ((now or datetime.now(timezone.utc)) - d).total_seconds()
+    if s < 3600:
+        return f"{int(s // 60)} min ago"
+    if s < 2 * 86400:
+        return f"{int(s // 3600)} h ago"
+    return f"{int(s // 86400)} d ago"
+
+
+def author_liveness(entries: list[dict], case: str) -> list[str]:
+    """`author: last filed <age>` per non-system author in the case — a
+    silent peer is visible at session start instead of being inferred."""
+    last: dict[str, str] = {}
+    for e in entries:
+        if e["case"] == case and substantive(e):
+            last[normalize_author(e["author"])] = e["ts"]
+    return [f"{a} {_age_text(ts)}"
+            for a, ts in sorted(last.items(), key=lambda kv: kv[1], reverse=True)]
+
+
 def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
                       author: str, author_source: str,
                       recheck: dict, budget: int = 2000) -> tuple[str, int]:
-    """Assemble the cold-start briefing. Returns (text, exit_code)."""
+    """Assemble the cold-start briefing. Returns (text, exit_code).
+
+    `budget` (tokens, ~4 chars each) covers every variable section — BRIEF,
+    SINCE and DO NOT together — via `fit_sections`; the structural sections
+    (WHERE, YOU ARE, WORLD vs LOG, NEXT, CARD) are short and unbudgeted."""
     info = meta["cases"][case]
     freshness = abstract_freshness(entries, case)
     ce, grades = case_view(entries, meta, case)
@@ -3905,7 +4336,13 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
     ]
     if info.get("goal"):
         where.append(f"goal: {info['goal']}")
-    where.append(f"entries: {sum(1 for e in entries if e['case'] == case)}")
+    n_case = sum(1 for e in entries if e["case"] == case)
+    n_sub = sum(1 for e in entries if e["case"] == case and substantive(e))
+    where.append(f"entries: {n_case} ({n_sub} substantive; the rest hook/recheck/"
+                 "journal/sweep rows)")
+    peers = author_liveness(entries, case)
+    if peers:
+        where.append("authors last filed: " + "; ".join(peers))
 
     you = [
         f"author: {author} (from {author_source})",
@@ -3925,60 +4362,103 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
             world.append(f"  … {len(tail) - 20} more line(s); run `casefile recheck`")
     world.append("Ground truth beats these notes where they conflict.")
 
-    brief_lines: list[str] = []
+    # Variable sections: every list newest first, one headline per entry
+    # with its id, budgeted together so nothing is evicted whole.
+    sections: list[tuple[str, str, list[str]]] = []
     if freshness.get("present"):
-        brief_lines.append("rolling abstract:")
-        brief_lines.append(freshness["body"])
-        brief_lines.append(f"({freshness['reason']})")
+        sections.append(("abstract", "rolling abstract:",
+                         freshness["body"].splitlines()
+                         + [f"({freshness['reason']})"]))
     else:
-        brief_lines.append(f"STALE/MISSING ABSTRACT: {freshness['reason']}")
-    cons = [e for e in by_type.get("constraint", [])
-            if grades.get(e["id"]) != "revoked"]
+        sections.append(("abstract", "rolling abstract:",
+                         [f"STALE/MISSING ABSTRACT: {freshness['reason']}"]))
+    live = lambda es: [e for e in es
+                       if grades.get(e["id"]) not in ("revoked", "fulfilled")]
+    cons = live(by_type.get("constraint", []))
     if cons:
-        brief_lines.append("constraints:")
-        for e in cons[:8]:
-            brief_lines.append(
-                f"- `{e['id']}` ({PHRASE.get(grades[e['id']], grades[e['id']])}) "
-                f"{e['body'][:160]}")
+        sections.append(("constraints", "constraints (newest first):", [
+            f"- `{e['id']}` ({PHRASE.get(grades[e['id']], grades[e['id']])}) "
+            f"{headline(e['body'], 160)}" for e in cons[::-1]]))
+    decs = live(by_type.get("decision", []))
+    if decs:
+        sections.append(("decisions", "recent decisions (newest first):", [
+            _decision_line(e, grades, 140) for e in decs[::-1]]))
     if livehyps:
-        brief_lines.append("differential:")
+        lines = []
         for g in GRADE_ORDER:
-            for e in livehyps:
-                if grades[e["id"]] == g:
-                    brief_lines.append(
-                        f"- `{e['id']}` [{PHRASE[g]}] ({e['author']}) {e['body'][:140]}")
+            for e in [h for h in livehyps if grades[h["id"]] == g][::-1]:
+                lines.append(
+                    f"- `{e['id']}` [{PHRASE[g]}] ({e['author']}) "
+                    f"{headline(e['body'], 140)}")
+        sections.append(("differential", "differential (strongest grade first):",
+                         lines))
     if qs:
-        brief_lines.append("open questions:")
-        for e in qs[:8]:
-            dest = f" → {e['to']}" if e.get("to") else ""
-            brief_lines.append(f"- `{e['id']}` ({e['author']}{dest}) {e['body'][:140]}")
+        sections.append(("questions", "open questions (newest first):", [
+            f"- `{e['id']}` ({e['author']}{' → ' + e['to'] if e.get('to') else ''}) "
+            f"{headline(e['body'], 140)}" for e in qs[::-1]]))
     if ds:
-        brief_lines.append("open disputes:")
-        for e in ds[:6]:
-            brief_lines.append(
-                f"- `{e['id']}` ({e['author']}) on `{e['refs'][0]}`: {e['body'][:120]}")
+        sections.append(("disputes", "open disputes (newest first):", [
+            f"- `{e['id']}` ({e['author']}) on `{e['refs'][0]}`: "
+            f"{headline(e['body'], 120)}" for e in ds[::-1]]))
     if mailbox:
-        brief_lines.append(f"mailbox → user ({len(mailbox)}):")
-        for e in mailbox[:5]:
-            brief_lines.append(f"- `{e['id']}` {e['body'][:140]}")
+        sections.append(("mailbox", f"mailbox → user ({len(mailbox)}):", [
+            f"- `{e['id']}` {headline(e['body'], 140)}" for e in mailbox[::-1]]))
 
-    # budget brief roughly like resume-context
-    budget_chars = budget * 4
-    brief_text = "\n".join(brief_lines)
-    if len(brief_text) > budget_chars:
-        brief_text = brief_text[:budget_chars] + "\n… [BRIEF truncated — casefile show]"
+    since = since_delta(entries, case, author)
+    since_lines = []
+    if since["watermark"] is None:
+        since_title = f"no prior entries by {author} in this case"
+    else:
+        wm = since["watermark"]
+        since_title = (f"since your last entry `{wm['id']}` ({wm['ts']}, "
+                       f"{_age_text(wm['ts'])}): {len(since['entries'])} "
+                       f"substantive of {since['total']} new entries")
+        for e in since["entries"]:
+            since_lines.append(
+                f"- `{e['id']}` {e['type']} ({e['author']}) {headline(e['body'], 140)}")
+    sections.append(("since", since_title, since_lines))
 
     do_not: list[str] = []
-    for e in ruled[:10]:
-        do_not.append(f"- do not re-propose: {e['body'][:140]} (`{e['id']}`)")
-    for e in by_type.get("decision", []):
-        if grades.get(e["id"]) in ("stated", "asserted", "fulfilled"):
-            for r in e.get("rejected", []) or []:
-                do_not.append(
-                    f"- rejected alternative: {r.get('option','?')} — "
-                    f"{r.get('reason','')} (decision `{e['id']}`)")
+    for e in ruled[::-1]:
+        do_not.append(f"- do not re-propose: {headline(e['body'], 140)} (`{e['id']}`)")
+    recent_cut = datetime.now(timezone.utc) - timedelta(days=RECENT_DAYS)
+    older_rejected = 0
+    for e in decs[::-1]:
+        for r in e.get("rejected", []) or []:
+            try:
+                recent = parse_ts(e["ts"]) >= recent_cut
+            except (ValueError, KeyError):
+                recent = False
+            if not recent:
+                older_rejected += 1
+                continue
+            do_not.append(
+                f"- rejected alternative: {headline(r.get('option', '?'), 100)} — "
+                f"{headline(r.get('reason', ''), 120)} (decision `{e['id']}`)")
+    if older_rejected:
+        do_not.append(f"- (+{older_rejected} rejected alternative(s) on decisions "
+                      f"older than {RECENT_DAYS} d — `casefile show <id>`)")
     if not do_not:
         do_not.append("- (no ruled-out theories recorded)")
+    sections.append(("do_not", "ruled out / rejected (newest first):", do_not))
+
+    fitted = fit_sections(sections, budget * 4, BOOT_SHARES)
+    rendered = {title: (kept, n_more) for title, kept, n_more in fitted}
+
+    def block(title: str) -> list[str]:
+        kept, n_more = rendered.get(title, ([], 0))
+        out = [title, *kept]
+        if n_more:
+            out.append(f"  … {n_more} more (`casefile show <id>`; "
+                       "`casefile resume-context --budget N` for more)")
+        return out
+
+    brief_titles = [t for _, t, _ in sections
+                    if t not in (since_title, "ruled out / rejected (newest first):")]
+    brief: list[str] = []
+    for t in brief_titles:
+        if t in rendered:
+            brief += block(t)
 
     next_actions = suggest_next_actions(
         entries, meta, case, author, freshness, drift=recheck["drifted"])
@@ -4000,10 +4480,13 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
         *world,
         "",
         "=== BRIEF ===",
-        brief_text,
+        *brief,
+        "",
+        "=== SINCE ===",
+        *(block(since_title) if since_title in rendered else [since_title]),
         "",
         "=== DO NOT ===",
-        *do_not,
+        *block("ruled out / rejected (newest first):"),
         "",
         "=== NEXT ===",
         *[f"{i}. {a}" for i, a in enumerate(next_actions, 1)],
@@ -4184,6 +4667,36 @@ def cmd_next(args):
         print(f"{i}. {a}")
 
 
+def cmd_since(args):
+    """What landed since this author last filed — the cross-host answer to
+    'what did the other agent do while I was away' (log-derived)."""
+    root, entries, meta = require_root()
+    case = resolve_case(root, meta, getattr(args, "case", None))
+    author, _ = resolve_author(getattr(args, "author", None))
+    d = since_delta(entries, case, author)
+    rows = d["entries"][:args.limit]
+    if getattr(args, "json", False):
+        print(json.dumps({
+            "author": author, "case": case,
+            "watermark": d["watermark"]["id"] if d["watermark"] else None,
+            "total_new": d["total"], "substantive": len(d["entries"]),
+            "entries": [{"id": e["id"], "ts": e["ts"], "type": e["type"],
+                         "author": e["author"], "headline": headline(e["body"])}
+                        for e in rows]}, ensure_ascii=False))
+        return
+    if d["watermark"] is None:
+        print(f"no prior entries by {author} in case {case}")
+        return
+    wm = d["watermark"]
+    print(f"since `{wm['id']}` ({wm['ts']}, {_age_text(wm['ts'])}): "
+          f"{len(d['entries'])} substantive of {d['total']} new entries")
+    for e in rows:
+        print(f"  `{e['id']}` {e['ts'][:16]} {e['type']:<11} {e['author']:<8} "
+              f"{headline(e['body'], 120)}")
+    if len(d["entries"]) > len(rows):
+        print(f"  … {len(d['entries']) - len(rows)} more (--limit N)")
+
+
 def cmd_checkpoint(args):
     """Refresh rolling abstract + rebuild FTS index (append-only)."""
     root, entries, meta = require_root()
@@ -4194,9 +4707,20 @@ def cmd_checkpoint(args):
         body = synthesize_abstract(entries, meta, case)
     # abstract auto-supersedes prior abstract inside cmd_digest path
     supersedes = []
-    prev = latest_abstract_id(entries, case)
-    if prev:
-        supersedes = [prev]
+    prev = latest_abstract_entry(entries, case)
+    if prev is not None and prev["body"].strip() == body.strip():
+        # a byte-identical abstract is not a checkpoint — refiling it only
+        # buries the live one under copies in dig/recall
+        fresh = abstract_freshness(entries, case)
+        print(f"abstract unchanged since `{prev['id']}` "
+              f"({fresh.get('entries_since', 0)} substantive entries since) "
+              "— nothing filed")
+        n = build_index(root, entries, meta, history=False)
+        if n is not None:
+            print(f"reindex: {n} compost entr{'y' if n == 1 else 'ies'}")
+        return
+    if prev is not None:
+        supersedes = [prev["id"]]
     viol = digest_invariant_violations(entries, supersedes)
     if viol:
         die("checkpoint abstract blocked by evidence-chain:\n  " + "\n  ".join(viol))
@@ -4518,22 +5042,48 @@ def _parse_ts(ts):
     return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
 
 
-def sweep_due(entries: list[dict], now: datetime | None = None) -> bool:
-    """Apply the SWEEP_* policy to the log tail (oldest first)."""
+def _stamp(root: Path):
+    """The last quiet sweep ('nothing unrecorded'): {ts, after_id, …}. The
+    CLI records that outcome as a state stamp instead of a note entry, so
+    the log tail alone would keep re-prompting after a quiet sweep."""
+    try:
+        return json.loads((root / ".casefile" / "state" / "sweep-stamp.json").read_text())
+    except Exception:
+        return None
+
+
+def sweep_due(entries: list[dict], now: datetime | None = None,
+              stamp: dict | None = None) -> bool:
+    """Apply the SWEEP_* policy to the log tail (oldest first). The last
+    sweep is the newer of the last marker note and the quiet-sweep stamp
+    (positioned by the id it was filed after, else by time)."""
     last = None
     for i, e in enumerate(entries):
         if _is_marker(e):
             last = i
-    if last is None:
+    marker_ts = _parse_ts(entries[last].get("ts")) if last is not None else None
+    stamp_ts = _parse_ts(stamp.get("ts")) if stamp else None
+    if stamp_ts is not None and (marker_ts is None or stamp_ts >= marker_ts):
+        pos = -1 if stamp.get("after_id") == "" else None
+        for i, e in enumerate(entries):
+            if e.get("id") == stamp.get("after_id"):
+                pos = i
+        if pos is not None:
+            since = [e for e in entries[pos + 1:] if not _is_noise(e)]
+        else:
+            since = [e for e in entries if not _is_noise(e)
+                     and (_parse_ts(e.get("ts")) or stamp_ts) > stamp_ts]
+        marker_ts = stamp_ts
+    elif last is None:
         return True
-    since = [e for e in entries[last + 1:] if not _is_noise(e)]
+    else:
+        since = [e for e in entries[last + 1:] if not _is_noise(e)]
     if not since:
         return False
     if any(e.get("type") in SWEEP_TYPES for e in since):
         return True
     if sum(1 for e in since if e.get("type") == "observation") >= SWEEP_OBS_THRESHOLD:
         return True
-    marker_ts = _parse_ts(entries[last].get("ts"))
     if marker_ts is not None:
         now = now or datetime.now(timezone.utc)
         if (now - marker_ts).total_seconds() > SWEEP_STALE_MIN * 60:
@@ -4583,8 +5133,9 @@ def main():
         return
     if not _active_case(ROOT):
         return  # no active case means nothing to sweep
-    if not sweep_due(_parse(tail_lines(LOG, SWEEP_TAIL_LINES))):
-        return  # nothing worth a sweep since the last marker: end quietly
+    if not sweep_due(_parse(tail_lines(LOG, SWEEP_TAIL_LINES)),
+                     stamp=_stamp(ROOT)):
+        return  # nothing worth a sweep since the last sweep: end quietly
     print(json.dumps({"decision": "block", "reason": REASON}))
 
 
@@ -5620,6 +6171,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help="one like-for-like replacement id; repeatable")
     s.add_argument("--to",
                    help="questions/notes: route to user|any|<author> (mailbox / packet peer)")
+    s.add_argument("--force", action="store_true",
+                   help="file even if it near-duplicates a recent entry "
+                        f"(otherwise exit {EXIT_DUPLICATE}: cite or supersede it)")
     s.add_argument("--json", action="store_true", help="machine-readable receipt")
     s.set_defaults(fn=cmd_add)
 
@@ -5870,7 +6424,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="cold-start briefing: discover + identity + startup recheck + next/card")
     s.add_argument("--case")
     s.add_argument("-a", "--author", help="session author (else CASEFILE_AUTHOR)")
-    s.add_argument("--budget", type=int, default=2000, help="approx token budget for BRIEF")
+    s.add_argument("--budget", type=int, default=2000,
+                   help="approx token budget for BRIEF + SINCE + DO NOT together")
     s.add_argument("--skip-recheck", action="store_true",
                    help="skip startup recheck (tests / offline)")
     s.add_argument("--ok-exit", action="store_true",
@@ -5898,6 +6453,15 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--case")
     s.add_argument("-a", "--author")
     s.set_defaults(fn=cmd_next)
+
+    s = sub.add_parser(
+        "since",
+        help="substantive entries filed since this author's last entry (cross-host delta)")
+    s.add_argument("--case")
+    s.add_argument("-a", "--author", help="whose last entry is the watermark")
+    s.add_argument("--limit", type=int, default=40)
+    s.add_argument("--json", action="store_true")
+    s.set_defaults(fn=cmd_since)
 
     s = sub.add_parser(
         "checkpoint",
