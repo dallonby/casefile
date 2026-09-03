@@ -2201,7 +2201,18 @@ def _ensure_index_schema(db) -> bool:
         db.execute(
             "CREATE VIRTUAL TABLE IF NOT EXISTS history USING fts5("
             "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
-            "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED)")
+            "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED, "
+            "source UNINDEXED)")
+        # Pre-`source` index files: drop the old history table so the
+        # row-count check fails and the next `dig` rebuilds it in full.
+        cols = {r[1] for r in db.execute("PRAGMA table_info(history)")}
+        if "source" not in cols:
+            db.execute("DROP TABLE history")
+            db.execute(
+                "CREATE VIRTUAL TABLE history USING fts5("
+                "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
+                "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED, "
+                "source UNINDEXED)")
     except Exception:
         return False
     db.execute("CREATE TABLE IF NOT EXISTS superseded (id TEXT PRIMARY KEY)")
@@ -2223,6 +2234,7 @@ def _history_row(e: dict) -> tuple:
         e.get("ts", ""),
         e.get("body") or "",
         ",".join(e.get("supersedes") or []),
+        str(e.get("source") or ""),
     )
 
 
@@ -2249,8 +2261,8 @@ def _index_append(root: Path, batch: list[dict]) -> None:
         if not _ensure_index_schema(db):
             return
         db.executemany(
-            "INSERT INTO history(id, case_id, etype, author, ts, body, supersedes) "
-            "VALUES (?,?,?,?,?,?,?)",
+            "INSERT INTO history(id, case_id, etype, author, ts, body, "
+            "supersedes, source) VALUES (?,?,?,?,?,?,?,?)",
             [_history_row(e) for e in batch])
         for e in batch:
             _index_record_digest(db, e)
@@ -2282,12 +2294,13 @@ def _rebuild_history(db, entries: list[dict]) -> int:
     db.execute(
         "CREATE VIRTUAL TABLE history USING fts5("
         "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
-        "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED)")
+        "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED, "
+        "source UNINDEXED)")
     db.execute("DELETE FROM superseded")
     db.execute("DELETE FROM hidden_by")
     db.executemany(
-        "INSERT INTO history(id, case_id, etype, author, ts, body, supersedes) "
-        "VALUES (?,?,?,?,?,?,?)",
+        "INSERT INTO history(id, case_id, etype, author, ts, body, "
+        "supersedes, source) VALUES (?,?,?,?,?,?,?,?)",
         [_history_row(e) for e in entries])
     for e in entries:
         _index_record_digest(db, e)
@@ -2337,12 +2350,23 @@ def _query_terms(query: str) -> list[str]:
 _TYPE_WEIGHT = {
     "constraint": 1.6,
     "decision": 1.6,
+    "digest": 1.5,
     "hypothesis": 1.35,
-    "digest": 1.25,
     "question": 1.2,
     "note": 1.05,
     "observation": 1.0,
 }
+
+# Provenance factor. Automatic hook observations (author `system`, source
+# `hook:*`) are the bulk of a mature store and match by term overlap just as
+# well as the decision they surround; they stay findable, but they must not
+# swamp what a person or model deliberately filed.
+_HOOK_NOISE_WEIGHT = 0.25
+
+
+def _is_hook_noise(e: dict) -> bool:
+    return (e.get("author") == "system"
+            or str(e.get("source") or "").startswith("hook:"))
 
 DIG_SNIPPET = 220
 
@@ -2352,9 +2376,10 @@ def rank_matches(candidates: list[dict], query: str) -> list[dict]:
 
     Agents search with keyword soup, so all-terms-AND returns empty exactly
     when search matters most. Score = sum of smoothed IDF over matched terms,
-    times a type weight (constraints/decisions beat observation firehose).
-    Ties break to recency. Returns candidates ordered best-first — tool
-    output is truncated, so the first lines *are* the memory.
+    times a type weight (constraints/decisions beat observation firehose),
+    times the hook-noise factor for automatic hook entries. Ties break to
+    digests first, then recency. Returns candidates ordered best-first —
+    tool output is truncated, so the first lines *are* the memory.
     """
     terms = _query_terms(query)
     if not terms:
@@ -2374,9 +2399,12 @@ def rank_matches(candidates: list[dict], query: str) -> list[dict]:
     for e, i, matched in hits:
         idf_sum = sum(math.log((n + 1) / (df[t] + 1)) + 1.0 for t in matched)
         score = idf_sum * _TYPE_WEIGHT.get(e.get("type"), 1.0)
-        scored.append((-score, -i, e))
-    scored.sort()
-    return [e for _, _, e in scored]
+        if _is_hook_noise(e):
+            score *= _HOOK_NOISE_WEIGHT
+        digest_first = 0 if e.get("type") == "digest" else 1
+        scored.append((-score, digest_first, -i, e))
+    scored.sort(key=lambda t: t[:3])
+    return [t[3] for t in scored]
 
 
 def dig_snippet(body: str, terms: list[str], width: int = DIG_SNIPPET) -> str:
@@ -2470,10 +2498,12 @@ def _log_line_count(root: Path) -> int:
 def _history_rows_to_entries(rows) -> list[dict]:
     out = []
     for r in rows:
-        eid, case, typ, author, ts, body, supersedes = r
+        eid, case, typ, author, ts, body, supersedes, source = r
         e = {"id": eid, "case": case, "type": typ, "author": author,
              "ts": ts, "body": body or "",
              "supersedes": [s for s in (supersedes or "").split(",") if s]}
+        if source:
+            e["source"] = source
         out.append(e)
     return out
 
@@ -2528,7 +2558,7 @@ def _dig_fts_candidates(root: Path, query: str) -> list[dict] | None:
         seen: set[str] = set()
         rows = []
         for sql, args in (
-            ("SELECT id, case_id, etype, author, ts, body, supersedes "
+            ("SELECT id, case_id, etype, author, ts, body, supersedes, source "
              "FROM history WHERE history MATCH ? ORDER BY bm25(history) LIMIT 200",
              (fts,)),
         ):
@@ -2539,7 +2569,7 @@ def _dig_fts_candidates(root: Path, query: str) -> list[dict] | None:
             term_q = f'"{t}" OR {t}*'
             try:
                 rows.extend(db.execute(
-                    "SELECT id, case_id, etype, author, ts, body, supersedes "
+                    "SELECT id, case_id, etype, author, ts, body, supersedes, source "
                     "FROM history WHERE history MATCH ? "
                     "ORDER BY bm25(history) LIMIT 40",
                     (term_q,)).fetchall())
@@ -2665,6 +2695,10 @@ def cmd_dig(args):
               f"{', '.join(terms) or '—'})")
         return
     _print_dig_hits(root, ranked, hidden, terms, args.limit)
+    demoted = sum(1 for e in ranked if _is_hook_noise(e))
+    if demoted:
+        print(f"({demoted} hook observation{'s' if demoted != 1 else ''} "
+              "ranked lower; use recall for abstracts)")
 
 
 # -------- import (SPEC §11.3 / M3)
@@ -4332,24 +4366,46 @@ if __name__ == "__main__":
 HOOK_SWEEP_PY = r'''#!/usr/bin/env python3
 """Stop hook: secretary sweep + liveness pulse (SPEC §13; decision 52694aa9).
 
-First stop of a session blocks so the model diffs its conversation against
-the casefile log and files the gaps. The re-fire (`stop_hook_active` /
-Grok `stopHookActive`) is the final pass: every write of the turn —
-model-filed and sweep-filed — is already in the log, so it emits at most
-ONE honest liveness pulse (synthesis H7): 'casefile +3 since last look
-(2 hypothesis, 1 observation) — 74 total'. The diff is 'since this session
-last looked' via a session-keyed atomic cursor — no per-session write
-provenance is claimed. Suppressed while the tmux UI holds a fresh heartbeat
-lease (it is the liveness surface then); the cursor still advances. Silent
-when idle.
+A stop blocks for a secretary sweep only when the log tail shows something
+worth sweeping since the last sweep marker (see the SWEEP_* policy below);
+otherwise it ends the turn silently, so a quiet turn does not have to file
+a "nothing unrecorded" note. The re-fire (`stop_hook_active` / Grok
+`stopHookActive`) is the final pass: every write of the turn — model-filed
+and sweep-filed — is already in the log, so it emits at most ONE honest
+liveness pulse (synthesis H7): 'casefile +3 since last look (2 hypothesis,
+1 observation) — 74 total'. The diff is 'since this session last looked'
+via a session-keyed atomic cursor — no per-session write provenance is
+claimed. Suppressed while the tmux UI holds a fresh heartbeat lease (it is
+the liveness surface then); the cursor still advances. Silent when idle.
+
+Reads only the local log (the postgres mirror is kept in step by every
+append), and only its tail — never the whole store.
 """
 import json
 import os
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 LEASE_FRESH_S = 10
+
+# Sweep policy — operators may edit. The hook prompts for a sweep when, since
+# the last marker (a note whose body starts with SWEEP_MARKER_PREFIX), at
+# least one holds:
+#   (a) a non-system entry of a type in SWEEP_TYPES was filed, or
+#   (b) at least SWEEP_OBS_THRESHOLD non-system observations were filed, or
+#   (c) the marker is older than SWEEP_STALE_MIN minutes and any non-system
+#       entry was filed.
+# No marker within the tail (never swept, or SWEEP_TAIL_LINES entries since
+# the last one) always prompts. Entries by SWEEP_NOISE_AUTHORS or with a
+# `hook:*` source are automatic and never trigger a sweep on their own.
+SWEEP_TYPES = {"decision", "constraint", "hypothesis", "question", "verification"}
+SWEEP_OBS_THRESHOLD = 20
+SWEEP_STALE_MIN = 30
+SWEEP_TAIL_LINES = 2000
+SWEEP_NOISE_AUTHORS = {"system"}
+SWEEP_MARKER_PREFIX = "secretary sweep"  # same test as lint's UNSWEPT rule
 
 ROOT = Path(__file__).resolve().parents[2]  # <repo>/.casefile/hooks/sweep.py
 
@@ -4401,12 +4457,14 @@ REASON = (
 )
 
 
-def log_lines(root: Path) -> list[dict]:
-    p = root / ".casefile" / "log.jsonl"
-    if not p.exists():
-        return []
+LOG = ROOT / ".casefile" / "log.jsonl"
+
+
+def _parse(lines) -> list[dict]:
     out = []
-    for line in p.read_text().splitlines():
+    for line in lines:
+        if not line.strip():
+            continue
         try:
             out.append(json.loads(line))
         except Exception:
@@ -4414,9 +4472,78 @@ def log_lines(root: Path) -> list[dict]:
     return out
 
 
+def raw_lines(path: Path) -> list[str]:
+    """Every non-empty log line, unparsed (the pulse only decodes its delta)."""
+    if not path.exists():
+        return []
+    return [l for l in path.read_text().splitlines() if l.strip()]
+
+
+def tail_lines(path: Path, n: int) -> list[str]:
+    """The last n lines, read backwards in blocks — not the whole store."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return []
+    chunks = []
+    newlines = 0
+    with path.open("rb") as f:
+        pos = size
+        while pos > 0 and newlines <= n:
+            step = min(65536, pos)
+            pos -= step
+            f.seek(pos)
+            data = f.read(step)
+            chunks.append(data)
+            newlines += data.count(b"\n")
+    text = b"".join(reversed(chunks)).decode("utf-8", errors="replace")
+    return text.splitlines()[-n:]
+
+
+def _is_marker(e: dict) -> bool:
+    return (e.get("type") == "note"
+            and str(e.get("body") or "").lower().startswith(SWEEP_MARKER_PREFIX))
+
+
+def _is_noise(e: dict) -> bool:
+    return (e.get("author") in SWEEP_NOISE_AUTHORS
+            or str(e.get("source") or "").startswith("hook:"))
+
+
+def _parse_ts(ts):
+    try:
+        d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except Exception:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def sweep_due(entries: list[dict], now: datetime | None = None) -> bool:
+    """Apply the SWEEP_* policy to the log tail (oldest first)."""
+    last = None
+    for i, e in enumerate(entries):
+        if _is_marker(e):
+            last = i
+    if last is None:
+        return True
+    since = [e for e in entries[last + 1:] if not _is_noise(e)]
+    if not since:
+        return False
+    if any(e.get("type") in SWEEP_TYPES for e in since):
+        return True
+    if sum(1 for e in since if e.get("type") == "observation") >= SWEEP_OBS_THRESHOLD:
+        return True
+    marker_ts = _parse_ts(entries[last].get("ts"))
+    if marker_ts is not None:
+        now = now or datetime.now(timezone.utc)
+        if (now - marker_ts).total_seconds() > SWEEP_STALE_MIN * 60:
+            return True
+    return False
+
+
 def pulse(root: Path, session_id: str):
-    entries = log_lines(root)
-    total = len(entries)
+    lines = raw_lines(root / ".casefile" / "log.jsonl")
+    total = len(lines)
     cur_dir = root / ".casefile" / "state"
     cur_dir.mkdir(parents=True, exist_ok=True)
     cursor = cur_dir / f"pulse-{session_id or 'default'}"
@@ -4424,7 +4551,7 @@ def pulse(root: Path, session_id: str):
         seen = int(cursor.read_text())
     except Exception:
         seen = total  # first look: establish the baseline, report nothing
-    delta = entries[seen:total] if 0 <= seen <= total else entries
+    delta = _parse(lines[seen:total] if 0 <= seen <= total else lines)
     # advance the cursor first (atomic) — suppressed pulses still count as seen
     tmp = cursor.with_suffix(".tmp")
     tmp.write_text(str(total))
@@ -4456,6 +4583,8 @@ def main():
         return
     if not _active_case(ROOT):
         return  # no active case means nothing to sweep
+    if not sweep_due(_parse(tail_lines(LOG, SWEEP_TAIL_LINES))):
+        return  # nothing worth a sweep since the last marker: end quietly
     print(json.dumps({"decision": "block", "reason": REASON}))
 
 

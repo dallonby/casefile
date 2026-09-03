@@ -1212,6 +1212,56 @@ class CliMemoryTests(CliBase):
         r = self.cli("dig", "capacitor", expect=0)
         self.assertIn("flux capacitor", r.out)
 
+    def test_dig_demotes_hook_noise_and_says_so(self):
+        # newest-first would put the hook line on top; provenance wins
+        self.add("-t", "note", "-a", "claude", "flux capacitor undervolts")
+        for i in range(3):
+            self.add("-t", "observation", "-a", "system", "--source", "hook:post-bash",
+                     f"$ make flux-{i}: capacitor test FAILED")
+        for via in ("fts", "scan"):
+            if via == "scan":
+                (self.dir / ".casefile" / "index.db").unlink(missing_ok=True)
+            r = self.cli("dig", "capacitor", expect=0)
+            lines = [ln for ln in r.out.splitlines() if ln and not ln.startswith(" ")]
+            self.assertIn("flux capacitor undervolts", lines[0], (via, r.out))
+            self.assertTrue(lines[0].split()[1].startswith("note"), (via, r.out))
+            self.assertIn("(3 hook observations ranked lower; use recall for "
+                          "abstracts)", r.out, via)
+
+    def test_dig_no_demotion_line_without_hook_noise(self):
+        self.add("-t", "note", "-a", "claude", "flux capacitor undervolts")
+        r = self.cli("dig", "capacitor", expect=0)
+        self.assertNotIn("ranked lower", r.out)
+
+    def test_dig_fts_candidates_carry_source(self):
+        self.add("-t", "observation", "-a", "claude", "--source", "hook:post-bash",
+                 "capacitor test output")
+        cands = cf._dig_fts_candidates(self.dir, "capacitor")
+        self.assertIsNotNone(cands)
+        self.assertEqual(cands[0].get("source"), "hook:post-bash")
+
+    def test_pre_source_history_index_is_rebuilt(self):
+        import sqlite3
+        self.add("-t", "note", "-a", "claude", "flux capacitor undervolts")
+        p = self.dir / ".casefile" / "index.db"
+        db = sqlite3.connect(p)
+        db.execute("DROP TABLE history")
+        db.execute("CREATE VIRTUAL TABLE history USING fts5("
+                   "id UNINDEXED, case_id UNINDEXED, etype UNINDEXED, "
+                   "author UNINDEXED, ts UNINDEXED, body, supersedes UNINDEXED)")
+        db.commit()
+        db.close()
+        self.add("-t", "note", "-a", "claude", "second capacitor note")
+        r = self.cli("dig", "capacitor", expect=0)
+        self.assertIn("flux capacitor", r.out)
+        self.assertIn("second capacitor", r.out)
+        db = sqlite3.connect(p)
+        cols = {row[1] for row in db.execute("PRAGMA table_info(history)")}
+        n = db.execute("SELECT count(*) FROM history").fetchone()[0]
+        db.close()
+        self.assertIn("source", cols)
+        self.assertEqual(n, len(self.log_entries()))
+
 
 class RankMatchTests(unittest.TestCase):
     """Pure ranking: IDF + type weight, independent of CLI load cost."""
@@ -1234,6 +1284,39 @@ class RankMatchTests(unittest.TestCase):
                 body="disable backrunner configurations older than 90 days")
         ranked = cf.rank_matches([obs, con], "backrunner disable")
         self.assertEqual(ranked[0]["id"], "c1")
+
+    def test_user_decision_outranks_system_hook_observation(self):
+        # equal term overlap: provenance decides — the hook firehose is
+        # 90%+ of a mature store and must not bury what people filed
+        body = "disable backrunner configurations older than 90 days"
+        hook = E("h1", "observation", author="system", body=body,
+                 source="hook:post-bash")
+        dec = E("d1", "decision", author="user", body=body)
+        ranked = cf.rank_matches([dec, hook], "backrunner disable")
+        self.assertEqual([e["id"] for e in ranked], ["d1", "h1"])
+
+    def test_hook_source_demoted_even_with_model_author(self):
+        body = "flux capacitor undervolts under load"
+        hook = E("h1", "observation", author="claude", body=body,
+                 source="hook:post-bash")
+        obs = E("o1", "observation", author="claude", body=body,
+                source="manual")
+        # o1 is older (earlier index) — recency alone would put h1 first
+        ranked = cf.rank_matches([obs, hook], "capacitor")
+        self.assertEqual(ranked[0]["id"], "o1")
+        self.assertTrue(cf._is_hook_noise(hook))
+        self.assertFalse(cf._is_hook_noise(obs))
+
+    def test_digest_outranks_plain_observation(self):
+        body = "the flux capacitor undervolts under load"
+        obs = E("o1", "observation", author="codex", body=body, source="manual")
+        dig = E("g1", "digest", author="claude", body=body, kind="abstract")
+        ranked = cf.rank_matches([dig, obs], "capacitor undervolts")
+        self.assertEqual(ranked[0]["id"], "g1")
+        # durable types sit clearly above the raw stream
+        for t in ("decision", "constraint", "hypothesis", "digest"):
+            self.assertGreater(cf._TYPE_WEIGHT[t], cf._TYPE_WEIGHT["note"])
+            self.assertGreater(cf._TYPE_WEIGHT[t], cf._TYPE_WEIGHT["observation"])
 
     def test_snippet_windows_around_query_term(self):
         body = ("At 2026-08-18T21:03:41Z the exact 90-day cutoff was Base "
@@ -1476,6 +1559,124 @@ class CliTalkTests(CliBase):
             input="don't add any dependencies\nexit\n")
         self.assertEqual(p.returncode, 0, p.stderr)
         self.assertIn("recorded: constraint", p.stdout)  # echo-back convention
+
+
+class SweepPolicyTests(CliBase):
+    """The Stop hook prompts for a secretary sweep only when the log tail
+    shows something to sweep since the last marker; a quiet turn ends
+    silently instead of forcing a 'nothing unrecorded' note."""
+
+    def setUp(self):
+        super().setUp()
+        self.cli("hooks", "install", "all", expect=0)
+        self.sweep = self.dir / ".casefile" / "hooks" / "sweep.py"
+
+    def stop(self, *argv):
+        p = subprocess.run([sys.executable, str(self.sweep), *argv],
+                           cwd=self.dir, capture_output=True, text=True,
+                           input=json.dumps({"session_id": "s1",
+                                             "stop_hook_active": False}))
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout.strip()
+
+    def assert_prompts(self, out, author="claude"):
+        d = json.loads(out)
+        self.assertEqual(d["decision"], "block")
+        self.assertIn("Secretary sweep", d["reason"])
+        self.assertIn(f"-a {author}", d["reason"])
+
+    def marker(self, minutes_ago=0):
+        if not minutes_ago:
+            return self.add("-t", "note", "-a", "claude",
+                            "secretary sweep: nothing unrecorded")
+        # backdated marker: written straight to the log (ts is the CLI's)
+        from datetime import datetime, timedelta, timezone
+        ts = (datetime.now(timezone.utc) - timedelta(minutes=minutes_ago)).isoformat()
+        e = {"id": f"m{minutes_ago:07d}", "ts": ts, "case": "test-case",
+             "type": "note", "author": "claude",
+             "body": "secretary sweep: nothing unrecorded", "refs": []}
+        with (self.dir / ".casefile" / "log.jsonl").open("a") as f:
+            f.write(json.dumps(e) + "\n")
+
+    def test_no_marker_prompts_even_on_empty_store(self):
+        self.assert_prompts(self.stop())
+        self.assert_prompts(self.stop("codex"), author="codex")
+
+    def test_marker_with_nothing_new_is_silent(self):
+        self.marker()
+        self.assertEqual(self.stop(), "")
+        self.assertEqual(self.stop("codex"), "")
+
+    def test_user_decision_after_marker_prompts(self):
+        self.marker()
+        self.assertEqual(self.stop(), "")
+        self.add("-t", "decision", "-a", "user", "ship it on Friday")
+        self.assert_prompts(self.stop())
+        self.assert_prompts(self.stop("codex"), author="codex")
+        self.marker()  # the sweep marker clears it again
+        self.assertEqual(self.stop(), "")
+
+    def test_each_epistemic_type_prompts(self):
+        for t in ("constraint", "hypothesis", "question", "verification"):
+            self.marker()
+            self.assertEqual(self.stop(), "", t)
+            if t == "verification":
+                h = self.add("-t", "hypothesis", "-a", "claude", "h for v")
+                o = self.add("-t", "observation", "-a", "codex", "--source",
+                             "manual", "ground truth for v")
+                self.marker()
+                self.cli("verify", h, o, "-a", "codex", expect=0)
+            else:
+                self.add("-t", t, "-a", "claude", f"some {t}")
+            self.assert_prompts(self.stop())
+
+    def test_twenty_model_observations_prompt(self):
+        self.marker()
+        for i in range(19):
+            self.add("-t", "observation", "-a", "claude", "--source", "manual",
+                     f"saw thing {i}")
+        self.assertEqual(self.stop(), "")
+        self.add("-t", "observation", "-a", "claude", "--source", "manual", "saw thing 19")
+        self.assert_prompts(self.stop())
+
+    def test_hook_observations_alone_never_prompt(self):
+        self.marker()
+        for i in range(40):
+            self.add("-t", "observation", "-a", "system", "--source", "hook:post-bash",
+                     f"$ make check {i}: FAILED")
+        self.assertEqual(self.stop(), "")
+        self.assertEqual(self.stop("codex"), "")
+        # a plain note by the model is not enough while the marker is fresh
+        self.add("-t", "note", "-a", "claude", "bookkeeping")
+        self.assertEqual(self.stop(), "")
+
+    def test_stale_marker_prompts_only_with_model_activity(self):
+        self.marker(minutes_ago=45)
+        self.assertEqual(self.stop(), "")
+        self.add("-t", "observation", "-a", "system", "--source", "hook:post-bash",
+                 "$ ls: ok")
+        self.assertEqual(self.stop(), "")  # hook noise does not age a session
+        self.add("-t", "note", "-a", "claude", "bookkeeping")
+        self.assert_prompts(self.stop())
+
+    def test_policy_constants_are_editable_at_top(self):
+        head = self.sweep.read_text()[:2500]
+        for name in ("SWEEP_TYPES", "SWEEP_OBS_THRESHOLD", "SWEEP_STALE_MIN",
+                     "SWEEP_TAIL_LINES"):
+            self.assertIn(name, head)
+
+    def test_tail_reader_matches_full_read(self):
+        # the hook only reads the tail; make sure the block-wise reader
+        # returns exactly the last N lines on a multi-block file
+        spec = importlib.util.spec_from_file_location("sweep_hook", self.sweep)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        p = self.dir / "big.jsonl"
+        lines = [json.dumps({"i": i, "pad": "x" * 200}) for i in range(1500)]
+        p.write_text("\n".join(lines) + "\n")
+        self.assertEqual(mod.tail_lines(p, 700), lines[-700:])
+        self.assertEqual(mod.tail_lines(p, 5000), lines)
+        self.assertEqual(mod.tail_lines(self.dir / "missing.jsonl", 10), [])
 
 
 class LivenessPulseTests(CliBase):

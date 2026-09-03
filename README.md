@@ -197,8 +197,10 @@ tamper-evident by construction.
   disputes, orphan decisions, expired sources, and incomplete claim cards
   once a claim becomes ranking-driving.
 - **Hooks** — a Stop-hook "secretary sweep" diffs each AI session against
-  the log and files what the conversation decided but never recorded; a
-  one-line liveness pulse shows what changed since you last looked.
+  the log and files what the conversation decided but never recorded (it
+  only asks when something worth sweeping was filed since the last sweep;
+  quiet turns end silently); a one-line liveness pulse shows what changed
+  since you last looked.
 - **`casefile spitball`** — a two-model deliberation driver (proposer vs
   critic) that ferries turns between live CLIs (**Claude Code, Codex, Grok**);
   both models file claims and disputes into the same log, and convergence is

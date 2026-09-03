@@ -417,7 +417,9 @@ system laundering its own conclusion.
 no ceremony), `add`, `endorse`, `dispute`, `resolve`, `verify`, `revoke`,
 `digest`, `finalize-digest`, `show [entry]` (full entry by id, or compiled
 case view), `resume-context [--blind]`, `recheck`, `recall`, `dig
-<query>` (history FTS + IDF/type weight, relevance order, collapse
+<query>` (history FTS + IDF/type weight, hook-noise demotion — automatic
+`system`/`hook:*` entries rank below what people and models filed, digests
+first among ties — relevance order, collapse
 near-duplicate observations, expand exact ids; then `show <id>` for the
 full body; JSONL scan is the stale-cache fallback), `lint`, `log`,
 `reindex`, `hooks install <vendor>`, `ui`, `spitball`,
@@ -607,7 +609,13 @@ reply`, `interject(handle, msg)` (mid-request if supported), `cost(handle)`,
   or ruled out here that isn't recorded?" — and file the gaps. Closes the
   biggest leak: the decision made conversationally in window 4 that nobody
   wrote down. The sweep files a `note` marker; lint's UNSWEPT rule keys off
-  it.
+  it. The hook only prompts when the log tail shows something to sweep
+  since the last marker — a non-system decision/constraint/hypothesis/
+  question/verification, twenty non-system observations, or any
+  non-system entry once the marker is over thirty minutes old (constants
+  at the top of the installed `sweep.py`); a quiet turn ends silently,
+  with no marker required. Automatic `system`/`hook:*` entries never
+  trigger a sweep on their own.
 - **The skill file** (`SKILL.md` dropped where Claude Code discovers it),
   teaching every session in the repo: read resume-context (and run
   `recheck`) on start; address the mailbox; file hypotheses/decisions as it
