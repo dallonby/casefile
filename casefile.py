@@ -356,14 +356,14 @@ Postgres URL format (libpq / SQLAlchemy style):
   postgresql://USER:PASSWORD@HOST:PORT/DATABASE
 
 Examples:
-  postgres://rarbi:rarbi@ashburn2.a-star.io/casefile
-  postgresql://rarbi:rarbi@ashburn2.a-star.io:5432/casefile
-  postgres://rarbi:rarbi@localhost/casefile          # only when on ashburn2 itself
+  postgres://USER:PASSWORD@db.example.internal/casefile
+  postgresql://USER:PASSWORD@db.example.internal:5432/casefile
+  postgres://USER:PASSWORD@localhost/casefile          # only when on the database host itself
 
 Rules:
   • scheme must be postgres:// or postgresql://
   • USER and HOST are required
-  • DATABASE path required (e.g. /rarbi) — bare host with no db is rejected
+  • DATABASE path required (e.g. /casefile) — bare host with no db is rejected
   • PORT optional (default 5432)
   • special characters in PASSWORD must be URL-encoded
     (e.g. @ → %40, / → %2F, # → %23)
@@ -406,7 +406,7 @@ def validate_postgres_url(url: str) -> tuple[bool, str]:
             f"scheme {scheme!r} not allowed — use postgres:// or postgresql://"
         )
     if not p.hostname:
-        return False, "missing host (e.g. ashburn2.a-star.io)"
+        return False, "missing host (e.g. db.example.internal)"
     if not p.username:
         return False, "missing user (e.g. postgres://USER:pass@host/db)"
     # path is /dbname — require non-empty db name

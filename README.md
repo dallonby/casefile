@@ -46,7 +46,7 @@ Or a one-line gitignored `.casefile/author`. Process env still wins if set.
 ### Persistence (local default, optional Postgres)
 
 Default is **local** `.casefile/log.jsonl` (rides in git). For multi-user shared
-history on the VPN (e.g. ashburn2):
+history on a private network:
 
 **Interactive (recommended):**
 
@@ -60,14 +60,14 @@ Or non-interactive:
 
 ```bash
 casefile persistence enable \
-  --url 'postgres://rarbi:rarbi@ashburn2.a-star.io/casefile'
+  --url 'postgres://USER:PASSWORD@db.example.internal/casefile'
 ```
 
-Use the dedicated **`casefile`** database (not the app `rarbi` DB). URL shape:
+Use a dedicated **`casefile`** database (not an application DB). URL shape:
 `postgres://USER:PASSWORD@HOST[:PORT]/DATABASE` (or `postgresql://…`).
 The command prints format hints on bad input.
 
-Namespace defaults to the **store folder name** (e.g. `q5-dynamic-fee`).
+Namespace defaults to the **store folder name** (e.g. `my-project`).
 Override with `CASEFILE_PG_NAMESPACE` only if needed.
 
 First enable runs a reconcile (local → PG, dedupe by id). Local JSONL stays
