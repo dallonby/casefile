@@ -115,6 +115,9 @@ ENTRY_TYPES = {
     "revocation", "note",
 }
 DIGEST_KINDS = {"mechanical", "candidate", "judgment", "abstract"}
+# Like-for-like replacement via `add --supersede`: the new entry retires
+# its predecessor from every live view (grade `superseded`).
+SUPERSEDABLE_TYPES = ("hypothesis", "constraint", "decision")
 CLAIM_MODES = {
     "association", "causal-inference", "diagnosis", "forecast",
     "mechanistic", "normative-premise", "recommendation",
@@ -1042,9 +1045,11 @@ def superseded_ids(entries: list[dict]) -> set[str]:
         # Final digests supersede at checkpoints (§6). A candidate is inert
         # until an independent reviewer endorses it and `finalize-digest`
         # promotes the exact candidate. A corrected hypothesis
-        # supersedes the claim it re-files, retiring its stale check with it
+        # supersedes the claim it re-files, retiring its stale check with it;
+        # a replacement constraint or decision retires its predecessor the
+        # same way (a plan revision, not a retraction)
         if (e["type"] == "digest" and e.get("kind") != "candidate") \
-                or e["type"] in ("hypothesis", "constraint"):
+                or e["type"] in SUPERSEDABLE_TYPES:
             s.update(e.get("supersedes", []))
             # a newer abstract supersedes older abstracts of the same case
     # abstracts: only the latest per case is live
@@ -1140,6 +1145,7 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
     revoked = revoked_ids(entries)
     fulfilled = fulfilled_ids(entries)
     verified = verified_hypotheses(entries)
+    superseded = superseded_ids(entries)
 
     endorsements: dict[str, set[str]] = {}
     for e in entries:
@@ -1172,6 +1178,8 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
         elif t in ("decision", "constraint"):
             if eid in revoked:
                 grades[eid] = "revoked"
+            elif eid in superseded:
+                grades[eid] = "superseded"
             elif eid in fulfilled:
                 grades[eid] = "fulfilled"
             elif normalize_author(e["author"]) == "user":
@@ -1198,6 +1206,7 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
     fulfilled = fulfilled_ids(view)
     resolved = resolved_ref_ids(view)
     protected_obs = verification_protected_obs(view)
+    replaced = superseded_ids(view)  # a replaced requirement is dismissed
     out = []
     for sid in supersedes:
         e = by_id.get(sid)
@@ -1205,11 +1214,12 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
             out.append(f"{sid}: unknown entry")
             continue
         t = e["type"]
-        if t == "constraint" and sid not in revoked:
+        if t == "constraint" and sid not in revoked and sid not in replaced:
             out.append(f"{sid}: unrevoked constraint")
-        elif t == "decision" and sid not in revoked and sid not in fulfilled:
-            out.append(f"{sid}: undismissed decision (revoke or resolve "
-                       f"--outcome fulfilled first)")
+        elif t == "decision" and sid not in revoked and sid not in fulfilled \
+                and sid not in replaced:
+            out.append(f"{sid}: undismissed decision (revoke, `done`, or "
+                       f"--supersede it first)")
         elif t in ("dispute", "question") and sid not in resolved:
             out.append(f"{sid}: open {t}")
         elif t == "observation" and sid in protected_obs:
@@ -1223,6 +1233,7 @@ def historical_digest_invariant_problems(entries: list[dict]) -> list[str]:
     revoked: set[str] = set()
     fulfilled: set[str] = set()
     resolved: set[str] = set()
+    replaced: set[str] = set()
     verification_refs: set[str] = set()
     protected_obs: set[str] = set()
     out: list[str] = []
@@ -1235,13 +1246,14 @@ def historical_digest_invariant_problems(entries: list[dict]) -> list[str]:
                 violation = None
                 if not target:
                     violation = f"{sid}: unknown entry"
-                elif target["type"] == "constraint" and sid not in revoked:
+                elif target["type"] == "constraint" and sid not in revoked \
+                        and sid not in replaced:
                     violation = f"{sid}: unrevoked constraint"
-                elif target["type"] == "decision" \
-                        and sid not in revoked and sid not in fulfilled:
+                elif target["type"] == "decision" and sid not in revoked \
+                        and sid not in fulfilled and sid not in replaced:
                     violation = (
-                        f"{sid}: undismissed decision (revoke or resolve "
-                        f"--outcome fulfilled first)"
+                        f"{sid}: undismissed decision (revoke, `done`, or "
+                        f"--supersede it first)"
                     )
                 elif target["type"] in ("dispute", "question") \
                         and sid not in resolved:
@@ -1257,6 +1269,9 @@ def historical_digest_invariant_problems(entries: list[dict]) -> list[str]:
 
         by_id[e["id"]] = e
         refs = e.get("refs", [])
+        if e["type"] in SUPERSEDABLE_TYPES or (
+                e["type"] == "digest" and e.get("kind") != "candidate"):
+            replaced.update(e.get("supersedes") or [])
         if e["type"] == "revocation":
             revoked.update(refs)
         elif e["type"] == "resolution":
@@ -1797,14 +1812,18 @@ def cmd_add(args):
             if value:
                 extra[key] = value
     if args.supersedes:
-        # Like-for-like correction: a hypothesis or constraint re-filed with a
-        # fixed body/check retires its predecessor in one step. Constraints are
-        # authority-sensitive: another model cannot silently replace one.
-        if args.type not in ("hypothesis", "constraint"):
-            die("--supersedes on add is for hypotheses/constraints; decisions "
-                "revoke, digests supersede everything else")
+        # Like-for-like correction: a hypothesis, constraint or decision
+        # re-filed with a fixed body retires its predecessor in one step (a
+        # plan revision, not a retraction — `revoke` stays for retraction).
+        # Constraints and decisions are authority-sensitive: the same author,
+        # or the user overriding anyone; another model cannot silently
+        # replace one.
+        if args.type not in SUPERSEDABLE_TYPES:
+            die("--supersedes on add is for hypotheses/constraints/decisions; "
+                "digests supersede everything else")
         by_id = {e["id"]: e for e in entries}
         grades = compute_grades(entries)
+        me = normalize_author(args.author)
         for t in args.supersedes:
             target = by_id.get(t)
             if not target:
@@ -1814,13 +1833,13 @@ def cmd_add(args):
             if args.type == "hypothesis" and grades.get(t) == "verified":
                 die(f"{t} is verified against ground truth — dispute it "
                     "rather than silently replacing it")
-            if args.type == "constraint" and normalize_author(
-                    target["author"]) != normalize_author(args.author):
+            if args.type in ("constraint", "decision") and me != "user" \
+                    and normalize_author(target["author"]) != me:
                 die(f"{t} was authored by {target['author']}; only that "
-                    "authority may replace it")
-        if args.type == "constraint":
+                    "authority (or the user) may replace it")
+        if args.type in ("constraint", "decision"):
             if not args.rationale:
-                die("constraint replacement requires --rationale")
+                die(f"{args.type} replacement requires --rationale")
             extra["supersession_reason"] = args.rationale
         extra["supersedes"] = args.supersedes
     if args.type in ("question", "note") and args.to:
@@ -2479,9 +2498,17 @@ def _history_row(e: dict) -> tuple:
 
 
 def _index_record_digest(db, e: dict) -> None:
-    if e.get("type") != "digest" or e.get("kind") == "candidate":
+    """Side tables: who hides whom. Digests (not candidates) and like-for-like
+    replacements (hypothesis/constraint/decision `supersedes`) both retire
+    entries, so `dig`/`show` can tag them without parsing the log."""
+    if e.get("type") == "digest":
+        if e.get("kind") == "candidate":
+            return
+        kind = e.get("kind") or ""
+    elif e.get("type") in SUPERSEDABLE_TYPES:
+        kind = e["type"]
+    else:
         return
-    kind = e.get("kind") or ""
     preview = (e.get("body") or "")[:80]
     for sid in e.get("supersedes") or []:
         db.execute("INSERT OR IGNORE INTO superseded(id) VALUES (?)", (sid,))
@@ -3023,6 +3050,7 @@ PHRASE = {
     "asserted": "asserted, not user-confirmed",
     "refuted": "refuted",
     "fulfilled": "fulfilled — shipped and observed; digestible",
+    "superseded": "superseded by a later entry",
 }
 
 
@@ -3102,7 +3130,7 @@ _SHOW_EXTRA_KEYS = (
     "published_at", "accessed_at", "effective_at", "expires_at",
     "locator", "jurisdiction", "check", "claim_mode", "mechanism",
     "comparator", "analysis_layer", "falsifier", "counterfactual",
-    "horizon", "testability", "to", "kind",
+    "horizon", "testability", "to", "kind", "supersession_reason", "outcome",
 )
 
 
@@ -3173,6 +3201,7 @@ def cmd_show_entry(args):
     hidden: set[str] = set()
     if persistence_mode() != "postgres":
         e = _scan_entry_by_id(root, eid)
+        hidden = _index_hidden(root)  # side table: no full-log parse
     if e is None:
         root, entries, meta = require_root()
         e = next((x for x in entries if x["id"] == eid), None)
@@ -3181,6 +3210,8 @@ def cmd_show_entry(args):
         grades = compute_grades(entries)
         hidden = superseded_ids(entries)
     grade = grades.get(e["id"], "") or _cheap_grade(e)
+    if not grades and e["id"] in hidden and e.get("type") in ("decision", "constraint"):
+        grade = "superseded"
     print(format_entry(e, grade, e["id"] in hidden))
 
 
@@ -3781,6 +3812,7 @@ def compute_status(root, entries, meta) -> dict:
     qs, ds = open_items([e for e in entries if e["id"] not in hidden])
     mailbox = [q for q in qs if q.get("to") == "user"]
     lifecycle = case_lifecycle(entries, meta)
+    grades = compute_grades(entries)
     cases = {}
     for cid, info in meta["cases"].items():
         ce = [e for e in entries if e["case"] == cid]
@@ -3791,7 +3823,8 @@ def compute_status(root, entries, meta) -> dict:
                       "state": st.get("state", "active"),
                       "signals": st.get("signals", []),
                       "open_disputes": sum(1 for d in ds if d["case"] == cid),
-                      "open_questions": sum(1 for q in qs if q["case"] == cid)}
+                      "open_questions": sum(1 for q in qs if q["case"] == cid),
+                      "closure": closure_counts(entries, cid, grades)}
     return {"active_case": load_active(root, meta),
             "cases": cases,
             "mailbox": [{"id": q["id"], "case": q["case"], "body": q["body"]}
@@ -3831,6 +3864,7 @@ def cmd_status(args):
         print(f" {mark} {cid}: {c['title']} — {c['entries']} entries, "
               f"{c['open_disputes']} open disputes, {c['open_questions']} open questions"
               f" [{c['state']}]")
+        print(f"      {closure_text(c['closure'])}")
     if st["mailbox"]:
         print(f"mailbox ({len(st['mailbox'])} waiting on you):")
         for q in st["mailbox"]:
@@ -4340,6 +4374,7 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
     n_sub = sum(1 for e in entries if e["case"] == case and substantive(e))
     where.append(f"entries: {n_case} ({n_sub} substantive; the rest hook/recheck/"
                  "journal/sweep rows)")
+    where.append(closure_text(closure_counts(entries, case, grades)))
     peers = author_liveness(entries, case)
     if peers:
         where.append("authors last filed: " + "; ".join(peers))
@@ -4695,6 +4730,254 @@ def cmd_since(args):
               f"{headline(e['body'], 120)}")
     if len(d["entries"]) > len(rows):
         print(f"  … {len(d['entries']) - len(rows)} more (--limit N)")
+
+
+# -------- threads and closure (computed from the refs graph, never stored)
+
+THREAD_DEPTH = 4
+THREAD_LIMIT = 80
+_THREAD_OPAQUE_KINDS = ("mechanical", "abstract")  # digests not walked through
+
+
+def closure_counts(entries: list[dict], case: str, grades: dict) -> dict:
+    """Live vs closed decisions/constraints for a case (all entries, hidden
+    included — a superseded decision is closed, not gone)."""
+    out = {"decisions": 0, "constraints": 0, "fulfilled": 0, "revoked": 0,
+           "superseded": 0}
+    for e in entries:
+        if e["case"] != case or e["type"] not in ("decision", "constraint"):
+            continue
+        g = grades.get(e["id"], "")
+        if g in ("fulfilled", "revoked", "superseded"):
+            out[g] += 1
+        else:
+            out[e["type"] + "s"] += 1
+    return out
+
+
+def closure_text(c: dict) -> str:
+    return (f"live: {c['decisions']} decisions, {c['constraints']} constraints; "
+            f"closed: {c['fulfilled']} fulfilled, {c['superseded']} superseded, "
+            f"{c['revoked']} revoked")
+
+
+def cmd_done(args):
+    """Mark a decision fulfilled: sugar for `resolve --outcome fulfilled`
+    that links the evidence when it is an entry id."""
+    root, entries, meta = require_root()
+    t = _target(entries, args.entry)
+    if t["type"] != "decision":
+        die(f"{args.entry} is a {t['type']}; `done` closes decisions "
+            "(questions/disputes: `resolve`)")
+    by_id = {e["id"]: e for e in entries}
+    refs = [args.entry]
+    evidence = (args.evidence or "").strip()
+    reason = (args.reason or "").strip()
+    if evidence and re.fullmatch(r"[0-9a-f]{8}", evidence) and evidence in by_id:
+        ev = by_id[evidence]
+        if ev["case"] != t["case"]:
+            die(f"evidence {evidence} is in another case")
+        refs.append(evidence)
+        reason = reason or f"done — evidence {evidence}: {headline(ev['body'], 100)}"
+    elif evidence:
+        reason = reason or f"done — {evidence}"
+    if not reason:
+        reason = "done"
+    e = make_entry(entries, t["case"], "resolution", args.author, reason,
+                   refs=refs, outcome="fulfilled")
+    append_entry(root, e)
+    save_active(root, t["case"])
+    print(e["id"])
+
+
+def thread_nodes(entries: list[dict], seeds: list[str],
+                 depth: int = THREAD_DEPTH, limit: int = THREAD_LIMIT
+                 ) -> tuple[list[dict], int]:
+    """Entries reachable from the seeds over refs/supersedes in both
+    directions, breadth-first to `depth`, log order. Mechanical/abstract
+    digests are never traversed (they would pull in whole spans). Returns
+    (nodes, truncated_count)."""
+    by_id = {e["id"]: e for e in entries}
+    fwd: dict[str, list[str]] = {}
+    back: dict[str, list[str]] = {}
+    for e in entries:
+        if e["type"] == "digest" and e.get("kind") in _THREAD_OPAQUE_KINDS:
+            continue
+        for r in list(e.get("refs") or []) + list(e.get("supersedes") or []):
+            if r in by_id:
+                fwd.setdefault(e["id"], []).append(r)
+                back.setdefault(r, []).append(e["id"])
+    seen: dict[str, int] = {}
+    frontier = [s for s in seeds if s in by_id]
+    for s in frontier:
+        seen[s] = 0
+    d = 0
+    truncated = 0
+    while frontier and d < depth:
+        nxt = []
+        for nid in frontier:
+            for m in fwd.get(nid, []) + back.get(nid, []):
+                if m in seen:
+                    continue
+                e = by_id[m]
+                if e["type"] == "digest" and e.get("kind") in _THREAD_OPAQUE_KINDS:
+                    continue
+                if len(seen) >= limit:
+                    truncated += 1
+                    continue
+                seen[m] = d + 1
+                nxt.append(m)
+        frontier = nxt
+        d += 1
+    order = {e["id"]: i for i, e in enumerate(entries)}
+    nodes = sorted((by_id[i] for i in seen), key=lambda e: order[e["id"]])
+    return nodes, truncated
+
+
+def entry_state(e: dict, grades: dict, hidden: set[str],
+                outcomes: dict[str, str]) -> str:
+    t = e["type"]
+    if t in ("hypothesis", "decision", "constraint"):
+        g = grades.get(e["id"], "")
+        return "live" if g in ("stated", "asserted") else g
+    if t in ("question", "dispute"):
+        return outcomes.get(e["id"], "open")
+    if t == "digest":
+        return "superseded" if e["id"] in hidden else "live"
+    if t == "observation":
+        return "ground-truth"
+    if t == "resolution":
+        return str(e.get("outcome") or "")
+    return ""
+
+
+def thread_state(entries: list[dict], nodes: list[dict]) -> list[str]:
+    """The computed STATE footer for a set of thread nodes."""
+    grades = compute_grades(entries)
+    hidden = superseded_ids(entries)
+    by_id = {e["id"]: e for e in entries}
+    outcomes: dict[str, str] = {}
+    for e in entries:
+        if e["type"] == "resolution":
+            for r in e.get("refs", []):
+                outcomes[r] = str(e.get("outcome") or "resolved")
+    replaced_by: dict[str, str] = {}
+    revoked_by: dict[str, str] = {}
+    upheld_by: dict[str, str] = {}
+    for e in entries:
+        for s in e.get("supersedes") or []:
+            if e["type"] in SUPERSEDABLE_TYPES:
+                replaced_by[s] = e["id"]
+        if e["type"] == "revocation":
+            for r in e.get("refs", []):
+                revoked_by[r] = e["id"]
+        if e["type"] == "dispute" and outcomes.get(e["id"]) == "upheld":
+            for r in e.get("refs", []):
+                upheld_by[r] = e["id"]
+    ids = {e["id"] for e in nodes}
+
+    def line(e: dict, width: int = 110) -> str:
+        return f"`{e['id']}` {headline(e['body'], width)} ({e['author']}, {e['ts'][:10]})"
+
+    out = ["STATE:"]
+    decs = [e for e in nodes if e["type"] == "decision"
+            and grades.get(e["id"]) in ("stated", "asserted")]
+    out.append("  latest live decision: " + (line(decs[-1]) if decs else "none"))
+    if len(decs) > 1:
+        out.append(f"    (+{len(decs) - 1} older live decision(s) in thread)")
+    cons = [e for e in nodes if e["type"] == "constraint"
+            and grades.get(e["id"]) in ("stated", "asserted")]
+    out.append(f"  live constraints: {len(cons)}"
+               + (f" — newest {line(cons[-1], 90)}" if cons else ""))
+    hyps = [e for e in nodes if e["type"] == "hypothesis"
+            and grades.get(e["id"]) != "refuted"]
+    for e in hyps[::-1][:3]:
+        out.append(f"  hypothesis [{grades.get(e['id'])}]: {line(e, 90)}")
+    qs = [e for e in nodes if e["type"] == "question" and e["id"] not in outcomes]
+    out.append("  open questions: " + ("; ".join(line(q, 80) for q in qs)
+                                       if qs else "none"))
+    ds = [e for e in nodes if e["type"] == "dispute" and e["id"] not in outcomes]
+    if ds:
+        out.append(f"  open disputes: {len(ds)} — newest {line(ds[-1], 80)}")
+    ruled = []
+    for e in nodes:
+        eid = e["id"]
+        if e["type"] == "hypothesis" and grades.get(eid) == "refuted":
+            ruled.append(f"{line(e, 80)} refuted via dispute `{upheld_by.get(eid, '?')}`")
+        elif e["type"] in ("decision", "constraint"):
+            g = grades.get(eid)
+            if g == "revoked":
+                ruled.append(f"{line(e, 80)} revoked by `{revoked_by.get(eid, '?')}`")
+            elif g == "superseded":
+                by = replaced_by.get(eid, "?")
+                ruled.append(f"{line(e, 80)} superseded by `{by}`"
+                             + ("" if by in ids or by == "?" else " (outside thread)"))
+    out.append("  ruled out: " + ("; ".join(ruled) if ruled else "nothing"))
+    vers = [e for e in nodes if e["type"] == "verification"]
+    if vers:
+        v = vers[-1]
+        h = [r for r in v.get("refs", []) if by_id.get(r, {}).get("type") == "hypothesis"]
+        o = [r for r in v.get("refs", []) if by_id.get(r, {}).get("type") == "observation"]
+        out.append(f"  last verification: `{v['id']}` verified "
+                   f"{', '.join(f'`{x}`' for x in h) or '?'} by "
+                   f"{', '.join(f'`{x}`' for x in o) or '?'} ({v['ts'][:10]})")
+    else:
+        out.append("  last verification: none")
+    obs = [e for e in nodes if e["type"] == "observation"]
+    out.append("  last observation: " + (line(obs[-1]) if obs else "none"))
+    done = [e for e in nodes if e["type"] == "decision"
+            and grades.get(e["id"]) == "fulfilled"]
+    if done:
+        out.append(f"  fulfilled decisions: {len(done)} — latest {line(done[-1], 80)}")
+    return out
+
+
+def _thread_seeds(entries: list[dict], case: str, query: str) -> list[str]:
+    by_id = {e["id"]: e for e in entries}
+    if re.fullmatch(r"[0-9a-f]{8}", query) and query in by_id:
+        return [query]
+    cands = [e for e in entries if e["case"] == case and substantive(e)
+             and not (e["type"] == "digest" and e.get("kind") in _THREAD_OPAQUE_KINDS)]
+    return [e["id"] for e in rank_matches(cands, query)[:3]]
+
+
+def _thread(args):
+    root, entries, meta = require_root()
+    case = resolve_case(root, meta, getattr(args, "case", None))
+    seeds = _thread_seeds(entries, case, args.query.strip())
+    if not seeds:
+        die(f"no entry or search hit for {args.query!r} in case {case}")
+    nodes, truncated = thread_nodes(entries, seeds, depth=args.depth,
+                                    limit=args.limit)
+    return entries, seeds, nodes, truncated
+
+
+def cmd_thread(args):
+    entries, seeds, nodes, truncated = _thread(args)
+    grades = compute_grades(entries)
+    hidden = superseded_ids(entries)
+    outcomes = {r: str(e.get("outcome") or "resolved") for e in entries
+                if e["type"] == "resolution" for r in e.get("refs", [])}
+    ids = {e["id"] for e in nodes}
+    print(f"THREAD from {', '.join(f'`{s}`' for s in seeds)}: {len(nodes)} entries"
+          + (f" (+{truncated} beyond --limit)" if truncated else ""))
+    for e in nodes:
+        links = [r for r in list(e.get("refs") or []) + list(e.get("supersedes") or [])
+                 if r in ids]
+        mark = "*" if e["id"] in seeds else " "
+        state = entry_state(e, grades, hidden, outcomes)
+        print(f"{mark}{e['id']}  {e['type']:<12} {e['author']:<8} {e['ts'][:10]}  "
+              f"[{state}]  {headline(e['body'], 100)}"
+              + (f"  -> {','.join(links)}" if links else ""))
+    print()
+    print("\n".join(thread_state(entries, nodes)))
+
+
+def cmd_where(args):
+    entries, seeds, nodes, truncated = _thread(args)
+    print(f"thread from {', '.join(f'`{s}`' for s in seeds)}: {len(nodes)} entries "
+          f"(`casefile thread {args.query.strip()[:40]!r}` for the chain)")
+    print("\n".join(thread_state(entries, nodes)))
 
 
 def cmd_checkpoint(args):
@@ -5317,9 +5600,11 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
   ruled-out list, key decisions, open items. Run `reindex` after.
 - Prefer `--body-stdin` for multiline text and repeatable singular
   `--ref`/`--reject`/`--supersede` flags. Use `--json` receipts when another
-  process must parse the id. A constraint correction can supersede an older
-  constraint only with the same authority and `--rationale`; decisions still
-  use revoke/replace.
+  process must parse the id. A constraint or decision revision supersedes
+  its predecessor with `--supersede <id> --rationale "…"` (same author, or
+  the user overriding anyone); `revoke` is for retraction, `done <id>` for
+  a decision whose work shipped. Superseded/fulfilled/revoked entries leave
+  boot, resume-context and show; `thread`/`dig` still show them.
 - In multi-model work, never directly promote a recommendation: file
   `--kind candidate`, have a different author review that exact id, then use
   `finalize-digest`. Reference the frozen casefile requirement ids with
@@ -5331,7 +5616,9 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 
 | user says | you do |
 |---|---|
-| "where are we on X?" | `boot` (or `resume-context`) → prose summary sized to the question |
+| "where are we on X?" | `where "<X>"` (computed STATE of the thread: latest live decision, open questions, what was ruled out, last verification); `thread "<X>"` for the chain; `boot` / `resume-context` for the whole case |
+| "that's done" / "we shipped X" | `done <decision-id> --evidence <obs-id or text>` — **confirm first** |
+| "X replaces Y" / "new plan for X" | `add -t decision --supersede <old-id> --rationale "…"` |
 | "don't touch X" | `add -t constraint -a user` |
 | "I'm not convinced by X" | `dispute -a user` |
 | "why did we rule out X?" / "how did we do X?" | `dig "<query>"` then `show <id>` on a hit. Do not grep log.jsonl or a sidecar chat transcript. |
@@ -6166,7 +6453,8 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--testability", choices=sorted(CLAIM_TESTABILITY),
                    help="hypotheses: when/how the claim can be discriminated")
     s.add_argument("--supersedes", nargs="*", action="extend", default=[],
-                   help="hypotheses/constraints: like-for-like ids this corrects")
+                   help="hypotheses/constraints/decisions: like-for-like ids "
+                        "this replaces (constraints/decisions need --rationale)")
     s.add_argument("--supersede", action="append", default=[],
                    help="one like-for-like replacement id; repeatable")
     s.add_argument("--to",
@@ -6462,6 +6750,31 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--limit", type=int, default=40)
     s.add_argument("--json", action="store_true")
     s.set_defaults(fn=cmd_since)
+
+    s = sub.add_parser(
+        "done",
+        help="mark a decision fulfilled (resolution --outcome fulfilled, evidence linked)")
+    s.add_argument("entry", help="decision id")
+    s.add_argument("-a", "--author", required=True)
+    s.add_argument("--evidence",
+                   help="observation id (linked as a ref) or free text")
+    s.add_argument("--reason", help="resolution body (default derived from evidence)")
+    s.set_defaults(fn=cmd_done)
+
+    for name, fn, help_text in (
+        ("thread", cmd_thread,
+         "walk the refs graph from an entry or query; chain in time order + STATE"),
+        ("where", cmd_where,
+         "only the computed STATE of a thread: latest decision, open, ruled out"),
+    ):
+        s = sub.add_parser(name, help=help_text)
+        s.add_argument("query", help="entry id, or a dig query (top hits seed the thread)")
+        s.add_argument("--case")
+        s.add_argument("--depth", type=int, default=THREAD_DEPTH,
+                       help=f"hops from the seeds (default {THREAD_DEPTH})")
+        s.add_argument("--limit", type=int, default=THREAD_LIMIT,
+                       help=f"max entries in the thread (default {THREAD_LIMIT})")
+        s.set_defaults(fn=fn)
 
     s = sub.add_parser(
         "checkpoint",

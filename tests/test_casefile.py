@@ -2788,3 +2788,230 @@ class CompactNoiseTests(CliBase):
         plan = cf.compaction_plan(es)
         self.assertEqual(sum(len(ids) for _, ids, _ in plan), 1201)
         self.assertEqual(max(len(ids) for _, ids, _ in plan), cf.COMPACT_DIGEST_MAX_IDS)
+
+
+# ------------------------------------------------------ threads and closure
+
+class SupersededGradeTests(unittest.TestCase):
+    def test_superseded_decision_grade_and_precedence(self):
+        es = [E("d1", "decision", body="plan v1"),
+              E("d2", "decision", body="plan v2", supersedes=["d1"])]
+        g = cf.compute_grades(es)
+        self.assertEqual(g["d1"], "superseded")
+        self.assertEqual(g["d2"], "asserted")
+        self.assertIn("d1", cf.superseded_ids(es))
+        # revoked beats superseded; superseded beats fulfilled
+        es2 = es + [E("rv", "revocation", refs=["d1"])]
+        self.assertEqual(cf.compute_grades(es2)["d1"], "revoked")
+        es3 = es + [E("r1", "resolution", refs=["d1"], outcome="fulfilled")]
+        self.assertEqual(cf.compute_grades(es3)["d1"], "superseded")
+        self.assertIn("superseded", cf.PHRASE)
+
+    def test_superseded_constraint_grade(self):
+        es = [E("c1", "constraint", author="user", body="v1"),
+              E("c2", "constraint", author="user", body="v2", supersedes=["c1"])]
+        self.assertEqual(cf.compute_grades(es)["c1"], "superseded")
+
+    def test_grades_stay_pure_over_prefixes(self):
+        es = [E("d1", "decision", body="plan v1"),
+              E("d2", "decision", body="plan v2", supersedes=["d1"]),
+              E("r1", "resolution", refs=["d2"], outcome="fulfilled")]
+        for n in range(1, len(es) + 1):
+            g = cf.compute_grades(es[:n])
+            self.assertEqual(g, cf.compute_grades(list(es[:n])))
+        self.assertEqual(cf.compute_grades(es)["d2"], "fulfilled")
+
+    def test_superseded_decision_is_dismissed_for_digests(self):
+        es = [E("d1", "decision", body="plan v1"),
+              E("d2", "decision", body="plan v2", supersedes=["d1"])]
+        self.assertEqual(cf.digest_invariant_violations(es, ["d1"]), [])
+        self.assertTrue(cf.digest_invariant_violations(es, ["d2"]))
+        es.append(E("g1", "digest", kind="judgment", supersedes=["d1"]))
+        self.assertEqual([p for p in cf.lint_problems(es)
+                          if p.startswith("DIGEST-VIOLATION")], [])
+        # the replay is chronological: a digest filed before the replacement
+        # still violates
+        early = [E("d1", "decision", body="plan v1"),
+                 E("g0", "digest", kind="judgment", supersedes=["d1"]),
+                 E("d2", "decision", body="plan v2", supersedes=["d1"])]
+        self.assertTrue(any(p.startswith("DIGEST-VIOLATION") and "g0" in p
+                            for p in cf.lint_problems(early)))
+
+
+class DecisionSupersedeCliTests(CliBase):
+    V1 = "Plan v1: run the control leg first, then the candidate leg"
+    V2 = "Plan v2: run the candidate leg first, then two control legs"
+
+    def test_decision_supersede_hides_old_keeps_history(self):
+        d1 = self.add("-t", "decision", "-a", "codex", "--rationale", "r", self.V1)
+        d2 = self.add("-t", "decision", "-a", "codex", "--rationale", "plan changed",
+                      "--supersede", d1, self.V2)
+        entries = self.log_entries()
+        e2 = next(e for e in entries if e["id"] == d2)
+        self.assertEqual(e2["supersedes"], [d1])
+        self.assertEqual(e2["supersession_reason"], "plan changed")
+        self.assertEqual(cf.compute_grades(entries)[d1], "superseded")
+        for cmd in (("show",), ("resume-context",),
+                    ("boot", "-a", "codex", "--skip-recheck", "--ok-exit")):
+            out = self.cli(*cmd, expect=0).out
+            self.assertIn("Plan v2", out, cmd)
+            self.assertNotIn("Plan v1", out, cmd)
+        self.assertIn("[superseded]", self.cli("dig", "control leg", expect=0).out)
+        shown = self.cli("show", d1, expect=0).out
+        self.assertIn("superseded", shown)
+        self.assertIn("Plan v1", shown)
+
+    def test_decision_supersede_requires_rationale_and_authority(self):
+        d1 = self.add("-t", "decision", "-a", "user", self.V1)
+        r = self.cli("add", "-t", "decision", "-a", "codex", "--rationale", "r",
+                     "--supersede", d1, self.V2)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("only that authority", r.err)
+        r = self.cli("add", "-t", "decision", "-a", "user", "--supersede", d1, self.V2)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("--rationale", r.err)
+        # the user may replace a model's decision; a model may replace its own
+        m1 = self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                      "keep the widget cache warm between runs")
+        self.add("-t", "decision", "-a", "user", "--rationale", "user overrides",
+                 "--supersede", m1, "drop the widget cache between runs")
+        self.assertEqual(cf.compute_grades(self.log_entries())[m1], "superseded")
+
+    def test_user_may_replace_any_constraint(self):
+        c1 = self.add("-t", "constraint", "-a", "codex", "never deploy on Fridays")
+        self.add("-t", "constraint", "-a", "user", "--supersede", c1,
+                 "--rationale", "operator rule", "deploy only after the daily audit")
+        self.assertEqual(cf.compute_grades(self.log_entries())[c1], "superseded")
+
+    def test_superseded_decision_is_digestible_and_leaves_counts(self):
+        d1 = self.add("-t", "decision", "-a", "codex", "--rationale", "r", self.V1)
+        d2 = self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                      "--supersede", d1, self.V2)
+        self.cli("digest", "settled v1", "-a", "codex", "--kind", "judgment",
+                 "--supersedes", d1, expect=0)
+        st = json.loads(self.cli("status", "--json", expect=0).out)
+        c = st["cases"]["test-case"]["closure"]
+        self.assertEqual((c["decisions"], c["superseded"]), (1, 1))
+        self.cli("done", d2, "-a", "codex", expect=0)
+        c = json.loads(self.cli("status", "--json", expect=0).out)["cases"]["test-case"]["closure"]
+        self.assertEqual((c["decisions"], c["fulfilled"]), (0, 1))
+        where = _section(self.cli("boot", "-a", "codex", "--skip-recheck", "--ok-exit",
+                                  expect=0).out, "=== WHERE ===")
+        self.assertIn("live: 0 decisions", where)
+        self.assertIn("1 fulfilled, 1 superseded", where)
+
+
+class DoneCliTests(CliBase):
+    def test_done_links_evidence_id(self):
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                     "build the exporter")
+        o = self.add("-t", "observation", "-a", "codex", "--source", "manual",
+                     "exporter deployed; 200 OK on /metrics")
+        rid = self.cli("done", d, "-a", "codex", "--evidence", o, expect=0).out
+        e = next(x for x in self.log_entries() if x["id"] == rid)
+        self.assertEqual(e["type"], "resolution")
+        self.assertEqual(e["outcome"], "fulfilled")
+        self.assertEqual(e["refs"], [d, o])
+        self.assertIn(o, e["body"])
+        self.assertEqual(cf.compute_grades(self.log_entries())[d], "fulfilled")
+        self.assertNotIn("build the exporter",
+                         self.cli("resume-context", expect=0).out)
+
+    def test_done_with_text_evidence_and_type_guard(self):
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "r", "ship it")
+        rid = self.cli("done", d, "-a", "codex", "--evidence", "shipped in run 7",
+                       expect=0).out
+        e = next(x for x in self.log_entries() if x["id"] == rid)
+        self.assertEqual(e["refs"], [d])
+        self.assertIn("shipped in run 7", e["body"])
+        q = self.add("-t", "question", "-a", "user", "which db?")
+        r = self.cli("done", q, "-a", "codex")
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("resolve", r.err)
+
+
+class ThreadTests(CliBase):
+    def chain(self):
+        h = self.add("-t", "hypothesis", "-a", "claude",
+                     "pool exhaustion causes the 502s")
+        o = self.add("-t", "observation", "-a", "codex", "--source", "manual",
+                     "pool wait time spikes at 09:00 in the gateway log")
+        self.cli("verify", h, o, "-a", "codex", expect=0)
+        d1 = self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                      "--ref", h, "raise the pool size to forty")
+        d2 = self.add("-t", "decision", "-a", "codex", "--rationale", "measured",
+                      "--supersede", d1, "raise the pool size to sixty")
+        q = self.add("-t", "question", "-a", "codex", "--ref", d2,
+                     "does sixty hold under the batch job?")
+        bad = self.add("-t", "hypothesis", "-a", "claude", "--ref", h,
+                       "TLS renegotiation is the real cause")
+        dsp = self.cli("dispute", bad, "-a", "codex", "--reason", "no").out
+        self.cli("resolve", dsp, "-a", "user", "--outcome", "upheld",
+                 "--reason", "logs show no renegotiation", expect=0)
+        self.add("-t", "note", "-a", "claude", "unrelated bookkeeping about widgets")
+        return h, o, d1, d2, q, bad
+
+    def test_thread_walks_refs_both_directions_in_time_order(self):
+        h, o, d1, d2, q, bad = self.chain()
+        r = self.cli("thread", d1, expect=0)
+        lines = [ln for ln in r.out.splitlines() if ln[1:9] in (h, o, d1, d2, q, bad)]
+        self.assertEqual([ln[1:9] for ln in lines], [h, o, d1, d2, q, bad])
+        self.assertIn("[superseded]", next(ln for ln in lines if ln[1:9] == d1))
+        self.assertIn("[live]", next(ln for ln in lines if ln[1:9] == d2))
+        self.assertIn("[verified]", next(ln for ln in lines if ln[1:9] == h))
+        self.assertIn("[refuted]", next(ln for ln in lines if ln[1:9] == bad))
+        self.assertIn(f"-> {d1}", next(ln for ln in lines if ln[1:9] == d2))
+        self.assertNotIn("widgets", r.out)
+        self.assertIn("THREAD from `" + d1 + "`", r.out)
+
+    def test_thread_state_footer(self):
+        h, o, d1, d2, q, bad = self.chain()
+        r = self.cli("thread", h, expect=0)
+        state = r.out[r.out.index("STATE:"):]
+        self.assertIn(f"latest live decision: `{d2}`", state)
+        self.assertIn(f"open questions: `{q}`", state)
+        self.assertIn(f"`{bad}`", state)
+        self.assertIn("refuted via dispute", state)
+        self.assertIn(f"`{d1}`", state)
+        self.assertIn(f"superseded by `{d2}`", state)
+        self.assertIn(f"verified `{h}` by `{o}`", state)
+        self.assertIn(f"last observation: `{o}`", state)
+
+    def test_where_from_query_prints_only_state(self):
+        h, o, d1, d2, q, bad = self.chain()
+        r = self.cli("where", "pool size", expect=0)
+        self.assertIn("STATE:", r.out)
+        self.assertIn(f"latest live decision: `{d2}`", r.out)
+        self.assertNotIn("THREAD from", r.out)
+        self.assertLess(len(r.out.splitlines()), 14)
+        r = self.cli("where", "zzznomatch")
+        self.assertNotEqual(r.rc, 0)
+
+    def test_thread_depth_and_limit_bound_the_walk(self):
+        ids = [self.add("-t", "note", "-a", "claude", "root of the chain")]
+        for i in range(6):
+            ids.append(self.add("-t", "note", "-a", "claude", "--ref", ids[-1],
+                                f"link {i} of the chain"))
+        r = self.cli("thread", ids[0], "--depth", "2", expect=0)
+        self.assertIn(ids[2], r.out)
+        self.assertNotIn(ids[3], r.out)
+        r = self.cli("thread", ids[0], "--depth", "6", "--limit", "3", expect=0)
+        self.assertIn("beyond --limit", r.out)
+
+    def test_thread_does_not_traverse_mechanical_digests(self):
+        for i in range(4):
+            self.add("-t", "observation", "-a", "system", "--source", "hook:t",
+                     f"iteration {i}")
+        self.cli("compact", expect=0)
+        entries = self.log_entries()
+        dig = next(e for e in entries if e["type"] == "digest")
+        seed = dig["supersedes"][0]
+        r = self.cli("thread", seed, expect=0)
+        self.assertNotIn(dig["id"], r.out)
+        self.assertIn("1 entries", r.out)
+
+    def test_thread_is_computed_not_stored(self):
+        self.chain()
+        for e in self.log_entries():
+            self.assertNotIn("thread", e)
+            self.assertNotIn("topics", e)

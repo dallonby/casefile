@@ -251,6 +251,18 @@ tamper-evident by construction.
   resume; tmux is only an optional viewport, never the memory mechanism.
 - **`dig` and `recall`** — full history search (superseded entries
   included) and cross-case compost: "have we seen this before?"
+- **`casefile thread <id|query>` / `where <id|query>`** — "where are we on
+  X?" answered from the log: walk the refs graph both ways from an entry
+  or the best search hits, print the chain in time order with each entry's
+  computed state, and end with a STATE footer (latest live decision, open
+  questions, what was ruled out and how, last verification). `where`
+  prints only the footer. Threads are computed from the graph, never
+  stored.
+- **Closure** — `casefile done <decision> --evidence <obs-id|text>` marks a
+  decision fulfilled; `add -t decision --supersede <old> --rationale "…"`
+  revises a plan (same author, or the user). Fulfilled, superseded and
+  revoked entries leave the live views and counts, so the working set
+  shrinks as work ships.
 
 For a consequential debate, freeze the contract before the first argument:
 
@@ -299,8 +311,9 @@ exist (the entry is still filed).
 
 Singular `--ref`, `--reject`, and `--supersede` flags are repeatable and avoid
 the positional swallowing ambiguity of their legacy variadic counterparts.
-Constraints can be corrected by the same authority with `--supersede` plus a
-reason; decisions still use explicit revoke/replace semantics.
+Constraints and decisions can be revised by the same authority (or the user)
+with `--supersede` plus a reason; `revoke` remains the explicit retraction
+and `done` the explicit completion.
 
 ## Upgrade and maintenance
 

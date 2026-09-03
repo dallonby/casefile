@@ -192,7 +192,7 @@ starter ignore list lives in `.casefile/.gitignore`, **not** a blanket
 | type | purpose | extra fields |
 |---|---|---|
 | `hypothesis` | falsifiable claim by a model | `check`; like-for-like `supersedes`; claim card: `claim_mode`, `mechanism`, `comparator`, `analysis_layer`, `falsifier`, `counterfactual`, `horizon`, `testability` |
-| `decision` | a choice constraining future work | `rationale`, `rejected` (list of `{option, reason}` — the losing alternatives, so they aren't re-proposed) |
+| `decision` | a choice constraining future work | `rationale`, `rejected` (list of `{option, reason}` — the losing alternatives, so they aren't re-proposed); plan revision via `supersedes` + `supersession_reason` |
 | `observation` | ground truth from the world | `source`; optional `source_uri`, `source_type`, `published_at`, `accessed_at`, `effective_at`, `expires_at`, `locator`, `jurisdiction` |
 | `constraint` | invariant that must hold | `check`; same-author correction via `supersedes` + `supersession_reason` |
 | `question` | open unknown; user-authored questions form the **mailbox** | `to` (optional: `user`, `any`) |
@@ -210,11 +210,16 @@ Rules enforced at append time:
 - `digest.supersedes` may NOT include: unrevoked constraints, undismissed
   decisions, open disputes/questions, or observations referenced by any
   verification (**the evidence-chain invariant** — see also lint §7).
-  A decision is *dismissed* by revocation (retracted) **or** by a
+  A decision is *dismissed* by revocation (retracted), by a
   `resolution` with `outcome: fulfilled` (the work it mandated shipped and
-  was observed — distinct from retraction; the digest that supersedes it
-  must carry the residue). Revoke ≠ fulfil: the record must not read a
-  completed plan as a reversed one;
+  was observed — `casefile done <id> [--evidence <obs-id|text>]` is the
+  sugar; distinct from retraction; the digest that supersedes it must carry
+  the residue), **or** by a later decision that `supersedes` it (a plan
+  revision: `add -t decision --supersede <id> --rationale "…"`, same author
+  or the user overriding anyone; constraints follow the same rule). Revoke
+  ≠ fulfil ≠ supersede: the record must not read a completed or revised
+  plan as a reversed one. Supersession is recorded on the replacing entry
+  only — threads are computed from the refs/supersedes graph, never stored;
 - refs must exist and belong to the same case (digests exempted for
   cross-case abstracts only).
 
@@ -255,7 +260,10 @@ Other grades: `observation` → `ground-truth`; user-authored
 constraint/decision is grade `revoked` and drops from compiled views (but
 its revocation is shown in `dig`). A decision closed by
 `resolution --outcome fulfilled` is grade `fulfilled` (work shipped;
-digestible under the evidence-chain invariant).
+digestible under the evidence-chain invariant). A constraint or decision
+replaced by a later one is grade `superseded` (precedence: revoked >
+superseded > fulfilled > stated/asserted); it leaves the live views and
+counts, and `thread`/`dig` show it with what replaced it.
 
 Provenance phrases (P5) for compiled views:
 
@@ -269,6 +277,7 @@ refuted     → "refuted"
 hypothesis  → "an unverified hypothesis"
 asserted    → "asserted, not user-confirmed"
 fulfilled   → "fulfilled — shipped and observed; digestible"
+superseded  → "superseded by a later entry"
 ```
 
 ## 6. Distillation
@@ -463,7 +472,23 @@ near-duplicate observations, expand exact ids; then `show <id>` for the
 full body; JSONL scan is the stale-cache fallback), `lint`, `log`,
 `reindex`, `hooks install <vendor>`, `ui`, `spitball`,
 `spitball-recover`, `preflight`, `status` (JSON:
-active case, mailbox count, lint count, dormancy candidates, spend).
+active case, mailbox count, lint count, dormancy candidates, spend, live
+and closed decision/constraint counts), `since`, `done <decision>
+[--evidence <obs-id|text>]` (resolution `fulfilled` with the evidence
+linked), `thread <id|query>` and `where <id|query>`.
+
+`thread` answers "where are we on X" from the log. Seeded by an entry id
+or by the best `dig` hits for a query, it walks the refs and supersedes
+graph in both directions (bounded depth, default 4; mechanical and
+abstract digests are not traversed), prints the chain in time order —
+one line per entry: id, type, author, date, computed state, headline,
+refs within the thread — and ends with a computed **STATE** footer: the
+latest live decision, live constraints, open questions and disputes,
+what was ruled out and how (refuted via dispute, revoked, superseded by
+what), the last verification and the last observation. `where` prints
+only the footer. Threads are computed, never stored (P3): no thread or
+topic field exists, so history needs no re-tagging and the answer cannot
+drift from the graph.
 
 The CLI is model-facing memory, not a human log browser. `dig` prints
 best-first because host UIs truncate tool output; a later model that only
