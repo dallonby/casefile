@@ -15,6 +15,7 @@ import re
 import subprocess
 import sys
 import time
+from types import SimpleNamespace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -76,9 +77,10 @@ BOOT_SECTIONS = (
 # Budget shares for the variable sections of boot / resume-context. Every
 # section keeps its newest items; nothing is evicted whole (SPEC §11.1).
 BOOT_SHARES = (
-    ("abstract", 0.30), ("constraints", 0.16), ("decisions", 0.12),
-    ("differential", 0.10), ("since", 0.12), ("questions", 0.06),
+    ("abstract", 0.26), ("constraints", 0.16), ("decisions", 0.12),
+    ("differential", 0.10), ("since", 0.08), ("questions", 0.06),
     ("disputes", 0.03), ("mailbox", 0.03), ("do_not", 0.08),
+    ("board", 0.08),
 )
 RESUME_SHARES = (
     ("abstract", 0.20), ("judgments", 0.06), ("candidates", 0.04),
@@ -249,7 +251,7 @@ def normalize_author(author: str) -> str:
     if a in AUTHOR_ALIASES:
         return AUTHOR_ALIASES[a]
     # unlisted versioned xAI ids: grok47, grok-5, grok5.2 → grok
-    if a.startswith("grok") and a != "grok":
+    if re.match(r"grok-?\d", a):
         return "grok"
     return a
 
@@ -1024,6 +1026,9 @@ def substantive(e: dict) -> bool:
         return False
     if str(e.get("source") or "").startswith(NOISE_SOURCES):
         return False
+    from casefile_board import is_control
+    if is_control(e):
+        return False
     return not is_sweep_marker(e)
 
 
@@ -1461,7 +1466,11 @@ def make_entry(entries, case, type_, author, body, refs=None, **extra):
     missing = [r for r in refs if r not in ids]
     if missing:
         die(f"unknown ref(s): {', '.join(missing)}")
-    if type_ != "digest":
+    # Open board discussions can link evidence from any case in the store.
+    # This does not relax cross-case claim/decision provenance rules.
+    board_note = (type_ == "note" and isinstance(extra.get("board"), dict)
+                  and extra["board"].get("version") == 1)
+    if type_ != "digest" and not board_note:
         cross = [r for r in refs if by_id[r]["case"] != case]
         if cross:
             die(f"ref(s) in another case: {', '.join(cross)}")
@@ -4286,6 +4295,10 @@ def agent_card(author: str, author_source: str = "env") -> str:
         "Verify needs an observation: casefile verify <hyp> <obs> -a " + author,
         "Self-endorsement is rejected; get a foreign author or ground truth.",
         "Handoff: casefile packet --to <peer> | casefile inbox --for " + author,
+        "Open board: casefile board poll --for " + author +
+        "  # at work checkpoints; board read <thread>, reply <id>, ack <message>",
+        "Board search: casefile board search '\"exact phrase\" AND term' "
+        "  # all cases, full messages; --tag / --by / --status",
         "Checkpoint: casefile checkpoint -a " + author + "  # abstract + reindex",
         "Memory: casefile dig \"topic\"  then  casefile show <id>  "
         "(do not grep log.jsonl or a sidecar chat log)",
@@ -4439,6 +4452,11 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
         sections.append(("mailbox", f"mailbox → user ({len(mailbox)}):", [
             f"- `{e['id']}` {headline(e['body'], 140)}" for e in mailbox[::-1]]))
 
+    from casefile_board import notice as board_notice
+    board_lines = board_notice(entries, author, normalize_author)
+    if board_lines:
+        sections.append(("board", "messageboard (public across all cases):", board_lines))
+
     since = since_delta(entries, case, author)
     since_lines = []
     if since["watermark"] is None:
@@ -4497,6 +4515,8 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
 
     next_actions = suggest_next_actions(
         entries, meta, case, author, freshness, drift=recheck["drifted"])
+    if board_lines:
+        next_actions.insert(0, f"casefile board unread --for {author}  # read and reply at work boundaries")
     if author_source == "default":
         next_actions = [
             f"export {ENV_AUTHOR}=claude|codex|grok|fable   "
@@ -4539,7 +4559,7 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
         code = EXIT_ABSTRACT_STALE
     elif recheck["drifted"]:
         code = EXIT_DRIFT
-    elif mailbox:
+    elif mailbox or board_lines:
         code = EXIT_MAILBOX
     return text, code
 
@@ -4675,6 +4695,12 @@ def cmd_inbox(args):
         peer = normalize_author(args.for_author)
         source = "flag"
     items = inbox_items(entries, peer)
+    # Keep legacy addressed notes visible, and discover new public board
+    # activity even when nobody remembered to name a recipient.
+    from casefile_board import unread as board_unread
+    board_items = board_unread(entries, peer, normalize_author)
+    present = {e["id"] for e in items}
+    items += [e for e in board_items if e["id"] not in present]
     if getattr(args, "json", False):
         print(json.dumps([{"id": e["id"], "type": e["type"], "author": e["author"],
                            "case": e["case"], "to": e.get("to"),
@@ -4688,6 +4714,9 @@ def cmd_inbox(args):
         first = e["body"].strip().splitlines()[0][:120]
         print(f"  `{e['id']}` [{e['type']}] from {e['author']} "
               f"case={e['case']}: {first}")
+    if board_items:
+        print(f"{len(board_items)} unread public board message(s); "
+              "board read <thread-id> records what you saw, board ack <message-id> acknowledges it.")
 
 
 def cmd_next(args):
@@ -5572,6 +5601,40 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
    `python3 casefile.py checkpoint` before long gaps so `recall` sees the
    distilled problem.
 
+## Open messageboard — use throughout the session
+
+The board is shared across every case in this project. Every agent can browse,
+search, reply and update a discussion; mentions and follows select attention,
+never visibility. Keep secrets out: the board uses the same tracked log.
+
+- Before a work unit, after a bounded tool/experiment checkpoint, before a
+  plan change, and before declaring blocked or stopping: run
+  `python3 casefile.py board poll --for "$CASEFILE_AUTHOR"`.
+- `board unread --for <you>` lists public activity, including posts with no
+  recipient. `board read <thread>` shows the full discussion and records exact
+  messages seen. `board show <thread>` inspects without marking read. Neither
+  posting nor booting silently marks someone else's messages read.
+- Start useful discussions with `board post "Title" "Body" --tag topic`.
+  Use repeatable `--to <author>` for attention and `--ref <id>` for evidence;
+  everyone can still read and join. Use `--body-stdin` for multiline content.
+- Respond with `board reply <message-or-thread> "Findings / next action"`.
+  `board ack <message>` acknowledges receipt only. To report progress use
+  `board status <thread> open|in-progress|blocked|resolved "Reason"`; this
+  does not verify a claim, fulfill a decision or grant permission.
+- Search before duplicating work: `board search '"cold load" AND gas'`.
+  Full-text search supports phrases, AND/OR/NOT, prefix*, author/title/tags
+  fields, and exact `--case`, `--tag`, `--by`, `--status` filters. Use
+  `--offset` for further pages; JSON includes full matching message bodies.
+- `board follow <thread>`, `board follow --tag topic`, or `board follow --all`
+  selects optional `--following` views. Everyone can see the whole board.
+- When immediate attention matters, send a short native-agent/tmux nudge
+  pointing to the board message ID. A message posted is not delivery proof;
+  require a referenced reply/ack for consequential handoffs. The CLI does not
+  wake an idle agent automatically.
+
+Board messages are discussion notes, not promoted decisions. File resulting
+decisions/observations with their proper types and link the discussion IDs.
+
 ## Filing conventions (types and authors matter — grades are computed from them)
 
 - **hypothesis** — falsifiable claim, author is whoever proposed it. Add
@@ -5807,6 +5870,16 @@ This project keeps its investigation state in an append-only casefile log.
   as anonymous `agent`.
 - Handoff via the log: `python3 casefile.py packet --to <peer>`,
   `inbox --for <you>`, `next`.
+- **Open messageboard throughout work:** `python3 casefile.py board unread
+  --for <you>` before work/replanning, at bounded checkpoints, and before
+  blocking/handoff/stop. `board read <thread>` records exact messages seen;
+  `board reply <id> "..."` or `board ack <message>` confirms receipt.
+  Use `board post "Title" "Body" --tag topic --to <peer>` for open discussion;
+  recipients never hide it from others. Search all cases with `board search
+  '"exact phrase" AND term'`; `board poll` is a bounded quiet-when-empty check.
+  Do not treat posting, reading, acknowledgement or resolved discussion status
+  as completed work or verified evidence. Nudge active peers with the message
+  ID when a handoff needs immediate attention; the CLI does not wake idle agents.
 - Checkpoint abstracts: `python3 casefile.py checkpoint` then `recall`.
 - **After any context compaction or summarization**, re-run
   `python3 casefile.py boot` (or `resume-context`) before acting. The log
@@ -6396,6 +6469,8 @@ def cmd_talk(args):
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="casefile", description=__doc__)
     sub = p.add_subparsers(dest="cmd", required=True)
+    from casefile_board import register as register_board
+    register_board(sub, SimpleNamespace(**globals()))
 
     s = sub.add_parser(
         "cheatsheet",
@@ -6802,6 +6877,10 @@ def _cheatsheet_markdown() -> str:
             continue
         seen.add(id(sp))
         lines.append(" ".join(sp.format_usage().replace("usage: ", "").split()))
+        for action in sp._actions:
+            if isinstance(action, argparse._SubParsersAction):
+                for child in action.choices.values():
+                    lines.append(" ".join(child.format_usage().replace("usage: ", "").split()))
     lines += ["```", ""]
     return "\n".join(lines)
 

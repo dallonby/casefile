@@ -850,7 +850,47 @@ Each milestone ends with the dogfood test: use casefile on casefile.
   → candidate digest → exact foreign endorsement → mechanical system judgment;
   dispute/missing review paths must leave the candidate inert.
 
-## 19. Open questions (decide during build, with David)
+## 19. Open messageboard
+
+Operator requirement, 2026-09-11: "add a messageboard to casefile. Make it
+extremely open and highly searchable."
+
+- One board spans every case in a project. Anyone using the store can read,
+  search, start/reply to threads, and append discussion status. Recipients,
+  mentions and subscriptions affect attention only, never visibility.
+- `board post/reply/status/read/ack/follow/unfollow` append ordinary `note`
+  entries with `board.version=1` and an operation payload. Posts carry a title
+  and tags; replies carry root-thread and parent-message IDs. Discussion
+  references may cross cases. Existing epistemic reference restrictions remain.
+- Status is open/in-progress/blocked/resolved, computed from events in log
+  order. Resolved discussions stay visible/searchable. Status never verifies a
+  claim, closes an epistemic decision, authorizes work, or erases history.
+- Read and acknowledgement events name exact message IDs. Reading a snapshot
+  never consumes a racing/later message, including after log reconciliation.
+  Writing, searching, showing, booting and polling do not count as reading.
+  Acknowledgement is receipt only; a substantive reply reports action/results.
+- Participation implies following; explicit thread follow/unfollow overrides
+  that and broader tag/all follows. Public unread is the default. Optional
+  following-only unread also includes explicit mentions.
+- FTS5 searches full discussion messages and status reasons, titles, tags,
+  authors, IDs and evidence references. Supports phrase/Boolean/prefix queries,
+  exact filters before pagination, total counts, bounded pages and full JSON.
+  No substring-search fallback. A content-fingerprinted transactional SQLite
+  cache is derived and rebuildable from the authoritative append-only log.
+- Boot/inbox discover unread public activity. Generated instructions require
+  board checks at work boundaries. `board poll` is bounded and quiet when
+  empty; this version has no background wakeup daemon. Urgent agent handoffs
+  need a native nudge linking the durable message ID and a reply/ack.
+- Read/ack/follow controls do not age epistemic abstracts as substantive work.
+  Legacy addressed notes/packets remain supported without forced migration.
+  The board inherits local/Git/Postgres persistence and existing secret rules.
+
+Tests cover cross-author/cross-case access, append-only receipts, concurrent
+arrival/reconciliation, independent readers, subscriptions/mentions, exact FTS
+retrieval beyond previews, filters/pagination, index rebuild, legacy inbox,
+boot discovery, identity validation and unchanged decision grades.
+
+## 20. Open questions (decide during build, with David)
 
 1. Final name (casefile vs logbook vs statelog).
 2. Threaded disputes (dispute → counter → counter) — v0 is flat; expected
