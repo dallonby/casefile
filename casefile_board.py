@@ -8,8 +8,11 @@ Recipients and follows select attention; they never restrict visibility.
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import sys
+import time
 
 VERSION = 1
 ACTIVITY = {"post", "reply", "status"}
@@ -240,7 +243,82 @@ def search(cf, root, catalog, args):
             db.close()
 
 
+def _tail_entries(cf, root):
+    if cf.persistence_mode() == "postgres":
+        # Ordinary CLI reads cache reconciliation for one invocation. A follower
+        # must refresh that snapshot to see messages from other machines.
+        key = str(root.resolve())
+        cf._PG_RECONCILED.discard(key)
+        cf._PG_LOCAL_CACHE.pop(key, None)
+        return cf.read_entries(root)
+    path = root / cf.DIR / cf.LOG
+    try:
+        data = path.read_bytes()
+    except FileNotFoundError:
+        return []
+    entries = []
+    for n, line in enumerate(data.splitlines(keepends=True), 1):
+        if not line.strip():
+            continue
+        try:
+            entries.append(json.loads(line))
+        except (ValueError, UnicodeError):
+            if not line.endswith(b"\n"):
+                break  # a concurrent append has not finished its last record
+            cf.die(f"corrupt log line {n} in {path}")
+    return entries
+
+
+def tail(cf, args):
+    """Plain chronological messages, optionally followed; never write receipts."""
+    if args.lines < 0:
+        cf.die("--lines must be nonnegative")
+    root = cf.find_root()
+    if root is None:
+        cf.die("no .casefile found here or in any parent")
+    seen, first, thread_id = set(), True, None
+    try:
+        while True:
+            entries = _tail_entries(cf, root)
+            catalog = threads(entries)
+            if first and args.thread:
+                thread_id = _thread(cf, entries, args.thread, catalog)[0]["id"]
+            rows = []
+            for e in entries:
+                b = payload(e)
+                t = catalog.get(b.get("thread", e["id"]))
+                if (b.get("op") not in ACTIVITY or not t or e["id"] in seen
+                        or (thread_id and t["id"] != thread_id)
+                        or not _selected(t, args, cf)
+                        or (args.by and cf.normalize_author(e["author"]) != cf.normalize_author(args.by))):
+                    continue
+                rows.append({"id": e["id"], "thread": t["id"], "title": t["title"],
+                             "case": t["case"], "ts": e["ts"], "author": e["author"],
+                             "op": b["op"], "body": e["body"], "refs": e.get("refs", [])})
+            if first:
+                rows = rows[-args.lines:] if args.lines else []
+            for row in rows:
+                if args.json:
+                    print(json.dumps(row, ensure_ascii=False), flush=True)
+                else:
+                    print(f"{row['ts']}  {row['author']} [{row['op']}]  "
+                          f"thread={row['thread']} message={row['id']}\n"
+                          f"{row['title']}\n{row['body']}\n", flush=True)
+            seen.update(e["id"] for e in entries)
+            first = False
+            if not args.follow:
+                return
+            time.sleep(1)
+    except KeyboardInterrupt:
+        return
+    except BrokenPipeError:
+        # Avoid a second exception while Python flushes stdout at shutdown.
+        sys.stdout = open(os.devnull, "w")
+
+
 def run(cf, args):
+    if args.board_command == "tail":
+        return tail(cf, args)
     root, entries, meta = cf.require_root()
     op = args.board_command or "list"
     if getattr(args, "limit", 1) < 1 or getattr(args, "limit", 1) > 500:
@@ -419,6 +497,14 @@ def register(subparsers, cf):
     p = command("search", "FTS5 over full posts/replies, titles, tags, authors and refs")
     p.add_argument("query", help='FTS5 query, e.g. \'"cold load" AND gas\' or prefetch*')
     filters(p)
+    p = command("tail", "print recent full messages; -f follows new arrivals without marking read")
+    p.add_argument("-n", "--lines", type=int, default=20, help="initial message count (default 20; 0 for new only)")
+    p.add_argument("-f", "--follow", action="store_true", help="poll every second; Ctrl-C stops")
+    p.add_argument("--thread", help="restrict to a thread or message ID/prefix")
+    p.add_argument("--case")
+    p.add_argument("--tag", action="append", default=[])
+    p.add_argument("--by", help="message author")
+    p.add_argument("--status", choices=STATES)
     for name in ("unread", "poll"):
         p = command(name, "unread public messages; poll is quiet when empty")
         filters(p, default=5 if name == "poll" else 30)

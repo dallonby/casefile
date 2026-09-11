@@ -1,7 +1,12 @@
 """Behavioral tests for open discussions, FTS retrieval and exact read receipts."""
 
 import json
-from test_casefile import CliBase, cf
+import os
+import select
+import signal
+import subprocess
+import sys
+from test_casefile import CASEFILE, CliBase, cf
 import casefile_board as board
 
 
@@ -12,6 +17,70 @@ class MessageboardTests(CliBase):
 
     def rows(self, *args):
         return json.loads(self.cli("board", *args, "--json", expect=0).out)
+
+    def test_tail_is_full_chronological_and_does_not_mark_read(self):
+        p = self.post()
+        r = self.rows("reply", p["id"], "Full body\n" + "x" * 1200, "-a", "claude")
+        self.rows("ack", r["id"], "-a", "codex")
+        before = (self.dir / ".casefile/log.jsonl").read_bytes()
+        out = self.cli("board", "tail", "--json", expect=0).out
+        rows = [json.loads(line) for line in out.splitlines()]
+        self.assertEqual([row["id"] for row in rows], [p["id"], r["id"]])
+        self.assertEqual(rows[1]["body"], r["body"])
+        plain = self.cli("board", "tail", "-n", "1", expect=0).out
+        self.assertIn(r["body"], plain)
+        self.assertNotIn("[ack]", plain)
+        self.assertEqual((self.dir / ".casefile/log.jsonl").read_bytes(), before)
+
+    def test_tail_filters_before_taking_last_messages(self):
+        p = self.post("Gas", "first", "codex", "--tag", "gas")
+        r = self.rows("reply", p["id"], "second", "-a", "claude")
+        self.post("Unrelated", "third", "claude")
+        out = self.cli("board", "tail", "--thread", r["id"], "--tag", "gas",
+                       "--by", "claude", "-n", "1", "--json", expect=0).out
+        self.assertEqual(json.loads(out)["id"], r["id"])
+        self.assertEqual(self.cli("board", "tail", "-n", "0", expect=0).out, "")
+        self.assertIn("nonnegative", self.cli("board", "tail", "-n", "-1", expect=1).err)
+
+    def test_tail_status_changes_are_visible(self):
+        p = self.post()
+        s = self.rows("status", p["id"], "blocked", "Needs data", "-a", "codex")
+        out = self.cli("board", "tail", "--status", "blocked", "-n", "1",
+                       "--json", expect=0).out
+        self.assertEqual(json.loads(out)["id"], s["id"])
+
+    def test_tail_defers_partial_append_but_reports_corrupt_complete_line(self):
+        p = self.post()
+        path = self.dir / ".casefile/log.jsonl"
+        with path.open("ab") as f:
+            f.write(b'{"id":')
+        out = self.cli("board", "tail", "--json", expect=0).out
+        self.assertEqual(json.loads(out)["id"], p["id"])
+        with path.open("ab") as f:
+            f.write(b'\n')
+        self.assertIn("corrupt log line", self.cli("board", "tail", expect=1).err)
+
+    def test_tail_follow_prints_new_message_once_and_ctrl_c_is_clean(self):
+        p = self.post()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CASEFILE_")}
+        env["CASEFILE_SKIP_PIP"] = "1"
+        proc = subprocess.Popen([sys.executable, str(CASEFILE), "board", "tail", "-f", "--json"],
+                                cwd=self.dir, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(select.select([proc.stdout], [], [], 5)[0], "initial output timed out")
+            self.assertEqual(json.loads(proc.stdout.readline())["id"], p["id"])
+            r = self.rows("reply", p["id"], "New live message", "-a", "claude")
+            self.assertTrue(select.select([proc.stdout], [], [], 5)[0], "live output timed out")
+            self.assertEqual(json.loads(proc.stdout.readline())["id"], r["id"])
+            proc.send_signal(signal.SIGINT)
+            out, err = proc.communicate(timeout=3)
+            self.assertEqual((proc.returncode, out, err), (0, "", ""))
+            self.assertFalse(any(board.payload(e).get("op") == "read" for e in self.log_entries()))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate(timeout=3)
 
     def test_open_visibility_and_cross_author_reply(self):
         p = self.post("Gas mismatch", "Open to everyone", "codex", "--to", "grok-oracle")

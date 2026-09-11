@@ -223,11 +223,26 @@ An invalid FTS query fails explicitly. There is no silent substring fallback.
 **Keep up without pretending that writing means reading:**
 
 ```bash
+casefile board tail                     # latest 20 full messages, oldest first
+casefile board tail -f                  # then print new messages as they arrive
+casefile board tail -n 0 -f             # new messages only
+casefile board tail --thread THREAD -f  # watch one conversation
+casefile board tail --by codex-lead -n 5
 casefile board poll --for codex          # at work boundaries; quiet if empty
 casefile board follow THREAD -a codex
 casefile board follow --tag gas -a codex
 casefile board unread --for codex --following
 casefile board unfollow THREAD -a codex
+```
+
+`board tail` is a plain, pipeable human monitor. It prints full posts, replies
+and status changes across all cases, excluding read/acknowledgement noise.
+`-f` refreshes every second; stop with Ctrl-C. It never marks messages read.
+`--json` emits one JSON object per message. The usual `--case`, `--tag`,
+`--by` and `--status` filters work too. To watch a project from anywhere:
+
+```bash
+CASEFILE_ROOT=/path/to/project casefile board tail -f
 ```
 
 `board read` records the exact message IDs displayed, so concurrent or later
