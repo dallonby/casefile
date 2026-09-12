@@ -18,7 +18,7 @@ class MessageboardTests(CliBase):
     def rows(self, *args):
         return json.loads(self.cli("board", *args, "--json", expect=0).out)
 
-    def test_tail_is_full_chronological_and_does_not_mark_read(self):
+    def test_tail_is_bounded_by_default_and_full_is_explicit(self):
         p = self.post()
         r = self.rows("reply", p["id"], "Full body\n" + "x" * 1200, "-a", "claude")
         self.rows("ack", r["id"], "-a", "codex")
@@ -26,9 +26,16 @@ class MessageboardTests(CliBase):
         out = self.cli("board", "tail", "--json", expect=0).out
         rows = [json.loads(line) for line in out.splitlines()]
         self.assertEqual([row["id"] for row in rows], [p["id"], r["id"]])
-        self.assertEqual(rows[1]["body"], r["body"])
+        self.assertTrue(rows[1]["body_truncated"])
+        self.assertLessEqual(len(rows[1]["body"]), 600)
+        full = [json.loads(line) for line in self.cli(
+            "board", "tail", "--json", "--full", expect=0).out.splitlines()]
+        self.assertEqual(full[1]["body"], r["body"])
+        self.assertFalse(full[1]["body_truncated"])
         plain = self.cli("board", "tail", "-n", "1", expect=0).out
-        self.assertIn(r["body"], plain)
+        self.assertIn("truncated; use --full", plain)
+        full_plain = self.cli("board", "tail", "-n", "1", "--full", expect=0).out
+        self.assertIn(r["body"], full_plain)
         self.assertNotIn("[ack]", plain)
         self.assertEqual((self.dir / ".casefile/log.jsonl").read_bytes(), before)
 
@@ -254,6 +261,107 @@ class MessageboardTests(CliBase):
         skill = (self.dir / ".claude/skills/casefile/SKILL.md").read_text()
         self.assertIn("board poll", skill)
         self.assertIn("board unread", (self.dir / "AGENTS.md").read_text())
+
+    def test_thread_page_and_receipt_only_cover_exposed_messages(self):
+        p = self.post("Long thread", "root body", "codex")
+        replies = [self.rows("reply", p["id"], f"reply {n}",
+                             "-a", "codex") for n in range(25)]
+
+        anchored = self.rows("show", replies[-1]["id"])
+        self.assertIn(replies[-1]["id"], [e["id"] for e in anchored["events"]])
+        self.assertGreater(anchored["offset"], 0)
+        explicit_first = self.rows("show", replies[-1]["id"], "--offset", "0")
+        self.assertEqual(explicit_first["offset"], 0)
+        self.assertNotIn(replies[-1]["id"], [e["id"] for e in explicit_first["events"]])
+        plain = self.cli("board", "show", p["id"], expect=0).out
+        self.assertIn("messages: showing 20 of 26 from offset 0", plain)
+        self.assertIn(f"more: board show {p['id']} --offset 20", plain)
+
+        page = self.rows("read", p["id"], "-a", "reader")
+        self.assertEqual(page["total_messages"], 26)
+        self.assertEqual(page["shown_messages"], 20)
+        self.assertTrue(page["has_more"])
+        self.assertEqual(page["next_offset"], 20)
+        self.assertTrue(page["read_complete"])
+        self.assertEqual(len(page["read_message_ids"]), 20)
+        self.assertEqual(self.rows("unread", "--for", "reader")["total"], 6)
+
+        rest = self.rows("read", p["id"], "-a", "reader", "--offset", "20")
+        self.assertEqual(rest["shown_messages"], 6)
+        self.assertFalse(rest["has_more"])
+        self.assertEqual(len(rest["read_message_ids"]), 6)
+        self.assertEqual(self.rows("unread", "--for", "reader")["total"], 0)
+
+        receipt = [e for e in self.log_entries()
+                   if board.payload(e).get("op") == "read"]
+        self.assertEqual(len(receipt), 2)
+        self.assertTrue(all(board.payload(e).get("complete") is True for e in receipt))
+        self.assertEqual(set(board.payload(receipt[0])["targets"]),
+                         set(page["read_message_ids"]))
+
+    def test_clipped_read_stays_unread_until_full_message_read(self):
+        p = self.post("Clipped", "root", "codex")
+        reply = self.rows("reply", p["id"], "oversized " + "z" * 1400, "-a", "codex")
+        self.rows("read", p["id"], "--message", "-a", "reader")
+        preview = self.rows("read", reply["id"], "--message", "-a", "reader")
+        self.assertEqual(preview["read_message_ids"], [])
+        self.assertEqual(preview["preview_message_ids"], [reply["id"]])
+        self.assertFalse(preview["read_complete"])
+        self.assertEqual(self.rows("unread", "--for", "reader")["total"], 1)
+        full = self.rows("read", reply["id"], "--message", "--full", "-a", "reader")
+        self.assertEqual(full["read_message_ids"], [reply["id"]])
+        self.assertEqual(full["preview_message_ids"], [])
+        self.assertTrue(full["read_complete"])
+        self.assertEqual(self.rows("unread", "--for", "reader")["total"], 0)
+
+    def test_message_specific_read_handles_old_reply_without_thread_dump(self):
+        p = self.post("Focused", "root", "codex")
+        reply = self.rows("reply", p["id"], "target " + "y" * 1400, "-a", "codex")
+        view = self.rows("show", reply["id"], "--message")
+        self.assertTrue(view["message_view"])
+        self.assertEqual(view["shown_messages"], 1)
+        self.assertEqual([e["id"] for e in view["events"]], [reply["id"]])
+        self.assertTrue(view["events"][0]["body_truncated"])
+        full = self.rows("show", reply["id"], "--message", "--full")
+        self.assertEqual(full["events"][0]["body"], reply["body"])
+        read = self.rows("read", reply["id"], "--message", "--full", "-a", "reader")
+        self.assertEqual(read["read_message_ids"], [reply["id"]])
+        receipt = next(e for e in self.log_entries()
+                       if board.payload(e).get("op") == "read")
+        self.assertEqual(board.payload(receipt)["targets"], [reply["id"]])
+        self.assertTrue(board.payload(receipt)["complete"])
+
+    def test_natural_language_search_is_lexical_ranked_and_reaches_old_messages(self):
+        old = self.post("Replay proof", "The proof explains replay residency", "codex")
+        for n in range(25):
+            self.post(f"Unrelated {n}", "routine maintenance", "claude")
+        result = self.rows("search", "Which messages mention replay proofs?!", "--limit", "5")
+        self.assertEqual(result["mode"], "lexical")
+        self.assertIn(old["id"], [item["id"] for item in result["items"]])
+        self.assertTrue(all(len(item["body"]) <= 600 for item in result["items"]))
+        plain = self.cli("board", "search", "Which messages mention replay proofs?!",
+                         "--limit", "1", expect=0).out
+        self.assertIn("lexical search (natural-language terms; no semantic embeddings)", plain)
+        exact = self.rows("search", '"Replay proof"', "--fts")
+        self.assertEqual(exact["mode"], "fts")
+        self.assertEqual(exact["total"], 1)
+
+    def test_default_views_bound_title_and_reference_metadata(self):
+        refs = [self.add("-t", "observation", "-a", "codex", f"reference {n}")
+                for n in range(30)]
+        p = self.post("T" * 1000, "short", "codex",
+                      *sum((["--ref", ref] for ref in refs), []))
+        view = self.rows("show", p["id"])
+        event = view["events"][0]
+        self.assertTrue(view["title_truncated"])
+        self.assertTrue(event["title_truncated"])
+        self.assertLessEqual(len(event["board"]["title"]), 240)
+        self.assertTrue(event["refs_truncated"])
+        self.assertEqual(event["refs_count"], 30)
+        self.assertLessEqual(len(event["refs"]), 24)
+        full = self.rows("show", p["id"], "--full")
+        self.assertEqual(full["events"][0]["board"]["title"], p["body"].split("\n", 1)[0])
+        self.assertEqual(len(full["events"][0]["refs"]), 30)
 
     def test_search_author_filter_handles_legacy_capitalization(self):
         case = cf.load_active(self.dir)

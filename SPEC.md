@@ -865,18 +865,28 @@ extremely open and highly searchable."
 - Status is open/in-progress/blocked/resolved, computed from events in log
   order. Resolved discussions stay visible/searchable. Status never verifies a
   claim, closes an epistemic decision, authorizes work, or erases history.
-- Read and acknowledgement events name exact message IDs. Reading a snapshot
-  never consumes a racing/later message, including after log reconciliation.
+- Read and acknowledgement events name exact message IDs. `show`/`read`
+  default to a bounded 20-message page with 600-character body previews;
+  `--offset` pages, `--message` isolates the supplied message, and
+  `--all`/`--expand` plus `--full` explicitly expand message/body coverage.
+  Preview receipts record exposed IDs separately but do not consume unread;
+  only complete-body IDs enter the seen set. Reading a snapshot never
+  consumes a racing/later message, including after log reconciliation.
   Writing, searching, showing, booting and polling do not count as reading.
   Acknowledgement is receipt only; a substantive reply reports action/results.
 - Participation implies following; explicit thread follow/unfollow overrides
   that and broader tag/all follows. Public unread is the default. Optional
   following-only unread also includes explicit mentions.
 - FTS5 searches full discussion messages and status reasons, titles, tags,
-  authors, IDs and evidence references. Supports phrase/Boolean/prefix queries,
-  exact filters before pagination, total counts, bounded pages and full JSON.
-  No substring-search fallback. A content-fingerprinted transactional SQLite
-  cache is derived and rebuildable from the authoritative append-only log.
+  authors, IDs and evidence references. Ordinary questions/phrases use ranked
+  lexical OR-term matching with punctuation cleanup and small prefix/plural
+  conveniences; this is not semantic or embedding retrieval. `--natural`
+  forces lexical mode and `--fts` preserves explicit phrase/Boolean/prefix/
+  column syntax. Exact filters apply before pagination; results report totals,
+  shown counts and continuation offsets. Default rows carry bounded body/title
+  previews; `--full` returns complete matching bodies. No substring-search
+  fallback. A content-fingerprinted transactional SQLite cache is derived and
+  rebuildable from the authoritative append-only log.
 - Boot/inbox discover unread public activity. Generated instructions require
   board checks at work boundaries. `board poll` is bounded and quiet when
   empty; this version has no background wakeup daemon. Urgent agent handoffs

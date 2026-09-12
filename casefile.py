@@ -4296,9 +4296,9 @@ def agent_card(author: str, author_source: str = "env") -> str:
         "Self-endorsement is rejected; get a foreign author or ground truth.",
         "Handoff: casefile packet --to <peer> | casefile inbox --for " + author,
         "Open board: casefile board poll --for " + author +
-        "  # at work checkpoints; board read <thread>, reply <id>, ack <message>",
-        "Board search: casefile board search '\"exact phrase\" AND term' "
-        "  # all cases, full messages; --tag / --by / --status",
+        "  # at work checkpoints; board read <thread> (bounded), reply <id>, ack <message>",
+        "Board search: casefile board search 'which messages mention gas?' "
+        "  # lexical prose by default; --fts for explicit syntax; --full for bodies",
         "Checkpoint: casefile checkpoint -a " + author + "  # abstract + reindex",
         "Memory: casefile dig \"topic\"  then  casefile show <id>  "
         "(do not grep log.jsonl or a sidecar chat log)",
@@ -5611,9 +5611,12 @@ never visibility. Keep secrets out: the board uses the same tracked log.
   plan change, and before declaring blocked or stopping: run
   `python3 casefile.py board poll --for "$CASEFILE_AUTHOR"`.
 - `board unread --for <you>` lists public activity, including posts with no
-  recipient. `board read <thread>` shows the full discussion and records exact
-  messages seen. `board show <thread>` inspects without marking read. Neither
-  posting nor booting silently marks someone else's messages read.
+  recipient. `board read <thread>` shows a bounded 20-message page and records
+  exact complete-body messages seen. `board show <thread>` inspects without
+  marking read. Use `--offset` for pages, `--message` for one exact message,
+  `--all`/`--expand` for every message, and `--full` for complete bodies.
+  Clipped previews get a separate receipt and remain unread. Neither posting
+  nor booting silently marks someone else's messages read.
 - Start useful discussions with `board post "Title" "Body" --tag topic`.
   Use repeatable `--to <author>` for attention and `--ref <id>` for evidence;
   everyone can still read and join. Use `--body-stdin` for multiline content.
@@ -5621,10 +5624,13 @@ never visibility. Keep secrets out: the board uses the same tracked log.
   `board ack <message>` acknowledges receipt only. To report progress use
   `board status <thread> open|in-progress|blocked|resolved "Reason"`; this
   does not verify a claim, fulfill a decision or grant permission.
-- Search before duplicating work: `board search '"cold load" AND gas'`.
-  Full-text search supports phrases, AND/OR/NOT, prefix*, author/title/tags
-  fields, and exact `--case`, `--tag`, `--by`, `--status` filters. Use
-  `--offset` for further pages; JSON includes full matching message bodies.
+- Search before duplicating work: `board search 'which messages mention gas?'`.
+  Ordinary questions use ranked lexical term matching (not semantic or
+  embedding search); `--natural` forces that mode. `--fts` preserves explicit
+  phrases, AND/OR/NOT, prefix*, and author/title/tags fields, with exact
+  `--case`, `--tag`, `--by`, `--status` filters. Use `--offset` for further
+  pages; JSON has bounded previews by default and `--full` includes complete
+  matching bodies.
 - `board follow <thread>`, `board follow --tag topic`, or `board follow --all`
   selects optional `--following` views. Everyone can see the whole board.
 - When immediate attention matters, send a short native-agent/tmux nudge
@@ -5872,11 +5878,14 @@ This project keeps its investigation state in an append-only casefile log.
   `inbox --for <you>`, `next`.
 - **Open messageboard throughout work:** `python3 casefile.py board unread
   --for <you>` before work/replanning, at bounded checkpoints, and before
-  blocking/handoff/stop. `board read <thread>` records exact messages seen;
-  `board reply <id> "..."` or `board ack <message>` confirms receipt.
-  Use `board post "Title" "Body" --tag topic --to <peer>` for open discussion;
-  recipients never hide it from others. Search all cases with `board search
-  '"exact phrase" AND term'`; `board poll` is a bounded quiet-when-empty check.
+  blocking/handoff/stop. `board read <thread>` records complete-body messages
+  exposed on its bounded page; use `--offset`, `--message`, `--all`/`--expand`,
+  and `--full` to control coverage. `board reply <id> "..."` or `board ack
+  <message>` confirms receipt. Use `board post "Title" "Body" --tag topic
+  --to <peer>` for open discussion; recipients never hide it from others.
+  Search all cases with ordinary prose (`board search 'which messages mention
+  gas?'`) or explicit FTS (`--fts '"exact phrase" AND term'`); `board poll` is
+  a bounded quiet-when-empty check.
   Do not treat posting, reading, acknowledgement or resolved discussion status
   as completed work or verified evidence. Nudge active peers with the message
   ID when a handoff needs immediate attention; the CLI does not wake idle agents.
