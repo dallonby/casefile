@@ -1487,28 +1487,25 @@ def make_entry(entries, case, type_, author, body, refs=None, **extra):
 # ----------------------------------------------------------------- commands
 
 def _ensure_casefile_tracked_in_git(root: Path) -> None:
-    """SPEC §5.1: the log belongs in git. Remove a blanket `.casefile/` ignore
-    from the project .gitignore if a previous policy added one. Leave an
-    optional comment so operators know derived state is ignored inside
-    `.casefile/.gitignore` instead."""
+    """SPEC §4: a local store's log belongs in git, so remove a blanket
+    `.casefile/` ignore a previous policy added. A Postgres-backed store
+    shares history through the database instead, so its ignore is kept."""
     pgi = root / ".gitignore"
     if not pgi.exists():
         return
     lines = pgi.read_text().splitlines()
-    kept = []
-    removed = False
-    for line in lines:
-        stripped = line.strip()
-        if stripped in (".casefile/", ".casefile", "**/.casefile/"):
-            removed = True
-            continue
-        kept.append(line)
-    if removed:
-        text = "\n".join(kept)
-        if text and not text.endswith("\n"):
-            text += "\n"
-        pgi.write_text(text)
-        print("updated: .gitignore (removed .casefile/ — log tracks in git per SPEC §5.1)")
+    blanket = (".casefile/", ".casefile", "**/.casefile/")
+    if not any(line.strip() in blanket for line in lines):
+        return
+    if persistence_mode() == "postgres":
+        print("kept: .casefile/ in .gitignore (postgres persistence shares the "
+              "log through the database)")
+        return
+    text = "\n".join(line for line in lines if line.strip() not in blanket)
+    if text and not text.endswith("\n"):
+        text += "\n"
+    pgi.write_text(text)
+    print("updated: .gitignore (removed .casefile/ — log tracks in git per SPEC §4)")
 
 
 def _ensure_env_ignored(root: Path) -> None:

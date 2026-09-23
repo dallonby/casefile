@@ -147,7 +147,10 @@ Repo discovery: git-style — walk upward from cwd for `.casefile/`.
 under `.casefile/` except derived/local state (`index.db`, `transcripts/`,
 `log.lock`, `ui/`, `active`, `state/`, `cli`, `journals`) belongs in git —
 starter ignore list lives in `.casefile/.gitignore`, **not** a blanket
-`.casefile/` entry in the project root `.gitignore`.
+`.casefile/` entry in the project root `.gitignore`. That is the rule for
+local persistence: a Postgres-backed store shares history through the
+database, so `init` and `upgrade` leave a blanket `.casefile/` ignore in
+place there.
 
 ## 5. Data model
 

@@ -46,7 +46,9 @@ Or a one-line gitignored `.casefile/author`. Process env still wins if set.
 ### Persistence (local default, optional Postgres)
 
 Default is **local** `.casefile/log.jsonl` (rides in git). For multi-user shared
-history on a private network:
+history on a private network use Postgres; the database then carries the
+history, and `init`/`upgrade` leave a blanket `.casefile/` line in the project
+`.gitignore` alone instead of stripping it:
 
 **Interactive (recommended):**
 

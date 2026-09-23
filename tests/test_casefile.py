@@ -11,7 +11,9 @@ Two layers:
 Stdlib only (SPEC §4): run with `python3 -m unittest discover tests`.
 """
 
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import subprocess
@@ -19,6 +21,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 CASEFILE = ROOT / "casefile.py"
@@ -3015,3 +3018,33 @@ class ThreadTests(CliBase):
         for e in self.log_entries():
             self.assertNotIn("thread", e)
             self.assertNotIn("topics", e)
+
+
+class GitignorePolicyTests(unittest.TestCase):
+    """SPEC §4: the blanket `.casefile/` ignore is stripped for a local store
+    only — a Postgres-backed store shares history through the database."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+        self.addCleanup(self._tmp.cleanup)
+        (self.root / ".gitignore").write_text("node_modules/\n.casefile/\n")
+
+    def strip(self, mode):
+        out = io.StringIO()
+        with mock.patch.dict(os.environ, {"CASEFILE_PERSISTENCE_MODE": mode}), \
+                contextlib.redirect_stdout(out):
+            cf._ensure_casefile_tracked_in_git(self.root)
+        return out.getvalue()
+
+    def test_local_mode_strips_blanket_ignore(self):
+        out = self.strip("local")
+        self.assertEqual((self.root / ".gitignore").read_text(),
+                         "node_modules/\n")
+        self.assertIn("removed .casefile/", out)
+
+    def test_postgres_mode_keeps_blanket_ignore(self):
+        out = self.strip("postgres")
+        self.assertEqual((self.root / ".gitignore").read_text(),
+                         "node_modules/\n.casefile/\n")
+        self.assertIn("kept", out)
