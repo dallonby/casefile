@@ -16,6 +16,7 @@ import importlib.util
 import io
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 CASEFILE = ROOT / "casefile.py"
+AGENTS_CLI = 'python3 "$(git config casefile.cli || cat .casefile/cli)"'
 
 _spec = importlib.util.spec_from_file_location("casefile_mod", CASEFILE)
 cf = importlib.util.module_from_spec(_spec)
@@ -292,19 +294,20 @@ class CliBase(unittest.TestCase):
         self.assertEqual(self.cli("init").rc, 0)
         self.assertEqual(self.cli("open", "Test case", "--goal", "g").rc, 0)
 
-    def cli(self, *args, expect=None, stdin=None):
+    def cli(self, *args, expect=None, stdin=None, env=None, cwd=None):
         # Sandboxed: no CASEFILE_* inherited (a live CASEFILE_POSTGRES_URL
         # would point the suite at a real shared log), bin dir + CODEX_HOME
         # under the tmp store so init/hooks/symlink never touch the real
         # HOME, and no pip side effects from init.
-        env = {k: v for k, v in os.environ.items()
-               if not k.startswith("CASEFILE_")}
-        env.update({"CODEX_HOME": str(self.dir / ".codex-home"),
-                    "CASEFILE_BIN_DIR": str(self.dir / ".bin"),
-                    "CASEFILE_SKIP_PIP": "1"})
+        run_env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("CASEFILE_")}
+        run_env.update({"CODEX_HOME": str(self.dir / ".codex-home"),
+                        "CASEFILE_BIN_DIR": str(self.dir / ".bin"),
+                        "CASEFILE_SKIP_PIP": "1"})
+        run_env.update(env or {})
         p = subprocess.run([sys.executable, str(CASEFILE), *args],
-                           cwd=self.dir, capture_output=True, text=True,
-                           env=env, input=stdin)
+                           cwd=cwd or self.dir, capture_output=True, text=True,
+                           env=run_env, input=stdin)
         r = type("R", (), {"rc": p.returncode,
                            "out": p.stdout.strip(), "err": p.stderr.strip()})
         if expect is not None:
@@ -1449,14 +1452,141 @@ class CliHooksInstallTests(CliBase):
 
     def test_agents_references_cli_without_baking_in_a_local_path(self):
         # AGENTS.md is a project convention file and is normally tracked, so
-        # it must stay byte-identical across clones — resolve through the
-        # per-checkout .casefile/cli pointer instead.
+        # it must stay byte-identical across clones and machines: one fixed
+        # command that resolves the CLI at run time, never an absolute path.
         self.cli("hooks", "install", "all", expect=0)
         rel = Path("AGENTS.md")
         text = (self.dir / rel).read_text()
-        self.assertIn('python3 "$(cat .casefile/cli)"', text, rel)
+        self.assertIn(AGENTS_CLI, text, rel)
         self.assertNotIn(str(CASEFILE.resolve()), text, rel)
         self.assertNotIn("python3 casefile.py", text, rel)
+
+    def _git(self, *args, cwd=None):
+        env = {**os.environ, "GIT_CONFIG_GLOBAL": os.devnull,
+               "GIT_CONFIG_NOSYSTEM": "1"}
+        p = subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@example.com",
+             "-c", "init.defaultBranch=main", *args],
+            cwd=cwd or self.dir, capture_output=True, text=True, env=env)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        return p.stdout.strip()
+
+    def _outside_worktree(self):
+        """A store in a git repo plus a linked worktree created outside it."""
+        self._git("init", "-q")
+        self._git("commit", "-q", "--allow-empty", "-m", "init")
+        self.cli("hooks", "install", "all", expect=0)
+        outside = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, outside, True)
+        wt = outside / "feature"
+        self._git("worktree", "add", "-q", str(wt), "-b", "feature")
+        self.assertFalse((wt / ".casefile").exists())
+        return wt
+
+    def _agents_cli(self, *args, cwd):
+        env = {k: v for k, v in os.environ.items()
+               if not k.startswith("CASEFILE_")}
+        return subprocess.run(
+            ["sh", "-c", f'{AGENTS_CLI} "$@"', "sh", *args],
+            cwd=cwd, capture_output=True, text=True, env=env)
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_install_records_cli_in_local_git_config(self):
+        # A worktree has no .casefile/cli, but git's local config is shared
+        # by every worktree of the clone.
+        self._git("init", "-q")
+        self.cli("hooks", "install", "all", expect=0)
+        self.assertEqual(self._git("config", "--local", "--get", "casefile.cli"),
+                         str(CASEFILE.resolve()))
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_install_writes_local_config_despite_matching_global_value(self):
+        self._git("init", "-q")
+        global_cfg = self.dir / "global.gitconfig"
+        global_cfg.write_text(f"[casefile]\n\tcli = {CASEFILE.resolve()}\n")
+        self.cli("hooks", "install", "all", expect=0,
+                 env={"GIT_CONFIG_GLOBAL": str(global_cfg)})
+        self.assertEqual(self._git("config", "--local", "--get", "casefile.cli"),
+                         str(CASEFILE.resolve()))
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_install_reports_why_the_config_write_failed(self):
+        self._git("init", "-q")
+        (self.dir / ".git" / "config.lock").write_text("")
+        r = self.cli("hooks", "install", "all", expect=0)
+        self.assertIn("skipped: git config casefile.cli", r.out)
+        self.assertIn("could not lock", r.out)
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_agents_cli_falls_back_to_the_pointer_in_a_legacy_clone(self):
+        # A clone installed before the config key existed has only the
+        # pointer; the committed command must still work there.
+        self._git("init", "-q")
+        self.cli("hooks", "install", "all", expect=0)
+        self._git("config", "--local", "--unset", "casefile.cli")
+        p = self._agents_cli("status", cwd=self.dir)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("test-case", p.stdout)
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_agents_cli_works_from_a_nested_worktree(self):
+        self._git("init", "-q")
+        self._git("commit", "-q", "--allow-empty", "-m", "init")
+        self.cli("hooks", "install", "all", expect=0)
+        wt = self.dir / ".worktrees" / "feature"
+        self._git("worktree", "add", "-q", str(wt), "-b", "feature")
+        p = self._agents_cli("status", cwd=wt)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("test-case", p.stdout)
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_store_is_found_from_a_worktree_outside_the_repo_directory(self):
+        # Worktrees need not live under the main checkout (`/tmp/<repo>-<branch>`
+        # is a common layout), so walking up from cwd never reaches .casefile/;
+        # the clone's common git dir still names the main checkout.
+        wt = self._outside_worktree()
+        p = self._agents_cli("status", cwd=wt)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertIn("test-case", p.stdout)
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_outside_worktree_honours_the_stores_env_and_author(self):
+        # .env and .casefile/author are untracked, so only the main checkout
+        # has them; a command run from the worktree must still see them or
+        # it runs a postgres store in local mode as an anonymous author.
+        wt = self._outside_worktree()
+        (self.dir / ".env").write_text("CASEFILE_PERSISTENCE_MODE=postgres\n")
+        (self.dir / ".casefile" / "author").write_text("codex\n")
+        gi = self.dir / ".gitignore"
+        gi.write_text(gi.read_text() + ".casefile/\n")
+        r = self.cli("whoami", cwd=wt, expect=0)
+        self.assertIn("author: codex", r.out)
+        r = self.cli("upgrade", "--no-pull", "--no-reexec", "--no-hooks",
+                     cwd=wt, expect=0)
+        self.assertIn("kept: .casefile/ in .gitignore", r.out)
+        self.assertIn(".casefile/", gi.read_text().splitlines())
+
+    @unittest.skipUnless(shutil.which("git"), "git required")
+    def test_outside_worktree_finds_a_store_kept_in_a_subdirectory(self):
+        # The fallback repeats the ordinary walk-up from the same relative
+        # path inside the main checkout, so a monorepo's per-project store
+        # is found and the repo root is not mistaken for it.
+        repo = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, repo, True)
+        (repo / "sub").mkdir()
+        self.cli("init", cwd=repo / "sub", expect=0)
+        self.cli("open", "Sub case", "--goal", "g", cwd=repo / "sub", expect=0)
+        self._git("init", "-q", cwd=repo)
+        self._git("commit", "-q", "--allow-empty", "-m", "init", cwd=repo)
+        wt = repo.parent / (repo.name + "-wt")
+        self.addCleanup(shutil.rmtree, wt, True)
+        self._git("worktree", "add", "-q", str(wt), "-b", "feature", cwd=repo)
+        (wt / "sub").mkdir()
+        r = self.cli("status", cwd=wt / "sub", expect=0)
+        self.assertIn("sub-case", r.out)
+        r = self.cli("status", cwd=wt)
+        self.assertNotEqual(r.rc, 0)
+        self.assertIn("no .casefile found", r.err)
 
     def test_sweep_reason_names_resolvable_cli(self):
         self.cli("hooks", "install", "claude-code", expect=0)

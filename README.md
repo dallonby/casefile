@@ -297,7 +297,8 @@ tamper-evident by construction.
 ## The parts
 
 - **`casefile boot`** — single cold-start ritual for any model: store
-  discovery (`CASEFILE_ROOT` / walk-up / `.casefile-pointer`), author
+  discovery (`CASEFILE_ROOT` / walk-up / `.casefile-pointer` / a linked
+  worktree's main checkout), author
   identity (`CASEFILE_AUTHOR`), startup recheck, and a structured brief
   (WHERE / YOU ARE / WORLD vs LOG / BRIEF / SINCE / DO NOT / NEXT / CARD),
   budgeted as a whole and newest-first in every section. Exit codes for

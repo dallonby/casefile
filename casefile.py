@@ -130,28 +130,28 @@ CLAIM_TESTABILITY = {
 
 # ------------------------------------------------------------------ storage
 
-def find_root(start: Path | None = None) -> Path | None:
-    """Locate the project root that owns `.casefile/`.
-
-    Search order (first hit wins):
-      1. CASEFILE_ROOT env (absolute or relative path to store root)
-      2. walk-up from start/cwd for a `.casefile/` directory
-      3. walk-up for a `.casefile-pointer` file whose contents name the root
-    """
-    env = os.environ.get(ENV_ROOT, "").strip()
-    if env:
-        p = Path(env).expanduser().resolve()
-        if (p / DIR).is_dir():
-            return p
-        if p.name == DIR and p.is_dir():
-            return p.parent
+def _git_run(root: Path, *args: str) -> subprocess.CompletedProcess | None:
+    """`git -C root args`, or None when git itself cannot be run."""
+    try:
+        return subprocess.run(["git", "-C", str(root), *args],
+                              capture_output=True, text=True)
+    except OSError:
         return None
 
-    p = (start or Path.cwd()).resolve()
-    for c in [p, *p.parents]:
+
+def _git_in(root: Path, *args: str) -> str | None:
+    """stdout of `git -C root args`, or None when git is missing or fails."""
+    p = _git_run(root, *args)
+    return p.stdout.strip() if p is not None and p.returncode == 0 else None
+
+
+def _walk_up(start: Path) -> Path | None:
+    """The nearest `.casefile/` at or above `start`, or the root a
+    `.casefile-pointer` file names."""
+    for c in [start, *start.parents]:
         if (c / DIR).is_dir():
             return c
-    for c in [p, *p.parents]:
+    for c in [start, *start.parents]:
         ptr = c / POINTER
         if ptr.is_file():
             try:
@@ -164,6 +164,39 @@ def find_root(start: Path | None = None) -> Path | None:
                     return target
             except OSError:
                 continue
+    return None
+
+
+def find_root(start: Path | None = None) -> Path | None:
+    """Locate the project root that owns `.casefile/`.
+
+    Search order (first hit wins):
+      1. CASEFILE_ROOT env (absolute or relative path to store root)
+      2. walk-up from start/cwd for a `.casefile/` directory
+      3. walk-up for a `.casefile-pointer` file whose contents name the root
+      4. inside a linked git worktree, the same walk-up from the matching
+         path in the clone's main checkout (the parent of git's common
+         dir): a worktree checks out tracked files only, so its store is
+         the main checkout's
+    """
+    env = os.environ.get(ENV_ROOT, "").strip()
+    if env:
+        p = Path(env).expanduser().resolve()
+        if (p / DIR).is_dir():
+            return p
+        if p.name == DIR and p.is_dir():
+            return p.parent
+        return None
+
+    p = (start or Path.cwd()).resolve()
+    found = _walk_up(p)
+    if found is not None:
+        return found
+    common = _git_in(p, "rev-parse", "--git-common-dir")
+    if common:
+        main = (p / common).resolve().parent
+        prefix = _git_in(p, "rev-parse", "--show-prefix") or ""
+        return _walk_up((main / prefix).resolve())
     return None
 
 
@@ -205,38 +238,41 @@ def _apply_dotenv_file(path: Path) -> None:
             os.environ[key] = val
 
 
+def _apply_env_dir(c: Path) -> None:
+    for name in (".env.local", ".env"):
+        p = c / name
+        if p.is_file():
+            _apply_dotenv_file(p)
+    author_file = c / DIR / LOCAL_AUTHOR
+    if author_file.is_file() and ENV_AUTHOR not in os.environ:
+        try:
+            a = author_file.read_text(encoding="utf-8").strip()
+        except OSError:
+            a = ""
+        if a:
+            os.environ[ENV_AUTHOR] = a
+
+
 def ensure_dotenv_loaded(start: Path | None = None) -> None:
     """Load nearest project `.env` / `.env.local` and `.casefile/author`.
 
-    Walks from cwd upward. Nearer files win (first assignment sticks).
-    Process environment always wins over files — no silent override of
-    a real export. Call is idempotent.
+    Walks from cwd upward, then the resolved store root when it lies
+    elsewhere (a linked worktree, or CASEFILE_ROOT): those files are
+    untracked, so only the main checkout has them. Nearer files win (first
+    assignment sticks). Process environment always wins over files — no
+    silent override of a real export. Call is idempotent.
     """
     global _DOTENV_LOADED
     if _DOTENV_LOADED:
         return
     _DOTENV_LOADED = True
     start = (start or Path.cwd()).resolve()
-    for c in [start, *start.parents]:
-        for name in (".env.local", ".env"):
-            p = c / name
-            if p.is_file():
-                _apply_dotenv_file(p)
-        author_file = c / DIR / LOCAL_AUTHOR
-        if author_file.is_file() and ENV_AUTHOR not in os.environ:
-            try:
-                a = author_file.read_text(encoding="utf-8").strip()
-            except OSError:
-                a = ""
-            if a:
-                os.environ[ENV_AUTHOR] = a
-        # stop climbing past a discovered casefile store's parent once we've
-        # also considered its .env (same directory as .casefile/)
-        if (c / DIR).is_dir() and c != start:
-            # still allow this dir's .env (already applied above); continue
-            # one more level only if no author yet — actually keep walking
-            # so monorepo root .env works. No early break.
-            pass
+    chain = [start, *start.parents]
+    for c in chain:
+        _apply_env_dir(c)
+    root = find_root(start)
+    if root is not None and root not in chain:
+        _apply_env_dir(root)
 
 
 def normalize_author(author: str) -> str:
@@ -5941,6 +5977,26 @@ def cli_invocation(root: Path) -> str:
     return f"python3 {Path(__file__).resolve()}"
 
 
+GIT_CONFIG_CLI = "casefile.cli"
+
+
+def _record_cli_in_git_config(root: Path, cli_path: str) -> None:
+    """Git's local config is shared by every worktree of a clone, so a
+    committed AGENTS.md can resolve the CLI from a worktree that has no
+    `.casefile/` checkout of its own."""
+    if _git_in(root, "rev-parse", "--is-inside-work-tree") != "true":
+        return
+    if _git_in(root, "config", "--local", "--get", GIT_CONFIG_CLI) == cli_path:
+        print(f"unchanged: git config {GIT_CONFIG_CLI}")
+        return
+    p = _git_run(root, "config", "--local", GIT_CONFIG_CLI, cli_path)
+    if p is not None and p.returncode == 0:
+        print(f"updated: git config {GIT_CONFIG_CLI}")
+    else:
+        why = p.stderr.strip() if p is not None else "git not found"
+        print(f"skipped: git config {GIT_CONFIG_CLI} ({why})")
+
+
 def cli_invocation_shared(root: Path) -> str:
     """Like `cli_invocation`, but for text written into a file the *project*
     tracks in git — currently `AGENTS.md`, a repository convention file that
@@ -5948,13 +6004,15 @@ def cli_invocation_shared(root: Path) -> str:
 
     An absolute path there is useless to every other clone and leaves the
     file permanently modified, so it can never be committed and reappears
-    after each install. Resolve through the per-checkout `.casefile/cli`
-    pointer instead: the installer already writes it, `.casefile/.gitignore`
-    already excludes it, and reading it at invocation time keeps the CLI
-    resolvable without depending on PATH."""
+    after each install. One fixed command resolves the CLI at run time
+    instead: the machine-local `casefile.cli` git config key the installer
+    records, which local config shares with every worktree of the clone,
+    then the `.casefile/cli` pointer for a clone installed before the key
+    existed or a store outside git. The text never depends on the
+    installing machine's git state, and neither lookup depends on PATH."""
     if (root / "casefile.py").exists():
         return "python3 casefile.py"
-    return 'python3 "$(cat .casefile/cli)"'
+    return f'python3 "$(git config {GIT_CONFIG_CLI} || cat .casefile/cli)"'
 
 
 def _install_hook_scripts(root: Path):
@@ -5962,6 +6020,7 @@ def _install_hook_scripts(root: Path):
     # repos that don't carry casefile.py at their root
     ptr = str(Path(__file__).resolve()) + "\n"
     print(f"{_write_if_changed(root / DIR / 'cli', ptr)}: .casefile/cli")
+    _record_cli_in_git_config(root, ptr.strip())
     cli = cli_invocation(root)
     for rel, content in [(".casefile/hooks/observe.py", HOOK_OBSERVE_PY),
                          (".casefile/hooks/sweep.py", HOOK_SWEEP_PY),
