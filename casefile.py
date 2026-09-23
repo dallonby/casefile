@@ -5897,16 +5897,26 @@ AGENTS_SNIPPET = """\
 ## casefile
 
 This project keeps its investigation state in an append-only casefile log.
+Every command below is `python3 casefile.py <subcommand>`, and a bare
+subcommand named in this section takes that same prefix. If the command
+cannot resolve the CLI (a fresh clone before the operator has run the
+installer), casefile is unavailable in this session: say so and carry on
+without it.
 
-- **Upgrade / keep skill current:** from the project root run
-  `python3 casefile.py upgrade` (git-pulls the casefile checkout, installs a
-  `casefile` symlink on PATH, rewrites SKILL.md + hooks from that CLI). Put
-  this in agent launch scripts so every session starts on current porcelain.
-- **REQUIRED every session:** `export CASEFILE_AUTHOR=<your-id>` then
-  `python3 casefile.py boot`. Pick a durable id for *this* agent (e.g.
-  `claude`, `codex`, `grok`; `fable`→claude, `grok45`→grok). If `whoami` shows author
-  `agent` / `from default`, stop and export first (boot exit 40). Never file
-  as anonymous `agent`.
+- **Start every session with one command:**
+  `python3 casefile.py boot -a <your-id>`. Pick a durable id for *this* agent
+  (e.g. `claude`, `codex`, `grok`; `fable`→claude, `grok45`→grok) and pass it
+  with `-a` on every write, or export `CASEFILE_AUTHOR` where your shell keeps
+  it between commands. Never file as anonymous `agent`. Exit 40 means the
+  identity is unset: fix it and rerun. Exits 10, 20 and 30 (mailbox, drift,
+  stale abstract) are informational: read the brief and continue, or add
+  `--ok-exit` when a non-zero exit would abort your tooling. In an unattended
+  or automated session add `--skip-recheck`: the startup recheck runs shell
+  recipes stored in the shared log.
+- **Never run `upgrade` yourself.** The operator's launcher runs
+  `python3 casefile.py upgrade` before a session: it git-pulls the casefile
+  checkout, rewrites this section, the skill and the hooks, and may edit the
+  project `.gitignore`, so an agent running it leaves tracked files modified.
 - Handoff via the log: `python3 casefile.py packet --to <peer>`,
   `inbox --for <you>`, `next`.
 - **Open messageboard throughout work:** `python3 casefile.py board unread
@@ -5924,8 +5934,9 @@ This project keeps its investigation state in an append-only casefile log.
   ID when a handoff needs immediate attention; the CLI does not wake idle agents.
 - Checkpoint abstracts: `python3 casefile.py checkpoint` then `recall`.
 - **After any context compaction or summarization**, re-run
-  `python3 casefile.py boot` (or `resume-context`) before acting. The log
-  outranks compacted summary.
+  `python3 casefile.py boot -a <your-id>` with the same flags as at session
+  start (or `resume-context`) before acting. The log outranks compacted
+  summary.
 - **Before filing a decision or changing an agreed plan**, run
   `python3 casefile.py dig "<topic>"` then `show <id>` on a hit (and
   `recall` for past-case abstracts) and cite what you find in `--refs`.

@@ -1588,6 +1588,23 @@ class CliHooksInstallTests(CliBase):
         self.assertNotEqual(r.rc, 0)
         self.assertIn("no .casefile found", r.err)
 
+    def test_agents_section_is_safe_for_unattended_agents(self):
+        # Every codex session reads the committed section, unattended ones
+        # included, so it must not send an agent through a command that
+        # rewrites tracked files, and must not make the startup recheck (it
+        # runs shell recipes stored in the shared log) an unflagged default.
+        self.cli("hooks", "install", "all", expect=0)
+        text = (self.dir / "AGENTS.md").read_text()
+        self.assertIn("boot -a <your-id>", text)
+        self.assertNotIn("export CASEFILE_AUTHOR=<your-id>` then", text)
+        self.assertIn("Never run `upgrade` yourself", text)
+        self.assertNotIn("Put this in agent launch scripts", text)
+        self.assertIn("--skip-recheck", text)
+        self.assertIn("--ok-exit", text)
+        self.assertIn("Exit 40", text)
+        self.assertIn("same prefix", text)
+        self.assertIn("cannot resolve the CLI", text)
+
     def test_sweep_reason_names_resolvable_cli(self):
         self.cli("hooks", "install", "claude-code", expect=0)
         p = subprocess.run(

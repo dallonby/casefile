@@ -751,7 +751,12 @@ committed, its commands carry no absolute path: outside the casefile repo
 itself they read the machine-local `casefile.cli` git config key the
 installer records (shared by every worktree of the clone), falling back to
 the `.casefile/cli` pointer for clones installed before the key existed or
-stores outside git — one fixed command, never PATH. Hook trust is per-hook,
+stores outside git — one fixed command, never PATH. The section is written
+for the agent that reads it, unattended sessions included: it never asks the
+agent to run `upgrade` (the launcher does, and it rewrites tracked files),
+gives identity and `boot` as one command with the informational exit codes
+explained, and tells unattended sessions to skip the startup recheck, which
+runs shell recipes stored in the shared log. Hook trust is per-hook,
 hash-based, and granted once interactively via `/hooks`; headless runs use
 `--dangerously-bypass-hook-trust`.
 
