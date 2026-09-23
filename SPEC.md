@@ -142,12 +142,20 @@ Language: **Python ≥3.10, stdlib only** for plumbing and driver (`subprocess`,
 `json`, `argparse`, `sqlite3`). Layout scripts may be thin bash. No runtime
 dependencies is a feature: the tool must run anywhere a model can shell out.
 
-Repo discovery: git-style — walk upward from cwd for `.casefile/`.
+Repo discovery: git-style — walk upward from cwd for `.casefile/`. Inside a
+linked git worktree, repeat that walk from the matching path in the clone's
+main checkout (the parent of git's common dir), since a worktree checks out
+tracked files only; the store's untracked `.env` and `.casefile/author` are
+read from there too, and `init`/`upgrade`/`hooks install` then act on that
+main checkout.
 **The investigation log rides in git** (cross-machine continuity). Everything
 under `.casefile/` except derived/local state (`index.db`, `transcripts/`,
 `log.lock`, `ui/`, `active`, `state/`, `cli`, `journals`) belongs in git —
 starter ignore list lives in `.casefile/.gitignore`, **not** a blanket
-`.casefile/` entry in the project root `.gitignore`.
+`.casefile/` entry in the project root `.gitignore`. That is the rule for
+local persistence: a Postgres-backed store shares history through the
+database, so `init` and `upgrade` leave a blanket `.casefile/` ignore in
+place there.
 
 ## 5. Data model
 
@@ -738,7 +746,17 @@ For author attribution, an explicit hook argv or `CASEFILE_AUTHOR` wins;
 otherwise the sweep recognizes Grok's reserved, runner-injected
 `GROK_HOOK_EVENT` + `GROK_SESSION_ID` pair before defaulting to Claude.
 Conventions land in a managed `AGENTS.md` section (Codex's project
-instructions file), pointing at the shared skill. Hook trust is per-hook,
+instructions file), pointing at the shared skill. Because that file is
+committed, its commands carry no absolute path: outside the casefile repo
+itself they read the machine-local `casefile.cli` git config key the
+installer records (shared by every worktree of the clone), falling back to
+the `.casefile/cli` pointer for clones installed before the key existed or
+stores outside git — one fixed command, never PATH. The section is written
+for the agent that reads it, unattended sessions included: it never asks the
+agent to run `upgrade` (the launcher does, and it rewrites tracked files),
+gives identity and `boot` as one command with the informational exit codes
+explained, and tells unattended sessions to skip the startup recheck, which
+runs shell recipes stored in the shared log. Hook trust is per-hook,
 hash-based, and granted once interactively via `/hooks`; headless runs use
 `--dangerously-bypass-hook-trust`.
 
