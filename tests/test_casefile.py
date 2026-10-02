@@ -1880,14 +1880,14 @@ class CliInitTests(CliBase):
         self.assertTrue((self.dir / ".claude" / "settings.json").exists())
         self.assertTrue((self.dir / ".casefile" / "hooks" / "sweep.py").exists())
         cfg = self.dir / ".codex-home" / "config.toml"
-        self.assertIn("[[hooks.Stop]]", cfg.read_text())
+        self.assertNotIn("[[hooks.Stop]]", cfg.read_text())
         self.assertIn("casefile", (self.dir / "AGENTS.md").read_text())
 
     def test_init_is_idempotent(self):
         r = self.cli("init", expect=0)
         self.assertIn("already exists", r.out)
         cfg = (self.dir / ".codex-home" / "config.toml").read_text()
-        self.assertEqual(cfg.count("[[hooks.Stop]]"), 1)
+        self.assertEqual(cfg.count("[[hooks.Stop]]"), 0)
         agents = (self.dir / "AGENTS.md").read_text()
         self.assertEqual(agents.count("## casefile"), 1)
         if (self.dir / ".gitignore").exists():
@@ -1918,24 +1918,165 @@ class CliInitTests(CliBase):
         text = cfg.read_text()
         self.assertIn('model = "gpt-5.6-sol"', text)
         self.assertIn('[projects."/x"]', text)
-        self.assertEqual(text.count("[[hooks.Stop]]"), 1)
+        self.assertEqual(text.count("[[hooks.Stop]]"), 0)
         try:  # parse-validate where the stdlib has TOML (3.11+)
             import tomllib
             data = tomllib.loads(text)
             self.assertIn("SessionStart", data["hooks"])
-            self.assertIn("Stop", data["hooks"])
+            self.assertNotIn("Stop", data["hooks"])
         except ModuleNotFoundError:
             pass
+
+    def test_codex_upgrade_preserves_hook_trust_state(self):
+        cfg = self.dir / ".codex-home" / "config.toml"
+        trust = ('\n[hooks.state]\n\n'
+                 '[hooks.state."/tmp/config.toml:post_tool_use:0:0"]\n'
+                 'trusted_hash = "sha256:post"\n\n'
+                 '[hooks.state."/tmp/config.toml:session_start:0:0"]\n'
+                 'trusted_hash = "sha256:start"\n\n'
+                 '[hooks.state."/tmp/config.toml:stop:0:0"]\n'
+                 'trusted_hash = "sha256:stop"\n')
+        cfg.write_text(cfg.read_text().replace(
+            cf.CODEX_HOOKS_END, trust + cf.CODEX_HOOKS_END))
+        before = cfg.read_text()
+        state_before = before[before.index("[hooks.state]"):before.index(
+            cf.CODEX_HOOKS_END)]
+        self.cli("hooks", "install", "codex", expect=0)
+        after = cfg.read_text()
+        state_after = after[after.index("[hooks.state]"):after.index(
+            cf.CODEX_HOOKS_END)]
+        self.assertEqual(state_after, state_before)
+        self.assertNotIn("[[hooks.Stop]]", after)
+        self.assertIn('trusted_hash = "sha256:post"', after)
+        self.assertIn('trusted_hash = "sha256:stop"', after)
 
     def test_codex_commands_are_project_dispatching(self):
         # global hooks must no-op outside casefile projects: every command
         # guards on the script's presence in the cwd
         cmds = [l for l in cf.CODEX_HOOKS_TOML.splitlines()
                 if l.startswith("command")]
-        self.assertEqual(len(cmds), 3)
+        self.assertEqual(len(cmds), 2)
         for c in cmds:
             self.assertIn("test -f .casefile/hooks/", c)
             self.assertIn("|| true", c)
+
+
+
+class PostToolSweepReminderTests(CliBase):
+    def setUp(self):
+        super().setUp()
+        self.cli("hooks", "install", "codex", expect=0)
+        self.observe = self.dir / ".casefile" / "hooks" / "observe.py"
+
+    def hook(self, session="s1", **extra):
+        payload = {"session_id": session, "turn_id": "turn1",
+                   "tool_name": "Bash", "tool_input": {"command": "true"},
+                   "tool_response": {"stdout": "", "stderr": ""}}
+        payload.update(extra)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CASEFILE_")}
+        env["CASEFILE_SKIP_PIP"] = "1"
+        p = subprocess.run([sys.executable, str(self.observe)], cwd=self.dir, env=env,
+                           input=json.dumps(payload), capture_output=True, text=True)
+        self.assertEqual(p.returncode, 0, p.stderr)
+        self.assertEqual(p.stderr, "")
+        return p.stdout.strip()
+
+    def test_board_delivery_combines_with_reminder_and_leaves_unread(self):
+        posted = json.loads(self.cli("board", "post", "Build slot", "Ready " + "x" * 1000,
+                                    "-a", "claude", "--to", "codex", "--json", expect=0).out)
+        before = (self.dir / ".casefile/log.jsonl").read_bytes()
+        output = json.loads(self.hook())
+        context = output["hookSpecificOutput"]["additionalContext"]
+        self.assertIn("checkpoint reminder", context)
+        self.assertIn("New casefile board activity", context)
+        self.assertIn(posted["id"], context)
+        self.assertIn("truncated; use --full", context)
+        self.assertNotIn("x" * 1000, context)
+        self.assertEqual((self.dir / ".casefile/log.jsonl").read_bytes(), before)
+        self.assertEqual(self.hook(), "")
+        self.assertIn(posted["id"], self.hook("s2"))
+        unread = json.loads(self.cli("board", "unread", "--for", "codex", "--json", expect=0).out)
+        self.assertEqual(unread["total"], 1)
+
+    def test_quiet_board_checks_throttle_then_deliver_new_activity(self):
+        self.add("-t", "note", "-a", "codex", "secretary sweep: nothing unrecorded")
+        self.assertEqual(self.hook(), "")
+        posted = self.cli("board", "post", "New", "@codex please read", "-a", "claude", expect=0).out
+        self.assertEqual(self.hook(), "")
+        for stamp in (self.dir / ".casefile/state").glob("post-tool-board-*.stamp"):
+            os.utime(stamp, (0, 0))
+        for cursor in (self.dir / ".casefile/state").glob("board-reader-*.json"):
+            data = json.loads(cursor.read_text())
+            data["last_checked"] = 0
+            cursor.write_text(json.dumps(data))
+        self.assertIn(posted, self.hook())
+
+    def test_board_hook_reads_followed_threads_but_not_unrelated_backlog(self):
+        unrelated = self.cli("board", "post", "Unrelated", "public backlog", "-a", "claude", expect=0).out
+        watched = self.cli("board", "post", "My task", "one", "-a", "codex", expect=0).out
+        reply = self.cli("board", "reply", watched, "follow-up", "-a", "claude", expect=0).out
+        context = self.hook()
+        self.assertIn(reply, context)
+        self.assertNotIn(unrelated, context)
+        self.assertNotIn("public backlog", context)
+
+    def test_board_hook_timeout_is_optional_and_does_not_block_turn(self):
+        import time
+        (self.dir / "casefile.py").write_text("import time; time.sleep(10)\n")
+        started = time.monotonic()
+        output = self.hook()
+        self.assertLess(time.monotonic() - started, 4)
+        self.assertNotIn("New casefile board activity", output)
+        self.assertEqual(self.hook(), "")
+
+    def test_due_reminder_is_context_only_and_throttled_per_session(self):
+        d = json.loads(self.hook())
+        self.assertEqual(set(d), {"hookSpecificOutput"})
+        self.assertEqual(d["hookSpecificOutput"]["hookEventName"], "PostToolUse")
+        self.assertIn("checkpoint reminder", d["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(self.hook(), "")
+        self.assertTrue(self.hook("s2"))
+
+    def test_completed_sweep_is_quiet(self):
+        self.add("-t", "note", "-a", "codex", "secretary sweep: nothing unrecorded")
+        self.assertEqual(self.hook(), "")
+
+    def test_quiet_checks_are_also_throttled(self):
+        self.add("-t", "note", "-a", "codex", "secretary sweep: nothing unrecorded")
+        self.assertEqual(self.hook(), "")
+        self.add("-t", "constraint", "-a", "user", "keep required audit records")
+        self.assertEqual(self.hook(), "")
+        for stamp in (self.dir / ".casefile" / "state").glob("post-tool-sweep-*.stamp"):
+            os.utime(stamp, (0, 0))
+        self.assertTrue(self.hook())
+
+    def test_missing_policy_does_not_disrupt_observation_logging(self):
+        (self.observe.parent / "sweep.py").unlink()
+        self.assertEqual(self.hook(tool_input={"command": "pytest tests"},
+                        tool_response={"stdout": "3 passed", "stderr": ""}), "")
+        self.assertTrue(any("3 passed" in e["body"] for e in self.log_entries()
+                            if e["type"] == "observation"))
+
+    def test_other_vendor_payload_does_not_get_extra_reminder(self):
+        p = subprocess.run([sys.executable, str(self.observe)], cwd=self.dir,
+                           input=json.dumps({"toolName": "run_terminal_command",
+                           "toolInput": {"command": "true"}}),
+                           capture_output=True, text=True)
+        self.assertEqual((p.returncode, p.stdout, p.stderr), (0, "", ""))
+
+    def test_upgrade_removes_only_managed_casefile_stop(self):
+        cfg = self.dir / ".codex-home" / "config.toml"
+        legacy = cf.CODEX_HOOKS_TOML + '\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype="command"\ncommand="python3 .casefile/hooks/sweep.py codex"\n'
+        cf._managed_block(cfg, cf.CODEX_HOOKS_BEGIN, cf.CODEX_HOOKS_END, legacy)
+        with cfg.open("a") as f:
+            f.write('\n[[hooks.Stop]]\n[[hooks.Stop.hooks]]\ntype="command"\ncommand="echo unrelated-hook"\n')
+        self.cli("hooks", "install", "codex", expect=0)
+        text = cfg.read_text()
+        self.assertEqual(text.count("[[hooks.Stop]]"), 1)
+        self.assertIn("echo unrelated-hook", text)
+        self.assertNotIn("sweep.py codex", text)
+        self.cli("hooks", "install", "codex", expect=0)
+        self.assertEqual(cfg.read_text(), text)
 
 
 class CliLintTests(CliBase):

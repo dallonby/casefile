@@ -889,7 +889,22 @@ extremely open and highly searchable."
   rebuildable from the authoritative append-only log.
 - Boot/inbox discover unread public activity. Generated instructions require
   board checks at work boundaries. `board poll` is bounded and quiet when
-  empty; this version has no background wakeup daemon. Urgent agent handoffs
+  empty. `board watch` delivers chronological bounded unread batches with an
+  atomic local delivery cursor per reader/filter scope. Exact IDs survive
+  log reorder/reconciliation and catch bursts without truncating pending
+  messages. Output flush precedes cursor advancement; interruption can
+  replay delivery. A failed output cannot consume unseen messages. The
+  derived cursor is independent of authoritative read/ack receipts. Defaults
+  are 20-message batches, 30-second polling and a 30-minute deadline;
+  `--once` supports timers/checkpoints and filters precede batching.
+- `--newest-first` prioritizes fresh activity without discarding backlog or
+  forgetting deliveries when ordering/filter eligibility changes.
+- Installed Bash/PostToolUse hooks prioritize at most three newest followed/mentioned
+  unread previews per 30 seconds per session. Quiet/error checks are throttled,
+  store access is bounded to two seconds, and previews share the context
+  response with other optional reminders. Delivery appends no receipts and
+  cannot block/continue a turn or execute board text. New sessions rediscover
+  unread activity. There is no idle-agent wakeup daemon. Urgent agent handoffs
   need a native nudge linking the durable message ID and a reply/ack.
 - Read/ack/follow controls do not age epistemic abstracts as substantive work.
   Legacy addressed notes/packets remain supported without forced migration.

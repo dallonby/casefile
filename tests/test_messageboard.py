@@ -6,6 +6,8 @@ import select
 import signal
 import subprocess
 import sys
+from types import SimpleNamespace
+from unittest.mock import patch
 from test_casefile import CASEFILE, CliBase, cf
 import casefile_board as board
 
@@ -17,6 +19,156 @@ class MessageboardTests(CliBase):
 
     def rows(self, *args):
         return json.loads(self.cli("board", *args, "--json", expect=0).out)
+
+    def reader(self, *args, author="claude"):
+        out = self.cli("board", "watch", "--once", "--for", author,
+                       "--json", *args, expect=0).out
+        return [json.loads(line) for line in out.splitlines()]
+
+    def test_reader_restart_has_exact_cursor_but_does_not_mark_read(self):
+        p = self.post()
+        before = (self.dir / ".casefile/log.jsonl").read_bytes()
+        self.assertEqual([r["id"] for r in self.reader()], [p["id"]])
+        self.assertEqual(self.reader(), [])
+        r = self.rows("reply", p["id"], "follow-up", "-a", "codex")
+        self.assertEqual([m["id"] for m in self.reader()], [r["id"]])
+        self.assertEqual(self.rows("unread", "--for", "claude")["total"], 2)
+        self.assertTrue((self.dir / ".casefile/log.jsonl").read_bytes().startswith(before))
+        self.assertFalse(any(board.is_control(e) for e in self.log_entries()))
+        # Another session/consumer can rediscover unprocessed instructions.
+        self.assertEqual([m["id"] for m in self.reader("--reader", "other")], [p["id"], r["id"]])
+
+    def test_reader_drains_burst_oldest_first_and_preserves_filtered_messages(self):
+        p = self.post()
+        expected = [p["id"]]
+        expected += [self.rows("reply", p["id"], str(i), "-a", "codex")["id"] for i in range(6)]
+        observed = []
+        for _ in range(4):
+            observed += [e["id"] for e in self.reader("--limit", "2")]
+        self.assertEqual(observed, expected)
+        self.assertEqual(self.reader(), [])
+        # Consumer identity includes the filter scope, so one view cannot
+        # discard undelivered instructions belonging to another view.
+        other = self.post("Different thread", "other", "codex", "--tag", "slots")
+        self.assertEqual(self.reader("--tag", "gas"), [])
+        self.assertEqual([e["id"] for e in self.reader("--tag", "slots")], [other["id"]])
+
+    def test_reader_follows_mentions_and_normalizes_author_filter(self):
+        p = self.post("Follow", "interesting", "codex", "--tag", "gas")
+        self.rows("follow", p["id"], "-a", "claude")
+        other = self.post("Unfollowed", "other", "codex")
+        mention = self.rows("reply", other["id"], "@claude please look", "-a", "Codex")
+        self.assertEqual([r["id"] for r in self.reader("--following", "--by", "codex")],
+                         [p["id"], mention["id"]])
+        self.assertEqual([r["id"] for r in self.reader("--thread", mention["id"], "--following")],
+                         [mention["id"]])
+        self.assertEqual(self.reader(author="codex"), [])
+
+    def test_reader_preview_full_read_and_status_filters_are_independent(self):
+        p = self.post(body="x" * 1000)
+        clipped = self.reader()[0]
+        self.assertTrue(clipped["body_truncated"])
+        full = self.reader("--full")[0]
+        self.assertEqual(full["body"], p["body"])
+        self.assertFalse(full["body_truncated"])
+        self.rows("read", p["id"], "--message", "--full", "-a", "claude")
+        self.assertEqual(self.reader("--reader", "fresh"), [])
+        s = self.rows("status", p["id"], "blocked", "needs help", "-a", "codex")
+        self.assertEqual(self.reader("--status", "open"), [])
+        self.assertEqual([r["id"] for r in self.reader("--status", "blocked")], [s["id"]])
+
+    def test_reader_temporary_unfollow_does_not_erase_delivery(self):
+        p = self.post()
+        self.rows("follow", p["id"], "-a", "claude")
+        self.assertEqual([r["id"] for r in self.reader("--following")], [p["id"]])
+        self.rows("unfollow", p["id"], "-a", "claude")
+        self.assertEqual(self.reader("--following"), [])
+        self.rows("follow", p["id"], "-a", "claude")
+        self.assertEqual(self.reader("--following"), [])
+
+    def test_reader_fresh_priority_preserves_backlog_and_cursor(self):
+        p = self.post()
+        replies = [self.rows("reply", p["id"], str(i), "-a", "codex")["id"] for i in range(4)]
+        self.assertEqual([r["id"] for r in self.reader("--newest-first", "--limit", "2")],
+                         list(reversed(replies[-2:])))
+        self.assertEqual([r["id"] for r in self.reader()], [p["id"], *replies[:2]])
+        self.assertEqual(self.reader("--newest-first"), [])
+
+    def test_reader_reconciled_older_message_is_not_lost(self):
+        p = self.post()
+        self.reader()
+        later = self.rows("reply", p["id"], "merged older finding", "-a", "codex")
+        entries = self.log_entries()
+        entries.insert(0, entries.pop())  # a merge can place activity before its root
+        (self.dir / ".casefile/log.jsonl").write_text(
+            "".join(json.dumps(e) + "\n" for e in entries))
+        self.assertEqual([r["id"] for r in self.reader()], [later["id"]])
+
+    def test_reader_partial_append_cooldown_and_corrupt_cursor(self):
+        p = self.post()
+        self.assertEqual([r["id"] for r in self.reader("--cooldown", "30")], [p["id"]])
+        r = self.rows("reply", p["id"], "new", "-a", "codex")
+        self.assertEqual(self.reader("--cooldown", "30"), [])
+        self.assertEqual([m["id"] for m in self.reader()], [r["id"]])
+        with (self.dir / ".casefile/log.jsonl").open("ab") as f:
+            f.write(b'{"id":')
+        self.assertEqual(self.reader(), [])
+        cursor = next((self.dir / ".casefile/state").glob("board-reader-*.json"))
+        cursor.write_text("broken JSON")
+        failure = self.cli("board", "watch", "--once", "--for", "claude", expect=1)
+        self.assertIn("invalid board reader cursor", failure.err)
+
+    def test_reader_failed_output_does_not_advance_and_busy_reader_is_quiet(self):
+        p = self.post()
+        args = SimpleNamespace(for_author="claude", author=None, reader="watch", thread=None,
+                               case=None, tag=[], by=None, status=None, following=False,
+                               full=False, json=True, cooldown=0, limit=20)
+        def broken(_):
+            raise BrokenPipeError()
+        with self.assertRaises(BrokenPipeError):
+            board.reader_once(cf, self.dir, args, emit=broken)
+        self.assertFalse(list((self.dir / ".casefile/state").glob("board-reader-*.json")))
+        lock = next((self.dir / ".casefile/state").glob("board-reader-*.lock"))
+        with board._reader_lock(lock) as held:
+            self.assertTrue(held)
+            self.assertEqual(self.reader(), [])
+        self.assertEqual([r["id"] for r in self.reader()], [p["id"]])
+
+    def test_reader_refreshes_postgres_mirror_each_cycle(self):
+        p = self.post()
+        with patch.object(cf, "persistence_mode", return_value="postgres"), \
+                patch.object(cf, "read_entries", return_value=self.log_entries()) as read:
+            key = str(self.dir.resolve())
+            cf._PG_RECONCILED.add(key)
+            cf._PG_LOCAL_CACHE[key] = []
+            self.assertEqual(board._tail_entries(cf, self.dir)[-1]["id"], p["id"])
+            self.assertNotIn(key, cf._PG_RECONCILED)
+            self.assertNotIn(key, cf._PG_LOCAL_CACHE)
+            self.assertEqual(read.call_count, 1)
+
+    def test_reader_follows_live_arrivals_and_deadline_is_finite(self):
+        p = self.post()
+        env = {k: v for k, v in os.environ.items() if not k.startswith("CASEFILE_")}
+        env["CASEFILE_SKIP_PIP"] = "1"
+        proc = subprocess.Popen([sys.executable, str(CASEFILE), "board", "watch", "--for", "claude",
+                                 "--interval", "0.05", "--timeout", "2", "--json"],
+                                cwd=self.dir, env=env, stdout=subprocess.PIPE,
+                                stderr=subprocess.PIPE, text=True)
+        try:
+            self.assertTrue(select.select([proc.stdout], [], [], 5)[0])
+            self.assertEqual(json.loads(proc.stdout.readline())["id"], p["id"])
+            r = self.rows("reply", p["id"], "live", "-a", "codex")
+            self.assertTrue(select.select([proc.stdout], [], [], 5)[0])
+            self.assertEqual(json.loads(proc.stdout.readline())["id"], r["id"])
+            out, err = proc.communicate(timeout=4)
+            self.assertEqual((proc.returncode, out, err), (0, "", ""))
+        finally:
+            if proc.poll() is None:
+                proc.kill()
+            proc.communicate(timeout=3)
+        for flag, value in [("--interval", "0"), ("--timeout", "nan"), ("--cooldown", "-1"), ("--limit", "0")]:
+            self.assertEqual(self.cli("board", "watch", "--once", "--for", "claude", flag, value).rc, 1)
+        self.assertEqual(self.cli("board", "watch", "--once").rc, cf.EXIT_IDENTITY)
 
     def test_tail_is_bounded_by_default_and_full_is_explicit(self):
         p = self.post()

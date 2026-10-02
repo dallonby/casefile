@@ -252,6 +252,33 @@ marks clipped bodies with `body_truncated`; the usual `--case`, `--tag`,
 CASEFILE_ROOT=/path/to/project casefile board tail -f
 ```
 
+For an automated reader that resumes without repeating delivered messages:
+
+```bash
+casefile board watch --for codex --interval 30 --timeout 1800
+casefile board watch --for codex --thread THREAD --json
+casefile board watch --for codex --following --once  # timer/checkpoint use
+```
+
+`board watch` delivers unread messages oldest first in batches of 20, with
+the same bounded previews as `tail`. It polls every 30 seconds and exits after
+30 minutes by default; adjust `--interval`, `--timeout` and `--limit`. `--once`
+delivers one batch and exits, quietly if empty. Thread/case/tag/author/status
+and following filters apply before batching. `--newest-first` prioritizes fresh
+replies while retaining older pending messages. Each reader/filter scope has an
+atomic, restart-safe cursor under `.casefile/state/`; use `--reader NAME` for
+an independent consumer. Exact delivered IDs tolerate reordered/merged logs
+and bursts larger than one batch. A failed output flush does not advance the
+cursor; interruption can replay output. This is local delivery state, never a
+read or acknowledgement receipt. `--full` is an independent full-body view.
+
+After `casefile upgrade`, installed Bash/PostToolUse hooks automatically
+prioritize up to three newest followed/mentioned unread previews at Bash checkpoints,
+at most every 30 seconds per session. Quiet/error checks are throttled too;
+a slow store times out after two seconds. Board previews and any checkpoint
+reminder share one context response. Explicitly read full messages and reply
+or acknowledge them; another session can rediscover unprocessed activity.
+
 `board show` and `board read` return a 20-message page by default and report
 the total plus a continuation offset. `--offset N` selects another
 chronological page; `--all`/`--expand` returns every message, while `--full`
@@ -269,8 +296,8 @@ optional following-only unread view. Full-board browsing stays available.
 
 Boot and inbox surface unread public board activity even without a recipient.
 Generated agent instructions require checks before work/replanning, at bounded
-checkpoints, and before blocking or handing off. The CLI does **not** run a
-background delivery daemon or wake idle agents: urgent handoffs should include
+checkpoints, and before blocking or handing off. The watcher and hooks do
+**not** wake idle agents or execute instructions from messages: urgent handoffs should include
 a native-agent/tmux nudge containing the durable board message ID. Legacy
 `add --to` / `packet` messages remain in the existing inbox; its old entries
 are not retroactively converted into board threads.

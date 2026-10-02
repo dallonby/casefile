@@ -8,11 +8,15 @@ Recipients and follows select attention; they never restrict visibility.
 import argparse
 import hashlib
 import json
+import math
 import os
 import re
 import sqlite3
 import sys
 import time
+from contextlib import contextmanager
+from pathlib import Path
+import tempfile
 
 VERSION = 1
 ACTIVITY = {"post", "reply", "status"}
@@ -217,15 +221,17 @@ def preview_ids(entries, author, normalize):
             for target in payload(e).get("previews", [])}
 
 
-def following(entries, thread, author, normalize):
-    author = normalize(author)
-    implicit = any(normalize(e["author"]) == author
-                   for e in thread["messages"])
+def _follow_settings(entries, author, normalize):
     settings = {}
     for e in entries:
         b = payload(e)
         if normalize(e["author"]) == author and b.get("op") in {"follow", "unfollow"}:
             settings[b["scope"]] = b["op"] == "follow"
+    return settings
+
+
+def _is_following(thread, author, normalize, settings):
+    implicit = any(normalize(e["author"]) == author for e in thread["messages"])
     exact = "thread:" + thread["id"]
     if exact in settings:
         return settings[exact]
@@ -233,13 +239,19 @@ def following(entries, thread, author, normalize):
         settings.get("tag:" + tag, False) for tag in thread["tags"])
 
 
+def following(entries, thread, author, normalize):
+    author = normalize(author)
+    return _is_following(thread, author, normalize, _follow_settings(entries, author, normalize))
+
+
 def unread(entries, author, normalize, *, followed=False):
     """Exact seen-ID sets: writes and later replies never advance a cursor."""
     author = normalize(author)
     seen = read_ids(entries, author, normalize)
+    settings = _follow_settings(entries, author, normalize) if followed else {}
     result = []
     for t in threads(entries).values():
-        is_following = following(entries, t, author, normalize) if followed else False
+        is_following = _is_following(t, author, normalize, settings) if followed else False
         for e in t["messages"]:
             if e["id"] in seen or normalize(e["author"]) == author:
                 continue
@@ -443,6 +455,162 @@ def _tail_entries(cf, root):
     return entries
 
 
+def _stream_row(e, t, args):
+    body, body_truncated = _bounded_body(e["body"], full=args.full)
+    title, title_truncated = _bounded_title(t["title"], full=args.full)
+    refs, refs_truncated = _bounded_refs(e.get("refs", []), full=args.full)
+    return {"id": e["id"], "thread": t["id"], "case": t["case"],
+            "ts": e["ts"], "author": e["author"], "op": payload(e)["op"],
+            "body": body, "body_truncated": body_truncated,
+            "refs": refs, "refs_count": len(e.get("refs", [])),
+            "refs_truncated": refs_truncated,
+            "title": title, "title_truncated": title_truncated}
+
+
+def _emit_stream_row(row, args):
+    if args.json:
+        print(json.dumps(row, ensure_ascii=False), flush=True)
+    else:
+        print(f"{row['ts']}  {row['author']} [{row['op']}]  "
+              f"thread={row['thread']} message={row['id']}\n"
+              f"{row['title']}\n{row['body']}\n", flush=True)
+
+
+@contextmanager
+def _reader_lock(path):
+    """Local consumer lock, independent of the authoritative log writer.
+
+    Advisory locks disappear on process exit/crash. A concurrent checkpoint
+    skips this cycle instead of waiting behind another reader or duplicating
+    its delivery. The next checkpoint still sees the undelivered messages.
+    """
+    with path.open("a+b") as handle:
+        if os.name == "nt":
+            import msvcrt
+            if not handle.tell():
+                handle.write(b"\0")
+                handle.flush()
+            handle.seek(0)
+            acquire = lambda: msvcrt.locking(handle.fileno(), msvcrt.LK_NBLCK, 1)
+            release = lambda: (handle.seek(0), msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1))
+        else:
+            import fcntl
+            acquire = lambda: fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            release = lambda: fcntl.flock(handle, fcntl.LOCK_UN)
+        try:
+            acquire()
+        except OSError:
+            yield False
+            return
+        try:
+            yield True
+        finally:
+            release()
+
+
+def reader_once(cf, root, args, emit=None):
+    """Deliver one bounded batch; delivery is never a read/ack receipt.
+
+    Exact IDs survive log merges/reordering. Save only after output flushes;
+    an interruption may replay output, but can never consume unseen output.
+    Cursor files are disposable local state, not the authoritative unread set.
+    """
+    peer = cf.normalize_author(args.for_author or _author(cf, args))
+    if peer in {"agent", "system"}:
+        cf.die("board watch requires a named reader: export CASEFILE_AUTHOR or use --for",
+               cf.EXIT_IDENTITY)
+    scope = {"reader": args.reader, "for": peer, "thread": args.thread,
+             "case": args.case, "tag": sorted(_tags(cf, args.tag)),
+             "by": cf.normalize_author(args.by) if args.by else None,
+             "status": args.status, "following": args.following, "full": args.full}
+    key = hashlib.sha256(json.dumps(scope, sort_keys=True).encode()).hexdigest()[:32]
+    path = root / cf.DIR / "state" / f"board-reader-{key}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with _reader_lock(path.with_suffix(".lock")) as acquired:
+        if not acquired:
+            return []
+        state = {"version": 1, "scope": scope, "delivered": []}
+        if path.exists():
+            try:
+                state = json.loads(path.read_text(encoding="utf-8"))
+                if (state.get("version") != 1 or state.get("scope") != scope
+                        or not isinstance(state.get("delivered"), list)
+                        or not all(isinstance(i, str) for i in state["delivered"])
+                        or not isinstance(state.get("last_checked", 0), (float, int))
+                        or not math.isfinite(state.get("last_checked", 0))):
+                    raise ValueError("invalid reader state")
+            except (ValueError, AttributeError) as exc:
+                cf.die(f"invalid board reader cursor {path}: {exc}; remove this derived file to replay unread messages")
+        now = time.time()
+        if 0 <= now - state.get("last_checked", 0) < args.cooldown:
+            return []
+        entries = _tail_entries(cf, root)
+        catalog = threads(entries)
+        tid = _thread(cf, entries, args.thread, catalog)[0]["id"] if args.thread else None
+        selected = []
+        # Oldest unread first: bounded batches must drain bursts without gaps.
+        pending = unread(entries, peer, cf.normalize_author, followed=args.following)
+        if not getattr(args, "newest_first", False):
+            pending.reverse()
+        for e in pending:
+            t = catalog[payload(e).get("thread", e["id"])]
+            if (not tid or t["id"] == tid) and _selected(t, args, cf) and (
+                    not args.by or cf.normalize_author(e["author"]) == scope["by"]):
+                selected.append((e, t))
+        # A temporary status/follow change must not erase previous deliveries.
+        # Prune only authoritative read/ack IDs, not currently filtered IDs.
+        delivered = set(state["delivered"]) - read_ids(entries, peer, cf.normalize_author)
+        rows = []
+        for e, t in selected:
+            if e["id"] not in delivered:
+                rows.append(_stream_row(e, t, args))
+                if len(rows) == args.limit:
+                    break
+        output = emit or (lambda row: _emit_stream_row(row, args))
+        for row in rows:
+            output(row)
+        state.update(delivered=sorted(delivered | {r["id"] for r in rows}), last_checked=now)
+        tmp = None
+        try:
+            with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                             prefix=path.name + ".", delete=False) as handle:
+                tmp = Path(handle.name)
+                json.dump(state, handle, ensure_ascii=False)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp, path)
+        finally:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+        return rows
+
+
+def watch(cf, args):
+    if not 1 <= args.limit <= 500:
+        cf.die("--limit must be between 1 and 500")
+    for name in ("interval", "timeout", "cooldown"):
+        value = getattr(args, name)
+        if not math.isfinite(value) or value < 0 or (name == "interval" and value == 0):
+            cf.die(f"--{name} must be finite and {'positive' if name == 'interval' else 'nonnegative'}")
+    root = cf.find_root()
+    if root is None:
+        cf.die("no .casefile found here or in any parent")
+    deadline = time.monotonic() + args.timeout
+    try:
+        while True:
+            reader_once(cf, root, args)
+            remaining = deadline - time.monotonic()
+            if args.once or remaining <= 0:
+                return
+            time.sleep(min(args.interval, remaining))
+            if time.monotonic() >= deadline:
+                return
+    except KeyboardInterrupt:
+        return
+    except BrokenPipeError:
+        sys.stdout = open(os.devnull, "w")
+
+
 def tail(cf, args):
     """Plain chronological messages, optionally followed; never write receipts."""
     if args.lines < 0:
@@ -466,28 +634,11 @@ def tail(cf, args):
                         or not _selected(t, args, cf)
                         or (args.by and cf.normalize_author(e["author"]) != cf.normalize_author(args.by))):
                     continue
-                body, body_truncated = _bounded_body(
-                    e["body"], full=getattr(args, "full", False))
-                title, title_truncated = _bounded_title(
-                    t["title"], full=getattr(args, "full", False))
-                refs, refs_truncated = _bounded_refs(
-                    e.get("refs", []), full=getattr(args, "full", False))
-                rows.append({"id": e["id"], "thread": t["id"],
-                             "case": t["case"], "ts": e["ts"], "author": e["author"],
-                             "op": b["op"], "body": body,
-                             "body_truncated": body_truncated,
-                             "refs": refs, "refs_count": len(e.get("refs", [])),
-                             "refs_truncated": refs_truncated,
-                             "title": title, "title_truncated": title_truncated})
+                rows.append(_stream_row(e, t, args))
             if first:
                 rows = rows[-args.lines:] if args.lines else []
             for row in rows:
-                if args.json:
-                    print(json.dumps(row, ensure_ascii=False), flush=True)
-                else:
-                    print(f"{row['ts']}  {row['author']} [{row['op']}]  "
-                          f"thread={row['thread']} message={row['id']}\n"
-                          f"{row['title']}\n{row['body']}\n", flush=True)
+                _emit_stream_row(row, args)
             seen.update(e["id"] for e in entries)
             first = False
             if not args.follow:
@@ -503,6 +654,8 @@ def tail(cf, args):
 def run(cf, args):
     if args.board_command == "tail":
         return tail(cf, args)
+    if args.board_command == "watch":
+        return watch(cf, args)
     root, entries, meta = cf.require_root()
     op = args.board_command or "list"
     if getattr(args, "limit", 1) < 1 or getattr(args, "limit", 1) > 500:
@@ -742,13 +895,14 @@ def register(subparsers, cf):
         p.add_argument("body", nargs="?")
         p.add_argument("--body-stdin", action="store_true")
 
-    def filters(p, default=DEFAULT_LIMIT):
+    def filters(p, default=DEFAULT_LIMIT, *, pagination=True):
         p.add_argument("--case", help="exact case ID; default all cases")
         p.add_argument("--tag", action="append", default=[], help="exact tag; repeat for intersection")
         p.add_argument("--by", help="message author (thread starter for list)")
         p.add_argument("--status", choices=STATES)
         p.add_argument("--limit", type=int, default=default)
-        p.add_argument("--offset", type=int, default=0)
+        if pagination:
+            p.add_argument("--offset", type=int, default=0)
 
     p = command("post", "start a public thread; recipients are attention hints")
     p.add_argument("title")
@@ -807,6 +961,18 @@ def register(subparsers, cf):
     p.add_argument("--tag", action="append", default=[])
     p.add_argument("--by", help="message author")
     p.add_argument("--status", choices=STATES)
+    p = command("watch", "deliver unread activity with a restart-safe local cursor; never acknowledge")
+    filters(p, pagination=False)
+    p.add_argument("--for", dest="for_author", help="reader's stable author ID")
+    p.add_argument("--thread", help="restrict to a thread or message ID/prefix")
+    p.add_argument("--following", action="store_true", help="followed topics/threads and mentions only")
+    p.add_argument("--reader", default="watch", help="independent delivery cursor name (default watch)")
+    p.add_argument("--interval", type=float, default=30, help="poll seconds (default 30)")
+    p.add_argument("--timeout", type=float, default=1800, help="total watch seconds (default 1800)")
+    p.add_argument("--once", action="store_true", help="deliver one batch and exit; repeat for timer/checkpoint use")
+    p.add_argument("--newest-first", action="store_true", help="prioritize fresh messages over unread backlog")
+    p.add_argument("--cooldown", type=float, default=0, help="minimum seconds between checks of this cursor")
+    p.add_argument("--full", action="store_true", help="include complete message bodies and metadata")
     for name in ("unread", "poll"):
         p = command(name, "unread public messages; poll is quiet when empty")
         filters(p, default=DEFAULT_POLL_LIMIT if name == "poll" else DEFAULT_LIMIT)
