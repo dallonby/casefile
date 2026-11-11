@@ -42,7 +42,11 @@ Record decisions and evidence during work and checkpoint before handoff.
   `python3 casefile.py dig "<topic>"` then `show <id>` on a hit (and
   `recall` for past-case abstracts) and cite what you find in `--refs`.
   Do not grep log.jsonl or a sidecar chat transcript. Decisions carry
-  `--rationale` and `--rejected` for losing options.
+  `--rationale` and `--rejected` for losing options, self-contained bodies
+  (never bare `"yes"`/`"ok"` or unanchored item numbers), and `--scope turn`
+  when a directive applies only to the current turn. Close open items inline on
+  `add` (`--answer <q-id>`, `--fulfill <dec-id>` on observations, `--verify
+  <hyp-id>` on observations, `--supersede <old-id>` on revisions).
 - **Before a consequential spitball**, sweep the current conversation into
   the log and freeze a manifest of verbatim requirements, criteria/weights,
   alternatives, evidence domains, analysis layers, and open questions.

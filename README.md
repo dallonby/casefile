@@ -389,11 +389,16 @@ tamper-evident by construction.
   questions, what was ruled out and how, last verification). `where`
   prints only the footer. Threads are computed from the graph, never
   stored.
-- **Closure** — `casefile done <decision> --evidence <obs-id|text>` marks a
-  decision fulfilled; `add -t decision --supersede <old> --rationale "…"`
-  revises a plan (same author, or the user). Fulfilled, superseded and
-  revoked entries leave the live views and counts, so the working set
-  shrinks as work ships.
+- **Closure** — close lifecycle transitions inline as you file: `--answer <q>`
+  resolves a question with the answering entry, `--fulfill <decision>` on an
+  `observation` marks the decision fulfilled with ground-truth evidence,
+  `--verify <hypothesis>` on an `observation` verifies the claim in one step,
+  `--supersede <old> --rationale "…"` revises a plan (same author, or the
+  user), and `--scope turn` marks tactical one-turn decisions/constraints so
+  they retire automatically after the turn's sweep, checkpoint, or session
+  end (`casefile done` and `casefile verify` remain available afterwards).
+  Fulfilled, superseded, revoked and expired entries leave the live views and
+  counts, so the working set shrinks as work ships.
 
 For a consequential debate, freeze the contract before the first argument:
 
@@ -436,15 +441,20 @@ casefile add -t observation -a codex "measured inclusion latency" \
 hand: a hypothesis/decision/constraint/question that near-duplicates a
 recent entry of the same type by the same author class is refused (exit 3)
 with the earlier id — cite it with `--ref`, replace it with `--supersede`,
-or file anyway with `--force`; and 8-hex ids cited in the body are
-harvested into `refs` automatically, with a warning for ids that do not
-exist (the entry is still filed).
+or file anyway with `--force`; bare chat affirmations (`"yes please"`, `"ok"`)
+or short unanchored item numbers (`"(2)"`) on decisions/constraints are
+refused so entries remain readable after a context reset; prose that cites a
+live same-type id with replacement language without `--supersede` is refused
+so superseded claims are retired rather than left co-live; and 8-hex ids
+cited in the body are harvested into `refs` automatically, with a warning for
+ids that do not exist (the entry is still filed).
 
-Singular `--ref`, `--reject`, and `--supersede` flags are repeatable and avoid
-the positional swallowing ambiguity of their legacy variadic counterparts.
-Constraints and decisions can be revised by the same authority (or the user)
-with `--supersede` plus a reason; `revoke` remains the explicit retraction
-and `done` the explicit completion.
+Singular `--ref`, `--reject`, `--supersede`, `--answer`, `--fulfill`, and
+`--verify` flags are repeatable and avoid the positional swallowing ambiguity
+of their legacy variadic counterparts. Constraints and decisions can be
+revised by the same authority (or the user) with `--supersede` plus a reason,
+or scoped to the current turn with `--scope turn`; `revoke` remains the
+explicit retraction and `done` the standalone completion.
 
 ## Upgrade and maintenance
 

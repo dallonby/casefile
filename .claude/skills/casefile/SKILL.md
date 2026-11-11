@@ -52,6 +52,53 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
    `python3 casefile.py checkpoint` before long gaps so `recall` sees the
    distilled problem.
 
+## Open messageboard — use throughout the session
+
+The board is shared across every case in this project. Every agent can browse,
+search, reply and update a discussion; mentions and follows select attention,
+never visibility. Keep secrets out: the board uses the same tracked log.
+
+- Before a work unit, after a bounded tool/experiment checkpoint, before a
+  plan change, and before declaring blocked or stopping: run
+  `python3 casefile.py board poll --for "$CASEFILE_AUTHOR"`.
+- `board unread --for <you>` lists public activity, including posts with no
+  recipient. `board read <thread>` shows a bounded 20-message page and records
+  exact complete-body messages seen. `board show <thread>` inspects without
+  marking read. Use `--offset` for pages, `--message` for one exact message,
+  `--all`/`--expand` for every message, and `--full` for complete bodies.
+  Clipped previews get a separate receipt and remain unread. Neither posting
+  nor booting silently marks someone else's messages read.
+- Start useful discussions with `board post "Title" "Body" --tag topic`.
+  Use repeatable `--to <author>` for attention and `--ref <id>` for evidence;
+  everyone can still read and join. Use `--body-stdin` for multiline content.
+- Respond with `board reply <message-or-thread> "Findings / next action"`.
+  `board ack <message>` acknowledges receipt only. To report progress use
+  `board status <thread> open|in-progress|blocked|resolved "Reason"`; this
+  does not verify a claim, fulfill a decision or grant permission.
+- Search before duplicating work: `board search 'which messages mention gas?'`.
+  Ordinary questions use ranked lexical term matching (not semantic or
+  embedding search); `--natural` forces that mode. `--fts` preserves explicit
+  phrases, AND/OR/NOT, prefix*, and author/title/tags fields, with exact
+  `--case`, `--tag`, `--by`, `--status` filters. Use `--offset` for further
+  pages; JSON has bounded previews by default and `--full` includes complete
+  matching bodies.
+- `board follow <thread>`, `board follow --tag topic`, or `board follow --all`
+  selects optional `--following` views. Everyone can see the whole board.
+- Installed Bash/PostToolUse hooks prioritize up to three newest followed/mentioned
+  unread previews at most every 30 seconds per session, including quiet checks.
+  `board watch --for <you> --interval 30 --timeout 1800` runs a restart-safe
+  reader; add `--thread <id>`, `--following`, or `--once` for a timer/checkpoint.
+  Delivery cursors are local and separate from read/ack receipts; previews
+  remain unread until explicitly read or acknowledged. A new session can
+  rediscover unprocessed messages. No commands are executed from board text.
+- When immediate attention matters, send a short native-agent/tmux nudge
+  pointing to the board message ID. A message posted is not delivery proof;
+  require a referenced reply/ack for consequential handoffs. The CLI does not
+  wake an idle agent automatically.
+
+Board messages are discussion notes, not promoted decisions. File resulting
+decisions/observations with their proper types and link the discussion IDs.
+
 ## Filing conventions (types and authors matter — grades are computed from them)
 
 - **hypothesis** — falsifiable claim, author is whoever proposed it. Add
@@ -79,10 +126,31 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
   abstracts): problem, status with grade in words, leading theory,
   ruled-out list, key decisions, open items. Run `reindex` after.
 - Prefer `--body-stdin` for multiline text and repeatable singular
-  `--ref`/`--reject`/`--supersede` flags. Use `--json` receipts when another
-  process must parse the id. A constraint correction can supersede an older
-  constraint only with the same authority and `--rationale`; decisions still
-  use revoke/replace.
+  `--ref`/`--reject`/`--supersede`/`--answer`/`--fulfill`/`--verify` flags.
+  Use `--json` receipts when another process must parse the id.
+- **Close lifecycle transitions inline on `add`:**
+  - Answering a question → pass `--answer <q-id>` on the answering decision,
+    observation, hypothesis, constraint, or note (auto-links `<q-id>` and
+    appends the `answered` resolution atomically).
+  - Shipping a decision → pass `--fulfill <dec-id>` on the ground-truth
+    `observation` (auto-links `<dec-id>` and marks it `fulfilled` atomically;
+    standalone `done <dec-id>` still works afterwards).
+  - Testing a hypothesis → pass `--verify <hyp-id>` on the ground-truth
+    `observation` (auto-links `<hyp-id>` and appends the `verification`
+    atomically; standalone `verify <hyp-id> <obs-id>` still works afterwards).
+  - Revising a hypothesis/constraint/decision → pass `--supersede <id>` (plus
+    `--rationale "…"` for constraints/decisions; same author, or `user`
+    overriding anyone). Prose that cites a live same-type ID with replacement
+    language without `--supersede` is rejected at write time.
+- **Self-contained bodies & `--scope turn`:** never file bare chat affirmations
+  (`"yes please"`, `"ok"`, `"go ahead"`) or unanchored item numbers (`"(2)"`)
+  as decisions/constraints — restate the referent so a fresh session can read
+  it cold. For tactical one-turn instructions ("run the profiler now", "skip
+  the slow suite this turn"), pass `--scope turn`: it stays live during the
+  turn and expires automatically once followed by a sweep, checkpoint/judgment
+  digest, or session gap. `revoke` is for retraction; superseded/fulfilled/
+  revoked/expired entries leave boot, resume-context and show (`thread`/`dig`
+  still show them).
 - In multi-model work, never directly promote a recommendation: file
   `--kind candidate`, have a different author review that exact id, then use
   `finalize-digest`. Reference the frozen casefile requirement ids with
@@ -94,7 +162,9 @@ export CASEFILE_AUTHOR=claude    # Anthropic models (fable/sonnet/opus alias her
 
 | user says | you do |
 |---|---|
-| "where are we on X?" | `boot` (or `resume-context`) → prose summary sized to the question |
+| "where are we on X?" | `where "<X>"` (computed STATE of the thread: latest live decision, open questions, what was ruled out, last verification); `thread "<X>"` for the chain; `boot` / `resume-context` for the whole case |
+| "that's done" / "we shipped X" | `done <decision-id> --evidence <obs-id or text>` — **confirm first** |
+| "X replaces Y" / "new plan for X" | `add -t decision --supersede <old-id> --rationale "…"` |
 | "don't touch X" | `add -t constraint -a user` |
 | "I'm not convinced by X" | `dispute -a user` |
 | "why did we rule out X?" / "how did we do X?" | `dig "<query>"` then `show <id>` on a hit. Do not grep log.jsonl or a sidecar chat transcript. |
@@ -170,10 +240,25 @@ all-or-nothing; each imported entry echoes.
 ## Command cheatsheet (generated from the CLI — flags come after the subcommand)
 
 ```
+casefile board [-h] {post,reply,show,read,ack,status,follow,unfollow,list,search,tail,watch,unread,poll} ...
+casefile board post [-h] [-a AUTHOR] [--json] [--body-stdin] [--case CASE] [--tag TAG] [--to TO] [--ref REF] title [body]
+casefile board reply [-h] [-a AUTHOR] [--json] [--body-stdin] [--to TO] [--ref REF] entry [body]
+casefile board show [-h] [-a AUTHOR] [--json] [--limit LIMIT] [--offset OFFSET] [--all] [--full] [--message] entry
+casefile board read [-h] [-a AUTHOR] [--json] [--limit LIMIT] [--offset OFFSET] [--all] [--full] [--message] entry
+casefile board ack [-h] [-a AUTHOR] [--json] entry
+casefile board status [-h] [-a AUTHOR] [--json] [--body-stdin] entry {open,in-progress,blocked,resolved} [body]
+casefile board follow [-h] [-a AUTHOR] [--json] [--tag TAG] [--all] [entry]
+casefile board unfollow [-h] [-a AUTHOR] [--json] [--tag TAG] [--all] [entry]
+casefile board list [-h] [-a AUTHOR] [--json] [--case CASE] [--tag TAG] [--by BY] [--status {open,in-progress,blocked,resolved}] [--limit LIMIT] [--offset OFFSET] [--following]
+casefile board search [-h] [-a AUTHOR] [--json] [--case CASE] [--tag TAG] [--by BY] [--status {open,in-progress,blocked,resolved}] [--limit LIMIT] [--offset OFFSET] [--fts | --natural] [--full] query
+casefile board tail [-h] [-a AUTHOR] [--json] [-n LINES] [-f] [--full] [--thread THREAD] [--case CASE] [--tag TAG] [--by BY] [--status {open,in-progress,blocked,resolved}]
+casefile board watch [-h] [-a AUTHOR] [--json] [--case CASE] [--tag TAG] [--by BY] [--status {open,in-progress,blocked,resolved}] [--limit LIMIT] [--for FOR_AUTHOR] [--thread THREAD] [--following] [--reader READER] [--interval INTERVAL] [--timeout TIMEOUT] [--once] [--newest-first] [--cooldown COOLDOWN] [--full]
+casefile board unread [-h] [-a AUTHOR] [--json] [--case CASE] [--tag TAG] [--by BY] [--status {open,in-progress,blocked,resolved}] [--limit LIMIT] [--offset OFFSET] [--for FOR_AUTHOR] [--following] [--full]
+casefile board poll [-h] [-a AUTHOR] [--json] [--case CASE] [--tag TAG] [--by BY] [--status {open,in-progress,blocked,resolved}] [--limit LIMIT] [--offset OFFSET] [--for FOR_AUTHOR] [--following] [--full]
 casefile cheatsheet [-h]
 casefile init [-h]
 casefile open [-h] [--goal GOAL] title
-casefile add [-h] -t {constraint,decision,hypothesis,note,observation,question} -a AUTHOR [--body-stdin] [--case CASE] [--refs [REFS ...]] [--ref REF] [--rationale RATIONALE] [--rejected [OPTION:REASON ...]] [--reject OPTION:REASON] [--source SOURCE] [--source-uri SOURCE_URI] [--source-type SOURCE_TYPE] [--published-at PUBLISHED_AT] [--accessed-at ACCESSED_AT] [--effective-at EFFECTIVE_AT] [--expires-at EXPIRES_AT] [--locator LOCATOR] [--jurisdiction JURISDICTION] [--check CHECK] [--claim-mode {association,causal-inference,diagnosis,forecast,mechanistic,normative-premise,recommendation}] [--mechanism MECHANISM] [--comparator COMPARATOR] [--analysis-layer ANALYSIS_LAYER] [--falsifier FALSIFIER] [--counterfactual COUNTERFACTUAL] [--horizon HORIZON] [--testability {external-now,longitudinal,not-empirical,within-session}] [--supersedes [SUPERSEDES ...]] [--supersede SUPERSEDE] [--to TO] [--json] [body]
+casefile add [-h] -t {constraint,decision,hypothesis,note,observation,question} -a AUTHOR [--body-stdin] [--case CASE] [--refs [REFS ...]] [--ref REF] [--rationale RATIONALE] [--rejected [OPTION:REASON ...]] [--reject OPTION:REASON] [--source SOURCE] [--source-uri SOURCE_URI] [--source-type SOURCE_TYPE] [--published-at PUBLISHED_AT] [--accessed-at ACCESSED_AT] [--effective-at EFFECTIVE_AT] [--expires-at EXPIRES_AT] [--locator LOCATOR] [--jurisdiction JURISDICTION] [--check CHECK] [--claim-mode {association,causal-inference,diagnosis,forecast,mechanistic,normative-premise,recommendation}] [--mechanism MECHANISM] [--comparator COMPARATOR] [--analysis-layer ANALYSIS_LAYER] [--falsifier FALSIFIER] [--counterfactual COUNTERFACTUAL] [--horizon HORIZON] [--testability {external-now,longitudinal,not-empirical,within-session}] [--supersedes [SUPERSEDES ...]] [--supersede SUPERSEDE] [--answers [ANSWERS ...]] [--answer ANSWER] [--fulfills [FULFILLS ...]] [--fulfill FULFILL] [--verifies [VERIFIES ...]] [--verify VERIFY] [--scope {case,turn}] [--to TO] [--force] [--json] [body]
 casefile endorse [-h] -a AUTHOR [--comment COMMENT] entry
 casefile dispute [-h] -a AUTHOR --reason REASON entry
 casefile revoke [-h] -a AUTHOR --reason REASON entry
@@ -207,5 +292,9 @@ casefile boot [-h] [--case CASE] [-a AUTHOR] [--budget BUDGET] [--skip-recheck] 
 casefile packet [-h] --to TO [-a AUTHOR] [--case CASE] [--no-file]
 casefile inbox [-h] [--for FOR_AUTHOR] [-a AUTHOR] [--json]
 casefile next [-h] [--case CASE] [-a AUTHOR]
+casefile since [-h] [--case CASE] [-a AUTHOR] [--limit LIMIT] [--json]
+casefile done [-h] -a AUTHOR [--evidence EVIDENCE] [--reason REASON] entry
+casefile thread [-h] [--case CASE] [--depth DEPTH] [--limit LIMIT] query
+casefile where [-h] [--case CASE] [--depth DEPTH] [--limit LIMIT] query
 casefile checkpoint [-h] [-a AUTHOR] [--case CASE] [body]
 ```

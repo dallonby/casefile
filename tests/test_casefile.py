@@ -3156,3 +3156,316 @@ class ThreadTests(CliBase):
         for e in self.log_entries():
             self.assertNotIn("thread", e)
             self.assertNotIn("topics", e)
+
+
+class InlineTransitionsCliTests(CliBase):
+    def test_answer_resolves_question_and_links_ref_atomically(self):
+        q = self.add("-t", "question", "-a", "claude", "--to", "user",
+                     "Which backoff curve should the retry worker use?")
+        r = self.cli(
+            "add", "-t", "decision", "-a", "user", "--answer", q,
+            "--rationale", "prevents synchronized retry storms", "--json",
+            "Use jittered exponential backoff capped at thirty seconds",
+            expect=0,
+        )
+        receipt = json.loads(r.out)
+        self.assertEqual(receipt["refs"], [q])
+        self.assertEqual(len(receipt["transitions"]), 1)
+        tr = receipt["transitions"][0]
+        self.assertEqual((tr["type"], tr["target"], tr["outcome"]),
+                         ("resolution", q, "answered"))
+        entries = self.log_entries()
+        qs, _ = cf.open_items(entries)
+        self.assertEqual(qs, [])
+        self.assertNotIn(q, self.cli("show", expect=0).out)
+        self.assertNotIn("Which backoff curve",
+                         self.cli("resume-context", expect=0).out)
+        boot = self.cli("boot", "-a", "codex", "--skip-recheck", "--ok-exit",
+                        expect=0).out
+        self.assertNotIn("mailbox → user", boot)
+
+    def test_fulfill_and_verify_on_observation_close_both_atomically(self):
+        h = self.add("-t", "hypothesis", "-a", "claude",
+                     "Connection pool starvation causes the 502 spike")
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "capacity",
+                     "Raise pool max_idle to 32 and export wait-time metrics")
+        obs = self.add(
+            "-t", "observation", "-a", "codex", "--source", "benchmark",
+            "--verify", h, "--fulfill", d,
+            "load test 10k rps: zero 502s and wait_ms p99 dropped from 410 to 4",
+        )
+        self.assertRegex(obs, r"^[0-9a-f]{8}$")
+        entries = self.log_entries()
+        grades = cf.compute_grades(entries)
+        self.assertEqual(grades[h], "verified")
+        self.assertEqual(grades[d], "fulfilled")
+        self.assertEqual(grades[obs], "ground-truth")
+        obs_entry = next(e for e in entries if e["id"] == obs)
+        self.assertEqual(obs_entry["refs"], [d, h])
+        self.assertEqual(cf.digest_invariant_violations(entries, [d]), [])
+        self.assertTrue(cf.digest_invariant_violations(entries, [obs]))
+        where = self.cli("where", d, expect=0).out
+        self.assertIn(f"verified `{h}` by `{obs}`", where)
+        self.assertIn(f"fulfilled decisions: 1 — latest `{d}`", where)
+
+    def test_inline_transition_validation_guards(self):
+        q = self.add("-t", "question", "-a", "claude", "Which region?")
+        h = self.add("-t", "hypothesis", "-a", "claude", "Cache miss spike")
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "r",
+                     "Warm cache before traffic shift")
+        before = len(self.log_entries())
+        # --answer forbidden on question
+        r = self.cli("add", "-t", "question", "-a", "claude", "--answer", q,
+                     "Follow-up question?")
+        self.assertNotEqual(r.rc, 0)
+        # --fulfill and --verify require observation
+        r = self.cli("add", "-t", "decision", "-a", "codex", "--rationale", "r",
+                     "--fulfill", d, "Shipped it")
+        self.assertNotEqual(r.rc, 0)
+        r = self.cli("add", "-t", "hypothesis", "-a", "claude", "--verify", h,
+                     "Confirmed cache miss")
+        self.assertNotEqual(r.rc, 0)
+        # Mismatched target types rejected
+        r = self.cli("add", "-t", "observation", "-a", "codex", "--verify", d,
+                     "observed output")
+        self.assertNotEqual(r.rc, 0)
+        r = self.cli("add", "-t", "observation", "-a", "codex", "--fulfill", q,
+                     "observed output")
+        self.assertNotEqual(r.rc, 0)
+        r = self.cli("add", "-t", "note", "-a", "codex", "--answer", h,
+                     "answering note")
+        self.assertNotEqual(r.rc, 0)
+        self.assertEqual(len(self.log_entries()), before)
+
+
+class WriteHygieneGuardsTests(CliBase):
+    def test_deictic_affirmations_and_unanchored_items_refused(self):
+        before = len(self.log_entries())
+        for bad in ("yes please", "yes ok", "yea", "LGTM!", "sounds good.",
+                    "go ahead", "prioritize (1) first", "go with option 2"):
+            r = self.cli("add", "-t", "decision", "-a", "user", bad)
+            self.assertEqual(r.rc, cf.EXIT_DUPLICATE, bad)
+            self.assertIn("deictic body", r.err)
+        r_con = self.cli("add", "-t", "constraint", "-a", "user",
+                         "im more bothered immediately by the error (1)'s")
+        self.assertEqual(r_con.rc, cf.EXIT_DUPLICATE)
+        self.assertEqual(len(self.log_entries()), before)
+
+        # Anchoring with --answer, --ref, --rationale, or --force succeeds
+        q = self.add("-t", "question", "-a", "claude",
+                     "Option 1 (lazy) or option 2 (eager)?")
+        self.add("-t", "decision", "-a", "user", "--answer", q,
+                 "go with option 2")
+        self.add("-t", "decision", "-a", "user", "--force", "yes please")
+
+    def test_prose_revision_cue_requires_supersede(self):
+        h1 = self.add("-t", "hypothesis", "-a", "claude",
+                      "Gateway timeout stems from DNS cache misses")
+        r = self.cli(
+            "add", "-t", "hypothesis", "-a", "claude",
+            f"Corrected version of {h1}: gateway timeout stems from TLS session cache misses",
+        )
+        self.assertEqual(r.rc, cf.EXIT_DUPLICATE)
+        self.assertIn(f"--supersede {h1}", r.err)
+
+        d1 = self.add("-t", "decision", "-a", "codex", "--rationale", "initial",
+                      "Stage rollout at five percent traffic")
+        r_dec = self.cli(
+            "add", "-t", "decision", "-a", "codex",
+            f"Updated plan replacing {d1}: stage rollout at ten percent traffic",
+        )
+        self.assertEqual(r_dec.rc, cf.EXIT_DUPLICATE)
+        self.assertIn(f"--supersede {d1}", r_dec.err)
+        self.assertIn("--rationale", r_dec.err)
+
+        # Retiring via --supersede succeeds cleanly
+        h2 = self.add(
+            "-t", "hypothesis", "-a", "claude", "--supersede", h1,
+            f"Corrected version of {h1}: gateway timeout stems from TLS session cache misses",
+        )
+        self.assertIn(h1, cf.superseded_ids(self.log_entries()))
+        self.assertTrue(h2)
+
+        # Verified hypotheses and foreign-authority decisions are not nudged into illegal --supersede
+        obs = self.add("-t", "observation", "-a", "codex", "--verify", h2,
+                       "TLS session cache hit rate was 0% during timeout window")
+        self.assertTrue(obs)
+        self.add("-t", "hypothesis", "-a", "claude",
+                 f"Follow-up refinement that replaces {h2} edge-case wording only")
+        u_dec = self.add("-t", "decision", "-a", "user", "--rationale", "owner",
+                         "Keep public API payload schema v2")
+        self.add("-t", "decision", "-a", "codex", "--rationale", "adapter",
+                 f"Internal adapter plan that replaces {u_dec} fallback shim")
+
+        # All-digit and all-letter 8-hex SHA prefixes are matched deterministically
+        es_hex = [
+            E("12345678", "hypothesis", author="claude", body="old numeric id"),
+            E("abcdefab", "hypothesis", author="claude", body="old alpha id"),
+        ]
+        for hid in ("12345678", "abcdefab"):
+            hit = cf.revision_cue_target(
+                es_hex, "c", "hypothesis", "claude",
+                f"Corrected version of {hid}: updated mechanism", [], [])
+            self.assertIsNotNone(hit, hid)
+            self.assertEqual(hit["id"], hid)
+
+
+class TurnScopedDirectivesTests(CliBase):
+    def test_turn_scope_unit_purity_and_precedence(self):
+        class PrefixTrackingList(list):
+            prefix_slices = 0
+
+            def __getitem__(self, key):
+                if isinstance(key, slice) and key.start is None \
+                        and isinstance(key.stop, int):
+                    self.prefix_slices += 1
+                return super().__getitem__(key)
+
+        es = PrefixTrackingList([
+            E("c1", "constraint", author="user", body="skip slow fuzzers this turn",
+              ts="2026-07-01T10:00:00+00:00", scope="turn"),
+            E("o1", "observation", author="system", source="hook:post-bash",
+              body="$ pytest\nok", ts="2026-07-01T10:45:00+00:00"),
+        ])
+        # System hook noise >30m later does NOT expire a turn directive
+        self.assertEqual(cf.compute_grades(es)["c1"], "stated")
+        # Substantive entry >30m later DOES expire it purely from log timestamps
+        es.append(E("h1", "hypothesis", author="claude", body="new session theory",
+                    ts="2026-07-01T10:46:00+00:00"))
+        self.assertEqual(cf.compute_grades(es)["c1"], "expired")
+        # Digesting an expired turn constraint causes zero violations and zero prefix slices
+        es.append(E("g1", "digest", kind="judgment", supersedes=["c1"],
+                    ts="2026-07-01T10:47:00+00:00"))
+        problems = cf.lint_problems(es, now=datetime(2026, 7, 1, 10, 50, tzinfo=timezone.utc))
+        self.assertEqual([p for p in problems if p.startswith("DIGEST-VIOLATION")], [])
+        self.assertEqual(es.prefix_slices, 0)
+
+        # Precedence: revoked > superseded > fulfilled > expired
+        es2 = [
+            E("d1", "decision", author="codex", body="run bench once", scope="turn"),
+            E("s1", "note", author="codex", body="secretary sweep: filed bench"),
+            E("r1", "resolution", author="codex", refs=["d1"], outcome="fulfilled"),
+        ]
+        self.assertEqual(cf.compute_grades(es2)["d1"], "fulfilled")
+        es2.append(E("d2", "decision", author="codex", body="run bench twice",
+                     supersedes=["d1"], supersession_reason="more samples"))
+        self.assertEqual(cf.compute_grades(es2)["d1"], "superseded")
+        es2.append(E("v1", "revocation", author="codex", refs=["d1"], body="abort"))
+        self.assertEqual(cf.compute_grades(es2)["d1"], "revoked")
+
+    def test_turn_scope_cli_lifecycle_views_recheck_and_quiet_sweep(self):
+        r_bad = self.cli("add", "-t", "hypothesis", "-a", "claude",
+                         "--scope", "turn", "not allowed on hypotheses")
+        self.assertNotEqual(r_bad.rc, 0)
+
+        c_default = self.add("-t", "constraint", "-a", "user", "--scope", "case",
+                             "Keep migrations reversible")
+        c_turn = self.add("-t", "constraint", "-a", "user", "--scope", "turn",
+                          "--check", "false", "Skip integration suite this turn")
+        entries = self.log_entries()
+        self.assertNotIn("scope", next(e for e in entries if e["id"] == c_default))
+        self.assertEqual(next(e for e in entries if e["id"] == c_turn)["scope"], "turn")
+
+        # Live during the turn
+        self.assertIn("turn-scoped", self.cli("show", expect=0).out)
+        self.assertIn("turn-scoped", self.cli("resume-context", expect=0).out)
+        self.assertEqual(len(cf.live_checks(entries)), 1)
+        r_dig = self.cli("digest", "premature digest", "-a", "claude",
+                         "--kind", "judgment", "--supersedes", c_turn)
+        self.assertNotEqual(r_dig.rc, 0)
+
+        # Quiet sweep while a turn directive is live appends the marker and expires it
+        self.cli("add", "-t", "note", "-a", "claude",
+                 "secretary sweep: nothing unrecorded", expect=0)
+        entries = self.log_entries()
+        self.assertEqual(cf.compute_grades(entries)[c_turn], "expired")
+        self.assertEqual(cf.live_checks(entries), [])
+        self.assertNotIn("Skip integration suite", self.cli("show", expect=0).out)
+        self.assertNotIn("Skip integration suite",
+                         self.cli("resume-context", expect=0).out)
+        self.assertIn("expired", self.cli("show", c_turn, expect=0).out)
+        st = json.loads(self.cli("status", "--json", expect=0).out)
+        closure = st["cases"]["test-case"]["closure"]
+        self.assertEqual(closure["expired"], 1)
+        boot = self.cli("boot", "-a", "claude", "--skip-recheck", "--ok-exit",
+                        expect=0).out
+        self.assertIn("1 expired", boot)
+        self.assertNotIn("Skip integration suite", boot)
+        self.cli("digest", "turn settled", "-a", "claude",
+                 "--kind", "judgment", "--supersedes", c_turn, expect=0)
+
+
+class SweepOpenStateChecklistTests(CliBase):
+    def setUp(self):
+        super().setUp()
+        self.cli("hooks", "install", "all", expect=0)
+        self.sweep = self.dir / ".casefile" / "hooks" / "sweep.py"
+        self.observe = self.dir / ".casefile" / "hooks" / "observe.py"
+
+    def test_stop_sweep_and_codex_reminder_surface_open_items_until_closed(self):
+        board_id = self.cli("board", "post", "Unrelated thread",
+                            "public board chatter", "-a", "claude", expect=0).out
+        self.assertTrue(board_id)
+        q = self.add("-t", "question", "-a", "claude",
+                     "Should the worker drop malformed frames?")
+        d = self.add("-t", "decision", "-a", "codex", "--rationale", "safety",
+                     "Quarantine malformed frames into dead-letter queue")
+        h = self.add("-t", "hypothesis", "-a", "claude",
+                     "Malformed frames originate from legacy v1 clients")
+
+        env = dict(os.environ)
+        env.pop("CASEFILE_AUTHOR", None)
+        env.update({
+            "GROK_HOOK_EVENT": "stop",
+            "GROK_SESSION_ID": "22222222-2222-4222-8222-222222222222",
+        })
+        p = subprocess.run(
+            [sys.executable, str(self.sweep)], cwd=self.dir, env=env,
+            input=json.dumps({"stopHookActive": False, "sessionId": "g-open"}),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(p.returncode, 0, p.stderr)
+        reason = json.loads(p.stdout)["reason"]
+        self.assertIn(f"--answer {q}", reason)
+        self.assertIn(f"--fulfill {d}", reason)
+        self.assertIn(f"--verify {h}", reason)
+        self.assertIn("-a grok", reason)
+        self.assertNotIn("-a claude", reason)
+        self.assertNotIn("public board chatter", reason)
+
+        # Codex PostToolUse checkpoint reminder also includes the checklist
+        obs_env = {k: v for k, v in os.environ.items()
+                   if not k.startswith("CASEFILE_")}
+        obs_env["CASEFILE_SKIP_PIP"] = "1"
+        p_codex = subprocess.run(
+            [sys.executable, str(self.observe)], cwd=self.dir, env=obs_env,
+            input=json.dumps({
+                "session_id": "codex-s1", "turn_id": "t1",
+                "tool_name": "Bash", "tool_input": {"command": "true"},
+                "tool_response": {"stdout": "", "stderr": ""},
+            }),
+            capture_output=True, text=True,
+        )
+        self.assertEqual(p_codex.returncode, 0, p_codex.stderr)
+        ctx = json.loads(p_codex.stdout)["hookSpecificOutput"]["additionalContext"]
+        self.assertIn(f"--answer {q}", ctx)
+        self.assertIn(f"--fulfill {d}", ctx)
+        self.assertIn(f"--verify {h}", ctx)
+
+        # Close all three inline and verify they disappear from the sweep checklist
+        ans = self.add("-t", "decision", "-a", "user", "--answer", q,
+                       "--rationale", "auditability",
+                       "Drop only after writing frame payload to dead-letter queue")
+        self.add("-t", "observation", "-a", "grok", "--source", "test",
+                 "--verify", h, "--fulfill", d, "--fulfill", ans,
+                 "integration test: v1 frames routed to DLQ; 0 crashes")
+        p2 = subprocess.run(
+            [sys.executable, str(self.sweep)], cwd=self.dir, env=env,
+            input=json.dumps({"stopHookActive": False, "sessionId": "g-closed"}),
+            capture_output=True, text=True,
+        )
+        reason2 = json.loads(p2.stdout)["reason"]
+        self.assertNotIn("Open items in active case", reason2)
+        self.assertNotIn(q, reason2)
+        self.assertNotIn(d, reason2)
+        self.assertNotIn(h, reason2)

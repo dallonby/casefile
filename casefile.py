@@ -120,6 +120,7 @@ DIGEST_KINDS = {"mechanical", "candidate", "judgment", "abstract"}
 # Like-for-like replacement via `add --supersede`: the new entry retires
 # its predecessor from every live view (grade `superseded`).
 SUPERSEDABLE_TYPES = ("hypothesis", "constraint", "decision")
+ENTRY_SCOPES = ("case", "turn")
 CLAIM_MODES = {
     "association", "causal-inference", "diagnosis", "forecast",
     "mechanistic", "normative-premise", "recommendation",
@@ -1095,6 +1096,51 @@ def fulfilled_ids(entries: list[dict]) -> set[str]:
     return out
 
 
+def _safe_ts(ts: str | None) -> datetime | None:
+    if not ts:
+        return None
+    try:
+        d = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return d if d.tzinfo else d.replace(tzinfo=timezone.utc)
+
+
+def expired_turn_ids(entries: list[dict]) -> set[str]:
+    """Turn-scoped decisions/constraints (`scope: 'turn'`) whose turn has ended.
+
+    Pure function of `entries` (SPEC P3 — no wall-clock or local state files):
+    a turn-scoped directive retires from live views once followed in the same
+    case by a secretary-sweep marker note, an `abstract`/`judgment` checkpoint
+    digest, or any substantive entry filed after a session gap (>SESSION_GAP_MIN).
+    """
+    expired: set[str] = set()
+    open_turn: dict[str, list[tuple[str, datetime | None]]] = {}
+    gap_s = 30 * 60  # matches SESSION_GAP_MIN (§9)
+    for e in entries:
+        cid = e.get("case", "")
+        bucket = open_turn.get(cid)
+        if bucket:
+            if is_sweep_marker(e) or (
+                    e["type"] == "digest"
+                    and e.get("kind") in ("abstract", "judgment")):
+                expired.update(eid for eid, _ in bucket)
+                bucket.clear()
+            elif substantive(e):
+                ts = _safe_ts(e.get("ts"))
+                if ts is not None:
+                    keep = []
+                    for eid, ets in bucket:
+                        if ets is not None and (ts - ets).total_seconds() > gap_s:
+                            expired.add(eid)
+                        else:
+                            keep.append((eid, ets))
+                    open_turn[cid] = keep
+        if e["type"] in ("decision", "constraint") and e.get("scope") == "turn":
+            open_turn.setdefault(cid, []).append((e["id"], _safe_ts(e.get("ts"))))
+    return expired
+
+
 def verification_protected_obs(entries: list[dict]) -> set[str]:
     by_id = {e["id"]: e for e in entries}
     out = set()
@@ -1149,6 +1195,7 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
     disputes = dispute_state(entries)
     revoked = revoked_ids(entries)
     fulfilled = fulfilled_ids(entries)
+    expired = expired_turn_ids(entries)
     verified = verified_hypotheses(entries)
     superseded = superseded_ids(entries)
 
@@ -1187,6 +1234,8 @@ def compute_grades(entries: list[dict]) -> dict[str, str]:
                 grades[eid] = "superseded"
             elif eid in fulfilled:
                 grades[eid] = "fulfilled"
+            elif eid in expired:
+                grades[eid] = "expired"
             elif normalize_author(e["author"]) == "user":
                 grades[eid] = "stated"
             else:
@@ -1209,6 +1258,7 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
     by_id = {e["id"]: e for e in view}
     revoked = revoked_ids(view)
     fulfilled = fulfilled_ids(view)
+    expired = expired_turn_ids(view)
     resolved = resolved_ref_ids(view)
     protected_obs = verification_protected_obs(view)
     replaced = superseded_ids(view)  # a replaced requirement is dismissed
@@ -1219,10 +1269,11 @@ def digest_invariant_violations(entries: list[dict], supersedes: list[str],
             out.append(f"{sid}: unknown entry")
             continue
         t = e["type"]
-        if t == "constraint" and sid not in revoked and sid not in replaced:
+        if t == "constraint" and sid not in revoked and sid not in replaced \
+                and sid not in expired:
             out.append(f"{sid}: unrevoked constraint")
         elif t == "decision" and sid not in revoked and sid not in fulfilled \
-                and sid not in replaced:
+                and sid not in replaced and sid not in expired:
             out.append(f"{sid}: undismissed decision (revoke, `done`, or "
                        f"--supersede it first)")
         elif t in ("dispute", "question") and sid not in resolved:
@@ -1237,6 +1288,9 @@ def historical_digest_invariant_problems(entries: list[dict]) -> list[str]:
     by_id: dict[str, dict] = {}
     revoked: set[str] = set()
     fulfilled: set[str] = set()
+    expired: set[str] = set()
+    open_turn: dict[str, list[tuple[str, datetime | None]]] = {}
+    gap_s = 30 * 60
     resolved: set[str] = set()
     replaced: set[str] = set()
     verification_refs: set[str] = set()
@@ -1252,10 +1306,11 @@ def historical_digest_invariant_problems(entries: list[dict]) -> list[str]:
                 if not target:
                     violation = f"{sid}: unknown entry"
                 elif target["type"] == "constraint" and sid not in revoked \
-                        and sid not in replaced:
+                        and sid not in replaced and sid not in expired:
                     violation = f"{sid}: unrevoked constraint"
                 elif target["type"] == "decision" and sid not in revoked \
-                        and sid not in fulfilled and sid not in replaced:
+                        and sid not in fulfilled and sid not in replaced \
+                        and sid not in expired:
                     violation = (
                         f"{sid}: undismissed decision (revoke, `done`, or "
                         f"--supersede it first)"
@@ -1271,6 +1326,27 @@ def historical_digest_invariant_problems(entries: list[dict]) -> list[str]:
                     out.append(
                         f"DIGEST-VIOLATION `{e['id']}` supersedes {violation}"
                     )
+
+        cid = e.get("case", "")
+        bucket = open_turn.get(cid)
+        if bucket:
+            if is_sweep_marker(e) or (
+                    e["type"] == "digest"
+                    and e.get("kind") in ("abstract", "judgment")):
+                expired.update(eid for eid, _ in bucket)
+                bucket.clear()
+            elif substantive(e):
+                ts = _safe_ts(e.get("ts"))
+                if ts is not None:
+                    keep = []
+                    for eid, ets in bucket:
+                        if ets is not None and (ts - ets).total_seconds() > gap_s:
+                            expired.add(eid)
+                        else:
+                            keep.append((eid, ets))
+                    open_turn[cid] = keep
+        if e["type"] in ("decision", "constraint") and e.get("scope") == "turn":
+            open_turn.setdefault(cid, []).append((e["id"], _safe_ts(e.get("ts"))))
 
         by_id[e["id"]] = e
         refs = e.get("refs", [])
@@ -1764,6 +1840,101 @@ def harvest_refs(entries: list[dict], case: str, body: str,
     return cited, unknown, foreign
 
 
+_BARE_AFFIRMATION_RE = re.compile(
+    r"^\s*(?:y|yes|yea|yeah|yep|yup|ok|okay|k|sure|agreed|approved|"
+    r"confirm|confirmed|lgtm|sounds\s+good|looks\s+good|go\s+ahead|"
+    r"go\s+for\s+it|do\s+it|proceed|please\s+do|yes\s+please|"
+    r"yes\s*,?\s*ok(?:ay)?|yeah\s*,?\s*ok(?:ay)?|ok(?:ay)?\s*,?\s*thanks|"
+    r"makes\s+sense|works\s+for\s+me)[\s.!?,;:]*$",
+    re.IGNORECASE,
+)
+_UNANCHORED_ITEM_RE = re.compile(
+    r"(?:(?:^|\s)\([1-9]\)(?:'?s)?(?=\s|[.!?,;:]|$)"
+    r"|\b(?:option|item|choice|plan)\s+#?[1-9]\b)",
+    re.IGNORECASE,
+)
+_REVISION_CUE_RE = re.compile(
+    r"\b(?:"
+    r"(?:corrected|updated|revised|amended)\s+"
+    r"(?:version|form|statement|plan|hypothesis|decision|constraint)\s+of\b"
+    r"|revision\s+of\b"
+    r"|correction\s+to\b"
+    r"|withdraws?\s+and\s+replaces?\b"
+    r"|supersedes?\b|superseding\b"
+    r"|replaces?\b|replacing\b"
+    r"|(?:is|now)\s+(?:superseded|replaced)\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _dedup_ids(seq: list[str]) -> list[str]:
+    out: list[str] = []
+    for item in seq:
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def deictic_body_problem(entry_type: str, body: str, *, refs: list[str],
+                         supersedes: list[str], answers: list[str],
+                         rationale: str | None) -> str | None:
+    """Refuse contextless affirmations or unanchored short item numbers on
+    decisions/constraints while the conversational referent is still in hand."""
+    if entry_type not in ("decision", "constraint"):
+        return None
+    if _BARE_AFFIRMATION_RE.match(body or ""):
+        return (
+            "deictic body — bare conversational affirmation loses its "
+            "referent after a context reset; restate the concrete choice or "
+            "constraint in full (and link any prior entry with --ref, "
+            "--answer, or --supersede; pass --force to file anyway)"
+        )
+    if (len((body or "").split()) < 12
+            and _UNANCHORED_ITEM_RE.search(body or "")
+            and not (refs or supersedes or answers or rationale)):
+        return (
+            "deictic body — short numbered-item reference has no anchor in "
+            "the log; spell out what item (1)/(2) refers to or anchor it "
+            "with --ref, --answer, --supersede, or --rationale (or --force)"
+        )
+    return None
+
+
+def revision_cue_target(entries: list[dict], case: str, entry_type: str,
+                        author: str, body: str, refs: list[str],
+                        supersedes: list[str]) -> dict | None:
+    """Detect prose that explicitly replaces/revises a live same-case,
+    same-type entry cited in `body` or `refs` without `--supersede <id>`."""
+    if entry_type not in SUPERSEDABLE_TYPES:
+        return None
+    if not _REVISION_CUE_RE.search(body or ""):
+        return None
+    cites = _dedup_ids([*ID_TOKEN.findall(body or ""), *refs])
+    if not cites:
+        return None
+    by_id = {e["id"]: e for e in entries}
+    grades = compute_grades(entries)
+    hidden = superseded_ids(entries)
+    me = normalize_author(author)
+    for tok in cites:
+        if tok in supersedes or tok in hidden:
+            continue
+        target = by_id.get(tok)
+        if target is None or target["case"] != case or target["type"] != entry_type:
+            continue
+        g = grades.get(tok)
+        if entry_type == "hypothesis" and g in ("verified", "refuted"):
+            continue
+        if entry_type in ("constraint", "decision"):
+            if g in ("revoked", "fulfilled", "superseded", "expired"):
+                continue
+            if me != "user" and normalize_author(target["author"]) != me:
+                continue
+        return target
+    return None
+
+
 def cmd_add(args):
     root, entries, meta = require_root()
     case = resolve_case(root, meta, args.case)
@@ -1771,6 +1942,10 @@ def cmd_add(args):
     args.refs = _combined(args, "refs", "ref")
     args.rejected = _combined(args, "rejected", "reject")
     args.supersedes = _combined(args, "supersedes", "supersede")
+    answers = _dedup_ids(_combined(args, "answers", "answer"))
+    fulfills = _dedup_ids(_combined(args, "fulfills", "fulfill"))
+    verifies = _dedup_ids(_combined(args, "verifies", "verify"))
+    scope = getattr(args, "scope", None)
     claim_fields = (
         "claim_mode", "mechanism", "comparator", "analysis_layer",
         "falsifier", "counterfactual", "horizon", "testability",
@@ -1794,7 +1969,43 @@ def cmd_add(args):
     if args.rationale and args.type != "decision" \
             and not (args.type == "constraint" and args.supersedes):
         die("--rationale is valid for decisions or constraint replacement")
+    if scope and args.type not in ("decision", "constraint"):
+        die("--scope is only valid for decisions/constraints")
+    if answers and args.type == "question":
+        die("--answer/--answers cannot be used on a question; file the "
+            "answering decision/observation/hypothesis/constraint/note")
+    if fulfills and args.type != "observation":
+        die("--fulfill/--fulfills is only valid on an observation "
+            "(ground-truth evidence that the decision shipped)")
+    if verifies and args.type != "observation":
+        die("--verify/--verifies is only valid on an observation "
+            "(SPEC P4: only ground truth verifies a hypothesis)")
+    if answers or fulfills or verifies:
+        by_id = {x["id"]: x for x in entries}
+        for qid in answers:
+            qt = by_id.get(qid)
+            if not qt:
+                die(f"unknown question {qid}")
+            if qt["type"] != "question" or qt["case"] != case:
+                die(f"{qid} is not a question in this case")
+        for did in fulfills:
+            dt = by_id.get(did)
+            if not dt:
+                die(f"unknown decision {did}")
+            if dt["type"] != "decision" or dt["case"] != case:
+                die(f"{did} is not a decision in this case")
+        for hid in verifies:
+            ht = by_id.get(hid)
+            if not ht:
+                die(f"unknown hypothesis {hid}")
+            if ht["type"] != "hypothesis" or ht["case"] != case:
+                die(f"{hid} is not a hypothesis in this case")
+        for tid in [*answers, *fulfills, *verifies]:
+            if tid not in args.refs:
+                args.refs.append(tid)
     extra = {}
+    if args.type in ("decision", "constraint") and scope == "turn":
+        extra["scope"] = "turn"
     if args.type == "decision":
         extra["rationale"] = args.rationale
         if args.rejected:
@@ -1856,18 +2067,46 @@ def cmd_add(args):
             else args.to
     author = normalize_author(args.author)
     if args.type == "note" and is_quiet_sweep(body):
-        # a sweep that filed nothing is a state stamp, not memory (SPEC §13)
-        stamp = write_sweep_stamp(root, author, body,
-                                  entries[-1]["id"] if entries else "")
-        if args.json:
-            print(json.dumps({"id": None, "case": case, "type": "note",
-                              "author": author, "sweep_stamp": stamp["ts"]}))
-        else:
-            print(f"sweep stamped ({stamp['ts']}) — nothing unrecorded, "
-                  "no entry filed")
-        return
+        grades_now = compute_grades(entries)
+        has_live_turn = any(
+            x["case"] == case
+            and x["type"] in ("decision", "constraint")
+            and x.get("scope") == "turn"
+            and grades_now.get(x["id"]) in ("stated", "asserted")
+            for x in entries
+        )
+        if not has_live_turn:
+            # a sweep that filed nothing is a state stamp, not memory (SPEC §13)
+            stamp = write_sweep_stamp(root, author, body,
+                                      entries[-1]["id"] if entries else "")
+            if args.json:
+                print(json.dumps({"id": None, "case": case, "type": "note",
+                                  "author": author, "sweep_stamp": stamp["ts"]}))
+            else:
+                print(f"sweep stamped ({stamp['ts']}) — nothing unrecorded, "
+                      "no entry filed")
+            return
     if author != "system":
         # write-time hygiene, while the context to fix it is still in hand
+        if not getattr(args, "force", False):
+            deictic = deictic_body_problem(
+                args.type, body, refs=args.refs, supersedes=args.supersedes,
+                answers=answers, rationale=args.rationale)
+            if deictic:
+                die(deictic, EXIT_DUPLICATE)
+            rev = revision_cue_target(
+                entries, case, args.type, args.author, body, args.refs,
+                args.supersedes)
+            if rev is not None:
+                rat_hint = (
+                    " --rationale '...'"
+                    if args.type in ("constraint", "decision") and not args.rationale
+                    else ""
+                )
+                die(f"prose cites live {args.type} `{rev['id']}` with replacement "
+                    f"language without retiring it: {headline(rev['body'], 80)}\n"
+                    f"  use --supersede {rev['id']}{rat_hint} to replace it in "
+                    "one step, or --force to keep both live", EXIT_DUPLICATE)
         if args.type in DEDUPE_TYPES and not is_sweep_marker({"type": args.type, "body": body}) \
                 and not extra.get("to"):
             dup = near_duplicate(root, entries, case, args.type, author, body)
@@ -1893,13 +2132,47 @@ def cmd_add(args):
                   file=sys.stderr)
     e = make_entry(entries, case, args.type, args.author, body,
                    refs=args.refs, **extra)
-    append_entry(root, e)
+    batch = [e]
+    transitions = []
+    for qid in answers:
+        r = make_entry(
+            entries + batch, case, "resolution", args.author,
+            f"answered by {e['id']}: {headline(body, 100)}",
+            refs=[qid, e["id"]], outcome="answered",
+        )
+        batch.append(r)
+        transitions.append({"type": "resolution", "id": r["id"],
+                            "target": qid, "outcome": "answered"})
+    for did in fulfills:
+        r = make_entry(
+            entries + batch, case, "resolution", args.author,
+            f"done — evidence {e['id']}: {headline(body, 100)}",
+            refs=[did, e["id"]], outcome="fulfilled",
+        )
+        batch.append(r)
+        transitions.append({"type": "resolution", "id": r["id"],
+                            "target": did, "outcome": "fulfilled"})
+    for hid in verifies:
+        v = make_entry(
+            entries + batch, case, "verification", args.author,
+            f"verified by {e['id']}",
+            refs=[hid, e["id"]],
+        )
+        batch.append(v)
+        transitions.append({"type": "verification", "id": v["id"],
+                            "target": hid})
+    append_entries(root, batch)
     save_active(root, case)  # SPEC §5.1: active case follows "last touched"
     if args.json:
-        print(json.dumps({
+        receipt = {
             "id": e["id"], "case": case, "type": e["type"],
             "author": e["author"], "body": e["body"], "refs": e["refs"],
-        }, ensure_ascii=False))
+        }
+        if e.get("scope"):
+            receipt["scope"] = e["scope"]
+        if transitions:
+            receipt["transitions"] = transitions
+        print(json.dumps(receipt, ensure_ascii=False))
     else:
         print(e["id"])
     # filing nudges: cheapest at write time, when the context to fix them is
@@ -2112,16 +2385,15 @@ def cmd_finalize_digest(args):
 
 def live_checks(entries: list[dict]) -> list[dict]:
     """Hypotheses/constraints that carry a `check` recipe and are still live —
-    not superseded by a digest, not revoked (constraints), not refuted
-    (hypotheses). These are the claims recheck can re-test against the world."""
+    not superseded by a digest, not revoked or turn-expired (constraints), not
+    refuted (hypotheses). These are the claims recheck can re-test against the world."""
     hidden = superseded_ids(entries)
-    revoked = revoked_ids(entries)
     grades = compute_grades(entries)
     out = []
     for e in entries:
         if not e.get("check") or e["id"] in hidden:
             continue
-        if e["type"] == "constraint" and e["id"] not in revoked:
+        if e["type"] == "constraint" and grades.get(e["id"]) in ("stated", "asserted"):
             out.append(e)
         elif e["type"] == "hypothesis" and grades.get(e["id"]) != "refuted":
             out.append(e)
@@ -2979,7 +3251,7 @@ def cmd_dig(args):
 
 IMPORT_TYPES = {"hypothesis", "decision", "observation", "constraint",
                 "question", "note"}
-_IMPORT_EXTRAS = {"decision": {"rationale", "rejected"},
+_IMPORT_EXTRAS = {"decision": {"rationale", "rejected", "scope"},
                   "observation": {
                       "source", "source_uri", "source_type", "published_at",
                       "accessed_at", "effective_at", "expires_at", "locator",
@@ -2990,7 +3262,7 @@ _IMPORT_EXTRAS = {"decision": {"rationale", "rejected"},
                       "analysis_layer", "falsifier", "counterfactual", "horizon",
                       "testability",
                   },
-                  "constraint": {"check"},
+                  "constraint": {"check", "scope"},
                   "question": {"to"}}
 
 
@@ -3021,6 +3293,11 @@ def cmd_import(args):
         if unknown:
             die(f"{src}:{n}: unknown field(s) for {t}: {', '.join(sorted(unknown))}")
         extra = {k: d[k] for k in allowed if k in d}
+        if t in ("decision", "constraint") and "scope" in extra:
+            if extra["scope"] not in ENTRY_SCOPES:
+                die(f"{src}:{n}: scope must be one of {list(ENTRY_SCOPES)}")
+            if extra["scope"] == "case":
+                del extra["scope"]
         if t == "observation":
             extra.setdefault("source", "import")
             for key in ("published_at", "accessed_at", "effective_at", "expires_at"):
@@ -3060,6 +3337,7 @@ PHRASE = {
     "refuted": "refuted",
     "fulfilled": "fulfilled — shipped and observed; digestible",
     "superseded": "superseded by a later entry",
+    "expired": "turn-scoped directive — expired after turn",
 }
 
 
@@ -3135,7 +3413,7 @@ def claim_card_text(e: dict) -> str:
 
 
 _SHOW_EXTRA_KEYS = (
-    "rationale", "rejected", "source", "source_uri", "source_type",
+    "scope", "rationale", "rejected", "source", "source_uri", "source_type",
     "published_at", "accessed_at", "effective_at", "expires_at",
     "locator", "jurisdiction", "check", "claim_mode", "mechanism",
     "comparator", "analysis_layer", "falsifier", "counterfactual",
@@ -3211,7 +3489,7 @@ def cmd_show_entry(args):
     if persistence_mode() != "postgres":
         e = _scan_entry_by_id(root, eid)
         hidden = _index_hidden(root)  # side table: no full-log parse
-    if e is None:
+    if e is None or e.get("scope") == "turn":
         root, entries, meta = require_root()
         e = next((x for x in entries if x["id"] == eid), None)
         if e is None:
@@ -3241,15 +3519,22 @@ def cmd_show(args):
     if info.get("goal"):
         out += [f"**Goal:** {info['goal']}", ""]
 
-    live = lambda es: [e for e in es if grades.get(e["id"]) != "revoked"]
+    live = lambda es: [
+        e for e in es if grades.get(e["id"]) not in ("revoked", "fulfilled", "expired")
+    ]
     if live(by_type.get("constraint", [])):
         out += ["## Constraints", ""]
-        out += [f"- `{e['id']}` [{grades[e['id']]}] ({e['author']}) {e['body']}"
-                for e in live(by_type["constraint"])] + [""]
+        out += [
+            f"- `{e['id']}` [{grades[e['id']]}"
+            f"{'; turn-scoped' if e.get('scope') == 'turn' else ''}] "
+            f"({e['author']}) {e['body']}"
+            for e in live(by_type["constraint"])
+        ] + [""]
     if live(by_type.get("decision", [])):
         out += ["## Decisions", ""]
         for e in live(by_type["decision"]):
-            line = f"- `{e['id']}` [{grades[e['id']]}] ({e['author']}) {e['body']}"
+            scope_note = "; turn-scoped" if e.get("scope") == "turn" else ""
+            line = f"- `{e['id']}` [{grades[e['id']]}{scope_note}] ({e['author']}) {e['body']}"
             if e.get("rationale"):
                 line += f" — *{e['rationale']}*"
             for r in e.get("rejected", []):
@@ -3372,6 +3657,8 @@ def _render_sections(fitted, more_hint: str) -> tuple[list[str], int]:
 def _decision_line(e: dict, grades: dict, width: int = 160) -> str:
     l = f"- `{e['id']}` {headline(e['body'], width)} " \
         f"({PHRASE.get(grades.get(e['id'], ''), '')}"
+    if e.get("scope") == "turn":
+        l += "; turn-scoped"
     if e.get("rationale"):
         l += f"; rationale: {headline(e['rationale'], 100)}"
     l += ")"
@@ -3417,12 +3704,15 @@ def cmd_resume_context(args):
             "requires exact independent review)" for e in candidates[-3:][::-1]
         ]))
 
-    live = lambda es: [e for e in es if grades.get(e["id"]) not in ("revoked", "fulfilled")]
+    live = lambda es: [
+        e for e in es if grades.get(e["id"]) not in ("revoked", "fulfilled", "expired")
+    ]
     cons = live(by_type.get("constraint", []))
     if cons:
         sections.append(("constraints", "CONSTRAINTS (newest first):", [
             f"- `{e['id']}` {headline(e['body'], 200)} "
-            f"({PHRASE.get(grades[e['id']], grades[e['id']])})"
+            f"({PHRASE.get(grades[e['id']], grades[e['id']])}"
+            f"{'; turn-scoped' if e.get('scope') == 'turn' else ''})"
             for e in cons[::-1]]))
     if ds:
         lines = []
@@ -4142,12 +4432,12 @@ def synthesize_abstract(entries: list[dict], meta: dict, case: str) -> str:
         lines.append("RULED OUT: " + "; ".join(
             f"{headline(h['body'], 120)} ({h['id']})" for h in ruled[::-1][:6]))
     cons = [e for e in by_type.get("constraint", [])
-            if grades.get(e["id"]) != "revoked"]
+            if grades.get(e["id"]) not in ("revoked", "expired")]
     if cons:
         lines.append("CONSTRAINTS: " + "; ".join(
             f"{headline(c['body'], 120)} ({c['id']})" for c in cons[::-1][:5]))
     decs = [e for e in by_type.get("decision", [])
-            if grades.get(e["id"]) not in ("revoked", "fulfilled")]
+            if grades.get(e["id"]) not in ("revoked", "fulfilled", "expired")]
     if decs:
         lines.append("KEY DECISIONS: " + "; ".join(
             f"{headline(d['body'], 120)} ({d['id']})" for d in decs[::-1][:5]))
@@ -4290,8 +4580,9 @@ def agent_card(author: str, author_source: str = "env") -> str:
         "Never edit .casefile/log.jsonl by hand — corrections are new entries.",
         "Session boot: casefile boot   (after export CASEFILE_AUTHOR=…)",
         "File: casefile add -t hypothesis|decision|observation|constraint|question|note "
-        f"-a {author} \"…\"",
+        f"-a {author} \"…\"  (self-contained body; --scope turn for one-turn directives)",
         "User decisions ONLY with -a user. Your proposals use your author id.",
+        "Close inline on add: --answer <q> | --fulfill <dec> (obs) | --verify <hyp> (obs) | --supersede <id>",
         "Verify needs an observation: casefile verify <hyp> <obs> -a " + author,
         "Self-endorsement is rejected; get a foreign author or ground truth.",
         "Handoff: casefile packet --to <peer> | casefile inbox --for " + author,
@@ -4420,12 +4711,14 @@ def build_boot_report(root: Path, entries: list[dict], meta: dict, case: str,
     else:
         sections.append(("abstract", "rolling abstract:",
                          [f"STALE/MISSING ABSTRACT: {freshness['reason']}"]))
-    live = lambda es: [e for e in es
-                       if grades.get(e["id"]) not in ("revoked", "fulfilled")]
+    live = lambda es: [
+        e for e in es if grades.get(e["id"]) not in ("revoked", "fulfilled", "expired")
+    ]
     cons = live(by_type.get("constraint", []))
     if cons:
         sections.append(("constraints", "constraints (newest first):", [
-            f"- `{e['id']}` ({PHRASE.get(grades[e['id']], grades[e['id']])}) "
+            f"- `{e['id']}` ({PHRASE.get(grades[e['id']], grades[e['id']])}"
+            f"{'; turn-scoped' if e.get('scope') == 'turn' else ''}) "
             f"{headline(e['body'], 160)}" for e in cons[::-1]]))
     decs = live(by_type.get("decision", []))
     if decs:
@@ -4772,12 +5065,12 @@ def closure_counts(entries: list[dict], case: str, grades: dict) -> dict:
     """Live vs closed decisions/constraints for a case (all entries, hidden
     included — a superseded decision is closed, not gone)."""
     out = {"decisions": 0, "constraints": 0, "fulfilled": 0, "revoked": 0,
-           "superseded": 0}
+           "superseded": 0, "expired": 0}
     for e in entries:
         if e["case"] != case or e["type"] not in ("decision", "constraint"):
             continue
         g = grades.get(e["id"], "")
-        if g in ("fulfilled", "revoked", "superseded"):
+        if g in ("fulfilled", "revoked", "superseded", "expired"):
             out[g] += 1
         else:
             out[e["type"] + "s"] += 1
@@ -4785,9 +5078,12 @@ def closure_counts(entries: list[dict], case: str, grades: dict) -> dict:
 
 
 def closure_text(c: dict) -> str:
-    return (f"live: {c['decisions']} decisions, {c['constraints']} constraints; "
+    base = (f"live: {c['decisions']} decisions, {c['constraints']} constraints; "
             f"closed: {c['fulfilled']} fulfilled, {c['superseded']} superseded, "
             f"{c['revoked']} revoked")
+    if c.get("expired"):
+        base += f", {c['expired']} expired"
+    return base
 
 
 def cmd_done(args):
@@ -4958,6 +5254,10 @@ def thread_state(entries: list[dict], nodes: list[dict]) -> list[str]:
             and grades.get(e["id"]) == "fulfilled"]
     if done:
         out.append(f"  fulfilled decisions: {len(done)} — latest {line(done[-1], 80)}")
+    exp = [e for e in nodes if e["type"] in ("decision", "constraint")
+           and grades.get(e["id"]) == "expired"]
+    if exp:
+        out.append(f"  expired turn directives: {len(exp)} — latest {line(exp[-1], 80)}")
     return out
 
 
@@ -5222,23 +5522,27 @@ def _sweep_reminder(hook, now=None):
         "casefile_sweep_policy", root / ".casefile" / "hooks" / "sweep.py")
     sweep = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(sweep)
-    if not sweep._active_case(root):
+    case = sweep._active_case(root)
+    if not case:
         return
-    due = sweep.sweep_due(
-        sweep._parse(sweep.tail_lines(sweep.LOG, sweep.SWEEP_TAIL_LINES)),
-        stamp=sweep._stamp(root))
+    tail = sweep._parse(sweep.tail_lines(sweep.LOG, sweep.SWEEP_TAIL_LINES))
+    due = sweep.sweep_due(tail, stamp=sweep._stamp(root))
     stamp.parent.mkdir(parents=True, exist_ok=True)
     tmp = stamp.with_suffix(f".{os.getpid()}.tmp")
     tmp.write_text(str(now))
     os.utime(tmp, (now, now))
     os.replace(tmp, stamp)
     if due:
-        return (
-                "Casefile checkpoint reminder (nonblocking): file any "
-                "unrecorded decisions, constraints and evidence with the "
-                f"correct author using `{sweep.CLI} add ...`, then record "
-                "a secretary sweep marker before handoff. "
-                "Codex no longer runs a casefile Stop hook.")
+        author = (os.environ.get("CASEFILE_AUTHOR") or "").strip() or "codex"
+        msg = (
+            "Casefile checkpoint reminder (nonblocking): file any "
+            "unrecorded decisions, constraints and evidence with the "
+            f"correct author using `{sweep.CLI} add ...`, then record "
+            "a secretary sweep marker before handoff. "
+            "Codex no longer runs a casefile Stop hook."
+        )
+        checklist = sweep.open_state_checklist(tail, case, sweep.CLI, author)
+        return f"{msg}\n{checklist}" if checklist else msg
 
 
 def _board_reader(hook, now=None):
@@ -5396,15 +5700,23 @@ def _cli_display(root):
 
 CLI = _cli_display(ROOT)
 
-REASON = (
-    "Secretary sweep (casefile): before ending, diff this conversation against "
-    "the casefile log. Anything decided, constrained, observed, or ruled out "
-    f"here that isn't recorded? File it with `{CLI} add ...` using "
-    f"the correct type and author (user for the user's words, {AUTHOR} for your "
-    "own). Then file the sweep marker — "
-    f"`{CLI} add -t note -a {AUTHOR} \"secretary sweep: <gaps filed, "
-    "or 'nothing unrecorded'>\"` — and finish."
-)
+
+def _base_reason(cli: str = CLI, author: str = AUTHOR) -> str:
+    return (
+        "Secretary sweep (casefile): before ending, diff this conversation against "
+        "the casefile log. Anything decided, constrained, observed, or ruled out "
+        f"here that isn't recorded? File it with `{cli} add ...` using "
+        f"the correct type and author (user for the user's words, {author} for your "
+        "own; use self-contained bodies and `--scope turn` for one-turn directives). "
+        "Close any open questions, decisions, or hypotheses settled in this turn "
+        "inline (`--answer`, `--fulfill`, `--verify`, `--supersede`). Then file "
+        "the sweep marker — "
+        f"`{cli} add -t note -a {author} \"secretary sweep: <gaps filed, "
+        "or 'nothing unrecorded'>\"` — and finish."
+    )
+
+
+REASON = _base_reason(CLI, AUTHOR)
 
 
 LOG = ROOT / ".casefile" / "log.jsonl"
@@ -5458,6 +5770,174 @@ def _is_marker(e: dict) -> bool:
 def _is_noise(e: dict) -> bool:
     return (e.get("author") in SWEEP_NOISE_AUTHORS
             or str(e.get("source") or "").startswith("hook:"))
+
+
+def _is_substantive(e: dict) -> bool:
+    if _is_noise(e) or _is_marker(e):
+        return False
+    b = e.get("board")
+    if e.get("type") == "note" and isinstance(b, dict) \
+            and b.get("op") in ("read", "ack", "follow", "unfollow"):
+        return False
+    return True
+
+
+def _head(body: str, width: int = 72) -> str:
+    first = ""
+    for ln in (body or "").splitlines():
+        if ln.strip():
+            first = " ".join(ln.split())
+            break
+    return (first[:width - 1].rstrip() + "…") if len(first) > width else first
+
+
+def open_state_checklist(entries: list[dict], case: str | None,
+                         cli: str = CLI, author: str = AUTHOR) -> str:
+    """Bounded open-state delta from the parsed log tail (zero subprocesses).
+
+    Surfaces live questions, disputes, unfulfilled decisions, unverified
+    hypotheses, and failing rechecks in `case` with exact closure flags so the
+    agent closes transitions while turn context is still hot.
+    """
+    if not case or not entries:
+        return ""
+    by_id: dict[str, dict] = {}
+    superseded: set[str] = set()
+    revoked: set[str] = set()
+    resolved: set[str] = set()
+    fulfilled: set[str] = set()
+    dispute_outcomes: dict[str, str] = {}
+    verified: set[str] = set()
+    expired_turn: set[str] = set()
+    open_turn: list[tuple[str, datetime | None]] = []
+    last_recheck: dict[str, bool] = {}
+    gap_s = 30 * 60
+
+    for e in entries:
+        eid = e.get("id")
+        if not eid:
+            continue
+        by_id[eid] = e
+        t = e.get("type")
+        refs = e.get("refs") or []
+        if (t == "digest" and e.get("kind") != "candidate") \
+                or t in ("hypothesis", "constraint", "decision"):
+            superseded.update(e.get("supersedes") or [])
+        if t == "revocation":
+            revoked.update(refs)
+        elif t == "resolution":
+            resolved.update(refs)
+            outcome = str(e.get("outcome") or "")
+            for r in refs:
+                dispute_outcomes[r] = outcome
+            if outcome == "fulfilled":
+                fulfilled.update(refs)
+        elif t == "verification":
+            if any(by_id.get(r, {}).get("type") == "observation" or r not in by_id
+                   for r in refs):
+                verified.update(refs)
+        elif t == "observation":
+            src = str(e.get("source") or "")
+            if src.startswith("recheck:"):
+                tid = src.split(":", 1)[1]
+                b = str(e.get("body") or "")
+                if b.startswith("[FAIL]"):
+                    last_recheck[tid] = False
+                elif b.startswith("[PASS]"):
+                    last_recheck[tid] = True
+
+        if e.get("case") != case:
+            continue
+        if open_turn:
+            if _is_marker(e) or (t == "digest"
+                                 and e.get("kind") in ("abstract", "judgment")):
+                expired_turn.update(tid for tid, _ in open_turn)
+                open_turn.clear()
+            elif _is_substantive(e):
+                ts = _parse_ts(e.get("ts"))
+                if ts is not None:
+                    keep = []
+                    for tid, tts in open_turn:
+                        if tts is not None and (ts - tts).total_seconds() > gap_s:
+                            expired_turn.add(tid)
+                        else:
+                            keep.append((tid, tts))
+                    open_turn = keep
+        if t in ("decision", "constraint") and e.get("scope") == "turn":
+            open_turn.append((eid, _parse_ts(e.get("ts"))))
+
+    refuted: set[str] = set()
+    for e in entries:
+        if e.get("type") == "dispute" \
+                and dispute_outcomes.get(e.get("id", "")) == "upheld":
+            refuted.update(e.get("refs") or [])
+
+    case_entries = [e for e in entries
+                    if e.get("case") == case and e.get("id") not in superseded]
+    qs = [e for e in case_entries
+          if e.get("type") == "question" and e["id"] not in resolved]
+    ds = [e for e in case_entries
+          if e.get("type") == "dispute" and e["id"] not in resolved]
+    decs = [e for e in case_entries
+            if e.get("type") == "decision"
+            and e["id"] not in revoked
+            and e["id"] not in fulfilled
+            and e["id"] not in expired_turn]
+    hyps = [e for e in case_entries
+            if e.get("type") == "hypothesis"
+            and e["id"] not in refuted
+            and e["id"] not in verified]
+    failing = [
+        e for e in case_entries
+        if e.get("type") in ("hypothesis", "constraint")
+        and e.get("check")
+        and last_recheck.get(e["id"]) is False
+        and (e.get("type") != "constraint"
+             or (e["id"] not in revoked and e["id"] not in expired_turn))
+        and (e.get("type") != "hypothesis" or e["id"] not in refuted)
+    ]
+
+    bullets: list[str] = []
+    for q in qs[::-1][:3]:
+        bullets.append(
+            f"  - open question `{q['id']}`: \"{_head(q.get('body', ''))}\" "
+            f"→ `{cli} add -t decision|observation|note -a {author} --answer {q['id']} \"...\"`"
+        )
+    for d in ds[::-1][:2]:
+        bullets.append(
+            f"  - open dispute `{d['id']}`: \"{_head(d.get('body', ''))}\" "
+            f"→ `{cli} resolve {d['id']} -a {author} --outcome upheld|withdrawn --reason \"...\"`"
+        )
+    for dec in decs[::-1][:3]:
+        bullets.append(
+            f"  - unfulfilled decision `{dec['id']}`: \"{_head(dec.get('body', ''))}\" "
+            f"→ shipped: `{cli} add -t observation -a {author} --fulfill {dec['id']} \"...\"` "
+            f"| revised: `--supersede {dec['id']} --rationale \"...\"`"
+        )
+    for h in hyps[::-1][:3]:
+        bullets.append(
+            f"  - unverified hypothesis `{h['id']}`: \"{_head(h.get('body', ''))}\" "
+            f"→ tested: `{cli} add -t observation -a {author} --verify {h['id']} \"...\"` "
+            f"| revised: `--supersede {h['id']}`"
+        )
+    for fc in failing[::-1][:2]:
+        bullets.append(
+            f"  - failing check `{fc['id']}`: \"{_head(fc.get('body', ''))}\" "
+            f"→ fix world, `--supersede {fc['id']}`, or `dispute {fc['id']} -a {author} --reason \"...\"`"
+        )
+    if not bullets:
+        return ""
+    return (
+        "Open items in active case (close any settled in this turn before sweeping):\n"
+        + "\n".join(bullets)
+    )
+
+
+def build_sweep_reason(entries: list[dict], case: str | None,
+                       cli: str = CLI, author: str = AUTHOR) -> str:
+    base = _base_reason(cli, author)
+    checklist = open_state_checklist(entries, case, cli, author)
+    return f"{base}\n\n{checklist}" if checklist else base
 
 
 def _parse_ts(ts):
@@ -5557,12 +6037,14 @@ def main():
         sid = str(_field(hook, "session_id", "sessionId", default="") or "")
         pulse(ROOT, sid)  # final pass: pulse (H7)
         return
-    if not _active_case(ROOT):
+    case = _active_case(ROOT)
+    if not case:
         return  # no active case means nothing to sweep
-    if not sweep_due(_parse(tail_lines(LOG, SWEEP_TAIL_LINES)),
-                     stamp=_stamp(ROOT)):
+    tail = _parse(tail_lines(LOG, SWEEP_TAIL_LINES))
+    if not sweep_due(tail, stamp=_stamp(ROOT)):
         return  # nothing worth a sweep since the last sweep: end quietly
-    print(json.dumps({"decision": "block", "reason": REASON}))
+    print(json.dumps({"decision": "block",
+                      "reason": build_sweep_reason(tail, case, CLI, AUTHOR)}))
 
 
 def _active_case(root: Path) -> str | None:
@@ -5789,12 +6271,31 @@ decisions/observations with their proper types and link the discussion IDs.
   abstracts): problem, status with grade in words, leading theory,
   ruled-out list, key decisions, open items. Run `reindex` after.
 - Prefer `--body-stdin` for multiline text and repeatable singular
-  `--ref`/`--reject`/`--supersede` flags. Use `--json` receipts when another
-  process must parse the id. A constraint or decision revision supersedes
-  its predecessor with `--supersede <id> --rationale "…"` (same author, or
-  the user overriding anyone); `revoke` is for retraction, `done <id>` for
-  a decision whose work shipped. Superseded/fulfilled/revoked entries leave
-  boot, resume-context and show; `thread`/`dig` still show them.
+  `--ref`/`--reject`/`--supersede`/`--answer`/`--fulfill`/`--verify` flags.
+  Use `--json` receipts when another process must parse the id.
+- **Close lifecycle transitions inline on `add`:**
+  - Answering a question → pass `--answer <q-id>` on the answering decision,
+    observation, hypothesis, constraint, or note (auto-links `<q-id>` and
+    appends the `answered` resolution atomically).
+  - Shipping a decision → pass `--fulfill <dec-id>` on the ground-truth
+    `observation` (auto-links `<dec-id>` and marks it `fulfilled` atomically;
+    standalone `done <dec-id>` still works afterwards).
+  - Testing a hypothesis → pass `--verify <hyp-id>` on the ground-truth
+    `observation` (auto-links `<hyp-id>` and appends the `verification`
+    atomically; standalone `verify <hyp-id> <obs-id>` still works afterwards).
+  - Revising a hypothesis/constraint/decision → pass `--supersede <id>` (plus
+    `--rationale "…"` for constraints/decisions; same author, or `user`
+    overriding anyone). Prose that cites a live same-type ID with replacement
+    language without `--supersede` is rejected at write time.
+- **Self-contained bodies & `--scope turn`:** never file bare chat affirmations
+  (`"yes please"`, `"ok"`, `"go ahead"`) or unanchored item numbers (`"(2)"`)
+  as decisions/constraints — restate the referent so a fresh session can read
+  it cold. For tactical one-turn instructions ("run the profiler now", "skip
+  the slow suite this turn"), pass `--scope turn`: it stays live during the
+  turn and expires automatically once followed by a sweep, checkpoint/judgment
+  digest, or session gap. `revoke` is for retraction; superseded/fulfilled/
+  revoked/expired entries leave boot, resume-context and show (`thread`/`dig`
+  still show them).
 - In multi-model work, never directly promote a recommendation: file
   `--kind candidate`, have a different author review that exact id, then use
   `finalize-digest`. Reference the frozen casefile requirement ids with
@@ -6019,7 +6520,11 @@ Record decisions and evidence during work and checkpoint before handoff.
   `python3 casefile.py dig "<topic>"` then `show <id>` on a hit (and
   `recall` for past-case abstracts) and cite what you find in `--refs`.
   Do not grep log.jsonl or a sidecar chat transcript. Decisions carry
-  `--rationale` and `--rejected` for losing options.
+  `--rationale` and `--rejected` for losing options, self-contained bodies
+  (never bare `"yes"`/`"ok"` or unanchored item numbers), and `--scope turn`
+  when a directive applies only to the current turn. Close open items inline on
+  `add` (`--answer <q-id>`, `--fulfill <dec-id>` on observations, `--verify
+  <hyp-id>` on observations, `--supersede <old-id>` on revisions).
 - **Before a consequential spitball**, sweep the current conversation into
   the log and freeze a manifest of verbatim requirements, criteria/weights,
   alternatives, evidence domains, analysis layers, and open questions.
@@ -6689,11 +7194,27 @@ def build_parser() -> argparse.ArgumentParser:
                         "this replaces (constraints/decisions need --rationale)")
     s.add_argument("--supersede", action="append", default=[],
                    help="one like-for-like replacement id; repeatable")
+    s.add_argument("--answers", nargs="*", action="extend", default=[],
+                   help="question id(s) this entry answers atomically")
+    s.add_argument("--answer", action="append", default=[],
+                   help="one question id this entry answers; repeatable")
+    s.add_argument("--fulfills", nargs="*", action="extend", default=[],
+                   help="observations: decision id(s) this evidence fulfills")
+    s.add_argument("--fulfill", action="append", default=[],
+                   help="observations: one decision id fulfilled; repeatable")
+    s.add_argument("--verifies", nargs="*", action="extend", default=[],
+                   help="observations: hypothesis id(s) this evidence verifies")
+    s.add_argument("--verify", action="append", default=[],
+                   help="observations: one hypothesis id verified; repeatable")
+    s.add_argument("--scope", choices=ENTRY_SCOPES,
+                   help="decisions/constraints: 'case' (default) or 'turn' "
+                        "(retires at sweep, checkpoint, or session end)")
     s.add_argument("--to",
                    help="questions/notes: route to user|any|<author> (mailbox / packet peer)")
     s.add_argument("--force", action="store_true",
-                   help="file even if it near-duplicates a recent entry "
-                        f"(otherwise exit {EXIT_DUPLICATE}: cite or supersede it)")
+                   help="file even if write-time hygiene flags a near-duplicate, "
+                        "unanchored deictic body, or unretired prose revision "
+                        f"(otherwise exit {EXIT_DUPLICATE})")
     s.add_argument("--json", action="store_true", help="machine-readable receipt")
     s.set_defaults(fn=cmd_add)
 

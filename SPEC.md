@@ -192,9 +192,9 @@ starter ignore list lives in `.casefile/.gitignore`, **not** a blanket
 | type | purpose | extra fields |
 |---|---|---|
 | `hypothesis` | falsifiable claim by a model | `check`; like-for-like `supersedes`; claim card: `claim_mode`, `mechanism`, `comparator`, `analysis_layer`, `falsifier`, `counterfactual`, `horizon`, `testability` |
-| `decision` | a choice constraining future work | `rationale`, `rejected` (list of `{option, reason}` — the losing alternatives, so they aren't re-proposed); plan revision via `supersedes` + `supersession_reason` |
+| `decision` | a choice constraining future work | `rationale`, `rejected` (list of `{option, reason}` — the losing alternatives, so they aren't re-proposed); optional `scope`: `turn` (retires at sweep/checkpoint/session end; omitted for default `case`); plan revision via `supersedes` + `supersession_reason` |
 | `observation` | ground truth from the world | `source`; optional `source_uri`, `source_type`, `published_at`, `accessed_at`, `effective_at`, `expires_at`, `locator`, `jurisdiction` |
-| `constraint` | invariant that must hold | `check`; same-author correction via `supersedes` + `supersession_reason` |
+| `constraint` | invariant that must hold | `check`; optional `scope`: `turn`; same-author correction via `supersedes` + `supersession_reason` |
 | `question` | open unknown; user-authored questions form the **mailbox** | `to` (optional: `user`, `any`) |
 | `endorsement` | author X supports another author's entry | `comment` |
 | `dispute` | author X challenges entry; **blocks promotion** while open | `reason` in body |
@@ -225,6 +225,23 @@ Rules enforced at append time:
 
 Write-time hygiene in `add` (the cheapest moment to fix a filing, while
 the context is still in hand):
+- **Inline lifecycle transitions.** `add` accepts repeatable `--answer
+  <question-id>` (on any non-question entry → appends a companion
+  `resolution` with `outcome: answered`), `--fulfill <decision-id>` (on
+  `observation` only → appends `resolution` with `outcome: fulfilled`), and
+  `--verify <hypothesis-id>` (on `observation` only, per P4 → appends
+  `verification`), auto-linking target ids into `refs` and committing the
+  primary entry plus companion closure records in one locked batch.
+- **Self-contained body & prose-supersession guards.** Bare chat affirmations
+  (`"yes"`, `"ok"`, `"go ahead"`, `"sounds good"`) and short unanchored
+  numbered-item references (`"(2)"`, `"option 2"` with no `refs`,
+  `supersedes`, `answers`, or `rationale`) on decisions/constraints are
+  refused with exit **3** (`--force` overrides). A hypothesis, decision, or
+  constraint whose prose cites a live replaceable same-case, same-type id
+  alongside explicit replacement language (`"corrected version of"`,
+  `"supersedes"`, `"replaces"`) without `--supersede <id>` is likewise
+  refused with exit **3** so the old claim is retired in one step rather than
+  left co-live.
 - **Near-duplicate refusal.** A hypothesis/decision/constraint/question/note
   whose digit-masked token set overlaps a recent (30 d) live entry of the
   same case, type and author class (user vs model) at Jaccard ≥ 0.7 is
@@ -241,7 +258,9 @@ the context is still in hand):
   entry is still filed, the phantom id is caught at the source.
 - **Quiet sweep markers.** A sweep note whose body says
   `secretary sweep: nothing …` is recorded as a state stamp
-  (`.casefile/state/sweep-stamp.json`), not a log entry (§13).
+  (`.casefile/state/sweep-stamp.json`), not a log entry (§13), unless a live
+  `scope: "turn"` directive exists in the case (in which case the marker
+  appends to the log so turn expiration is recorded across machines).
 
 ### 5.4 Epistemic grades (computed per P3)
 
@@ -261,9 +280,15 @@ constraint/decision is grade `revoked` and drops from compiled views (but
 its revocation is shown in `dig`). A decision closed by
 `resolution --outcome fulfilled` is grade `fulfilled` (work shipped;
 digestible under the evidence-chain invariant). A constraint or decision
-replaced by a later one is grade `superseded` (precedence: revoked >
-superseded > fulfilled > stated/asserted); it leaves the live views and
-counts, and `thread`/`dig` show it with what replaced it.
+with `scope: "turn"` transitions to grade `expired` (computed purely from
+the log, P3) once followed in the same case by a secretary-sweep marker, an
+`abstract`/`judgment` checkpoint digest, or a substantive entry after a
+`>30 min` session gap; expired turn directives leave live views, live
+recheck targets, and live counts, and are dismissed for the evidence-chain
+invariant. A constraint or decision replaced by a later one is grade
+`superseded` (precedence: revoked > superseded > fulfilled > expired >
+stated/asserted); it leaves the live views and counts, and `thread`/`dig`
+show it with what replaced it.
 
 Provenance phrases (P5) for compiled views:
 
@@ -278,6 +303,7 @@ hypothesis  → "an unverified hypothesis"
 asserted    → "asserted, not user-confirmed"
 fulfilled   → "fulfilled — shipped and observed; digestible"
 superseded  → "superseded by a later entry"
+expired     → "turn-scoped directive — expired after turn"
 ```
 
 ## 6. Distillation
@@ -705,6 +731,11 @@ reply`, `interject(handle, msg)` (mid-request if supported), `cost(handle)`,
   twenty non-system observations, or any non-system entry once the sweep
   is over thirty minutes old (constants at the top of the installed
   `sweep.py`); a quiet turn ends silently, with no marker required.
+  When a sweep or Codex checkpoint reminder fires, it also derives a bounded
+  open-state checklist from the parsed log tail (open questions, disputes,
+  unfulfilled decisions, unverified hypotheses, and failing checks) with the
+  inline closure flags (`--answer`, `--fulfill`, `--verify`, `--supersede`)
+  so settled items close before the turn ends.
   Automatic `system`/`hook:*` entries never trigger a sweep on their own.
 - **The skill file** (`SKILL.md` dropped where Claude Code discovers it),
   teaching every session in the repo: read resume-context (and run
